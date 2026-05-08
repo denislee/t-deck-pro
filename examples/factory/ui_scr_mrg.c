@@ -244,6 +244,14 @@ bool scr_mgr_pop(bool anim)
     return false;
 }
 
+int scr_mgr_get_curr_scr_id(void)
+{
+    if (scr_stack_top) {
+        return scr_stack_top->id;
+    }
+    return -1;
+}
+
 // set anim
 void scr_mgr_set_anim(lv_scr_load_anim_t sw, lv_scr_load_anim_t push, lv_scr_load_anim_t pop)
 {

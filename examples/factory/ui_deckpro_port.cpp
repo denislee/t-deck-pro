@@ -705,3 +705,74 @@ bool ui_notes_delete(bool is_sd, const char *filename)
     if (is_sd) shared_spi_unlock();
     return ret;
 }
+
+//************************************[ screen 13 ]****************************************** Ebook Reader
+
+void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *count)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    *count = 0;
+    
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    if (!fs.exists("/reader")) {
+        fs.mkdir("/reader");
+    }
+
+    File root = fs.open("/reader");
+    if (root && root.isDirectory()) {
+        File file = root.openNextFile();
+        while (file && *count < UI_READER_MAX_COUNT) {
+            if (!file.isDirectory()) {
+                const char* name = file.name();
+                // file.name() might return full path or just name depending on version
+                const char* lastSlash = strrchr(name, '/');
+                if (lastSlash) {
+                    strncpy(list[*count], lastSlash + 1, 31);
+                } else {
+                    strncpy(list[*count], name, 31);
+                }
+                list[*count][31] = '\0';
+                (*count)++;
+            }
+            file = root.openNextFile();
+        }
+    }
+
+    if (is_sd) {
+        shared_spi_unlock();
+    }
+}
+
+char* ui_reader_read(bool is_sd, const char *filename)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/reader/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    File file = fs.open(path, FILE_READ);
+    if (!file) {
+        if (is_sd) shared_spi_unlock();
+        return NULL;
+    }
+
+    size_t size = file.size();
+    char *content = (char *)malloc(size + 1);
+    if (content) {
+        file.readBytes(content, size);
+        content[size] = '\0';
+    }
+    file.close();
+
+    if (is_sd) shared_spi_unlock();
+    return content;
+}
+

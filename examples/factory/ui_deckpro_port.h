@@ -152,6 +152,11 @@ char* ui_notes_read(bool is_sd, const char *filename);
 bool ui_notes_write(bool is_sd, const char *filename, const char *content);
 bool ui_notes_delete(bool is_sd, const char *filename);
 
+// [ screen 13 ] --- Ebook Reader
+#define UI_READER_MAX_COUNT 20
+void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *count);
+char* ui_reader_read(bool is_sd, const char *filename);
+
 #ifdef __cplusplus
 }
 #endif

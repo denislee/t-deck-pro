@@ -25,7 +25,9 @@
 #define EPD_BITMAP_STRIDE(width) (((width) + 7) / 8)
 #define EPD_BITMAP_BUF_SIZE (EPD_BITMAP_STRIDE(LCD_HOR_SIZE) * LCD_VER_SIZE)
 
+#ifndef TINY_GSM_MODEM_SIM7672
 #define TINY_GSM_MODEM_SIM7672
+#endif
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
 #define MODEM_GPS_ENABLE_GPIO               (-1)
 

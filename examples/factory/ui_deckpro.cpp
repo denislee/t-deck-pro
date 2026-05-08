@@ -30,6 +30,10 @@
 #define LOW_VOLTAGE_POLL_MS 2000
 static char global_buf[GLOBAL_BUF_LEN];
 
+static lv_obj_t *notes_list_obj;
+static bool notes_use_sd = false;
+static char notes_selected_file[32] = {0};
+
 static lv_timer_t *touch_chk_timer = NULL;
 static lv_timer_t *taskbar_update_timer = NULL;
 static lv_timer_t *low_voltage_timer = NULL;
@@ -251,23 +255,19 @@ static int page_curr = 0;
 
 static struct menu_btn menu_btn_list[] = 
 {
-    {SCREEN2_ID,  &img_setting, "Setting",  false},
-    {SCREEN3_ID,  &img_GPS,     "GPS",      true},
-    {SCREEN4_ID,  &img_wifi,    "Wifi",     false},
-    {SCREEN5_ID,  &img_test,    "Test",     true},
-    {SCREEN6_ID,  &img_batt,    "Battery",  true},
-    {SCREEN7_ID,  &img_touch,   "Input",    true},
-    {SCREEN8_ID,  &img_A7682E,  "A7682E",   true},
-    {SCREEN9_ID,  &img_lora,    "Shutdown", false},
-    {SCREEN10_ID, &img_PCM5102, "PCM5102",  true},
-    {SCREEN11_ID, &img_PCM5102, "Sleep",    false},
-    {SCREEN12_1_ID, &img_SD,    "Notes",    false},
+    {SCREEN2_ID,  &img_setting, "Setting"},
+    {SCREEN13_ID, &img_SD,    "Reader"},
+    {SCREEN12_1_ID, &img_SD,    "Notes"},
 };
+
+#ifndef APP_HIDDEN_STATUS_DEFINED
+#define APP_HIDDEN_STATUS_DEFINED
+static bool app_hidden_status[MENU_BTN_NUM] = {0};
+#endif
 
 static void menu_btn_event_cb(lv_event_t *e)
 {
     struct menu_btn *tgr = (struct menu_btn *)e->user_data;
-    if (tgr->hidden) return;
     scr_mgr_push(tgr->idx, false);
 }
 
@@ -309,9 +309,6 @@ static void menu_get_gesture_dir(int dir)
 static void menu_btn_create(lv_obj_t *parent, struct menu_btn *info, int x, int y)
 {
     lv_obj_t * btn = lv_btn_create(parent);
-    if (info->hidden) {
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
-    }
     lv_obj_remove_style_all(btn);
     lv_obj_set_width(btn, 50);
     lv_obj_set_height(btn, 50);
@@ -398,7 +395,7 @@ static void create0(lv_obj_t *parent)
     //
     int visible_count = 0;
     for(int i = 0; i < MENU_BTN_NUM; i++) {
-        if(!menu_btn_list[i].hidden) visible_count++;
+        if(!app_hidden_status[i]) visible_count++;
     }
     page_num = (visible_count - 1) / 9;
 
@@ -424,27 +421,14 @@ static void create0(lv_obj_t *parent)
     lv_obj_align(menu_screen2, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(menu_screen2, LV_OBJ_FLAG_HIDDEN);
 
-    if(ui_test_a7682e() == false)
-    {
-        for(int i = 0; i < GET_BUFF_LEN(menu_btn_list); i++)
-        {
-            if(menu_btn_list[i].idx == SCREEN8_ID)
-            {
-                menu_btn_list[i].idx = SCREEN10_ID;
-                menu_btn_list[i].name = "PCM5012";
-                menu_btn_list[i].icon = &img_PCM5102;
-            }
-        }
-    }
-
     int visible_idx = 0;
     int col_spacing = 72;
     int row_spacing = 88;
     int x_start = 23;
-    int y_start = 13;
+    int y_start = 135;
 
     for(int i = 0; i < MENU_BTN_NUM; i++) {
-        if (menu_btn_list[i].hidden) continue;
+        if (app_hidden_status[i]) continue;
 
         int x, y;
         lv_obj_t *scr;
@@ -515,6 +499,8 @@ static void destroy0(void) {
         menu_taskbar = NULL;
     }
 }
+
+
 
 static scr_lifecycle_t screen0 = {
     .create = create0,
@@ -1005,6 +991,65 @@ static scr_lifecycle_t screen2_1 = {
     .destroy = destroy2_1,
 };
 #endif
+// --------------------- screen 2.2 --------------------- Hidden Apps
+#if 1
+static void hidden_app_event_handler(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * obj = lv_event_get_target(e);
+    if(code == LV_EVENT_VALUE_CHANGED) {
+        int app_index = (int)lv_event_get_user_data(e);
+        if(lv_obj_has_state(obj, LV_STATE_CHECKED)) {
+            app_hidden_status[app_index] = true;
+        } else {
+            app_hidden_status[app_index] = false;
+        }
+    }
+}
+
+static void scr2_2_btn_event_cb(lv_event_t * e)
+{
+    if(e->code == LV_EVENT_CLICKED){
+        scr_mgr_pop(false);
+    }
+}
+
+static void create2_2(lv_obj_t *parent)
+{
+    lv_obj_t * list = lv_list_create(parent);
+    lv_obj_set_size(list, LV_HOR_RES, lv_pct(88));
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    for (int i = 0; i < MENU_BTN_NUM; i++)
+    {
+        lv_obj_t * cb = lv_checkbox_create(list);
+        lv_checkbox_set_text(cb, menu_btn_list[i].name);
+        if (app_hidden_status[i])
+        {
+            lv_obj_add_state(cb, LV_STATE_CHECKED);
+        }
+        lv_obj_add_event_cb(cb, hidden_app_event_handler, LV_EVENT_VALUE_CHANGED, (void*)i);
+    }
+
+    scr_back_btn_create(parent, ("Hidden Apps"), scr2_2_btn_event_cb);
+}
+static void entry2_2(void)
+{
+}
+static void exit2_2(void)
+{
+}
+static void destroy2_2(void)
+{
+}
+
+static scr_lifecycle_t screen2_2 = {
+    .create = create2_2,
+    .entry = entry2_2,
+    .exit  = exit2_2,
+    .destroy = destroy2_2,
+};
+#endif
 // --------------------- screen 2 --------------------- Setting
 #if 1
 static lv_obj_t *setting_list;
@@ -1019,6 +1064,17 @@ static ui_setting_handle setting_handle_list[] = {
     {.name = "Power Lora",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_lora_status,  .get_cb = ui_setting_get_lora_status},
     {.name = "Power Gyro",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gyro_status,  .get_cb = ui_setting_get_gyro_status},
     {.name = "Power A7682",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_a7682_status, .get_cb = ui_setting_get_a7682_status},
+    {.name = "- Lora",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN1_ID},
+    {.name = "- WIFI",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN4_ID},
+    {.name = "- GPS",            .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN3_ID},
+    {.name = "- Test",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN5_ID},
+    {.name = "- Battery",        .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN6_ID},
+    {.name = "- Input",          .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN7_ID},
+    {.name = "- A7682E",         .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN8_ID},
+    {.name = "- PCM5102",        .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN10_ID},
+    {.name = "- Hidden Apps",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN2_2_ID},
+    {.name = "- Shutdown",       .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN9_ID},
+    {.name = "- Sleep",          .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN11_ID},
     {.name = "- About System",   .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN2_1_ID},
 };
 
@@ -2603,7 +2659,7 @@ static void create9(lv_obj_t *parent)
         lv_obj_center(label);
 
         // back 
-        scr_back_btn_create(parent, "Shoutdown", scr8_btn_event_cb);
+        scr_back_btn_create(parent, "Shutdown", scr8_btn_event_cb);
     } 
     else 
     {
@@ -2925,30 +2981,7 @@ static void indev_get_gesture_dir(lv_timer_t *t)
     // Serial.printf("dir=%d\n", dir);
 }
 
-static void menu_keypay_get_event(lv_timer_t *t)
-{
-    static int sec = 0;
-    static int press = false;
-    char keypay_v;
-    int ret = ui_input_get_keypad_val(&keypay_v);
 
-    if(ret > 0)
-    {
-        sec = 0;
-        press = true;
-        ui_input_set_keypad_flag();
-        lv_label_set_text_fmt(menu_keypad, "%c", keypay_v);
-    }
-
-    if(press){
-        sec++;
-        if(sec > 20) {
-            sec = 0;
-            press = false;
-            lv_label_set_text(menu_keypad, " ");
-        }
-    }
-}
 
 static void menu_taskbar_update_timer_cb(lv_timer_t *t)
 {
@@ -3033,8 +3066,43 @@ void ui_auto_timer_cb(lv_timer_t *t)
     }
 }
 
+
+
+static void menu_keypay_get_event(lv_timer_t *timer)
+{
+    uint16_t curr_id = scr_mgr_get_curr_scr_id();
+    if (curr_id == SCREEN0_ID) {
+        char key_val;
+        if (ui_input_get_keypad_val(&key_val)) {
+            switch (key_val) {
+                case 's':
+                    scr_mgr_push(SCREEN2_ID, false);
+                    break;
+                case 'r':
+                    scr_mgr_push(SCREEN13_ID, false);
+                    break;
+                case 'n':
+                    notes_selected_file[0] = '\0';
+                    scr_mgr_push(SCREEN12_1_ID, false);
+                    break;
+            }
+            ui_input_set_keypad_flag(); // Consume the key
+        }
+    } else if (curr_id == SCREEN13_ID || curr_id == SCREEN13_1_ID) {
+        char key_val;
+        if (ui_input_get_keypad_val(&key_val)) {
+            if (key_val == 'q') {
+                scr_mgr_switch(SCREEN0_ID, false);
+            }
+            ui_input_set_keypad_flag();
+        }
+    }
+}
+
 extern scr_lifecycle_t screen12;
 extern scr_lifecycle_t screen12_1;
+extern scr_lifecycle_t screen13;
+extern scr_lifecycle_t screen13_1;
 
 void ui_deckpro_entry(void)
 {
@@ -3061,6 +3129,7 @@ void ui_deckpro_entry(void)
     scr_mgr_register(SCREEN1_2_ID,  &screen1_2);    // - Lora Setting
     scr_mgr_register(SCREEN2_ID,    &screen2);      // Setting
     scr_mgr_register(SCREEN2_1_ID,  &screen2_1);    //  - About System
+    scr_mgr_register(SCREEN2_2_ID,  &screen2_2);    //  - Hidden Apps
     scr_mgr_register(SCREEN3_ID,    &screen3);      // 
     scr_mgr_register(SCREEN4_ID,    &screen4);      // WIFI
     scr_mgr_register(SCREEN4_1_ID,  &screen4_1);    //  - WIFI Config
@@ -3078,6 +3147,8 @@ void ui_deckpro_entry(void)
     scr_mgr_register(SCREEN11_ID,   &screen11);
     scr_mgr_register(SCREEN12_ID,   &screen12);
     scr_mgr_register(SCREEN12_1_ID, &screen12_1);
+    scr_mgr_register(SCREEN13_ID, &screen13);
+    scr_mgr_register(SCREEN13_1_ID, &screen13_1);
     
 
     scr_mgr_switch(SCREEN0_ID, false); // set root screen
@@ -3088,13 +3159,10 @@ void ui_deckpro_entry(void)
     // lv_label_set_text(menu_keypad, " ");
     // lv_obj_align(menu_keypad, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
 
-    // menu_timer = lv_timer_create(menu_keypay_get_event, 40, NULL);
+    menu_timer = lv_timer_create(menu_keypay_get_event, 40, NULL);
 }
 //************************************[ screen 12 ]***************************************** Notes List
 #if 1
-static lv_obj_t *notes_list_obj;
-static bool notes_use_sd = false;
-static char notes_selected_file[32] = {0};
 
 static void notes_list_update(void)
 {
@@ -3330,4 +3398,134 @@ scr_lifecycle_t screen12_1 = {
     .destroy = destroy12_1,
 };
 #endif
+
+//************************************[ screen 13 ]***************************************** Ebook Reader List
+#if 1
+
+static bool ends_with(const char *str, const char *suffix) {
+    if (!str || !suffix)
+        return false;
+    size_t len_str = strlen(str);
+    size_t len_suffix = strlen(suffix);
+    if (len_suffix > len_str)
+        return false;
+    return strncmp(str + len_str - len_suffix, suffix, len_suffix) == 0;
+}
+
+static lv_obj_t *reader_list_obj;
+static bool reader_use_sd = true; // Always use SD for ebooks
+static char reader_selected_file[32] = {0};
+
+static void reader_list_update(void)
+{
+    lv_obj_clean(reader_list_obj);
+    char list[UI_READER_MAX_COUNT][32];
+    int count = 0;
+    ui_reader_get_list(reader_use_sd, list, &count);
+
+    for (int i = 0; i < count; i++) {
+        if (ends_with(list[i], ".txt")) {
+            lv_obj_t * btn = lv_list_add_btn(reader_list_obj, NULL, list[i]);
+            lv_obj_set_style_text_font(btn, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+        }
+    }
+}
+
+static void reader_list_btn_event_cb(lv_event_t * e)
+{
+    lv_obj_t * obj = lv_event_get_target(e);
+    const char * name = lv_list_get_btn_text(reader_list_obj, obj);
+    if (name) {
+        strncpy(reader_selected_file, name, 31);
+        scr_mgr_push(SCREEN13_1_ID, false);
+    }
+}
+
+static void scr13_back_btn_event_cb(lv_event_t * e)
+{
+    scr_mgr_pop(false);
+}
+
+static void create13(lv_obj_t *parent)
+{
+    lv_obj_t * title = lv_label_create(parent);
+    lv_label_set_text(title, "Ebook Reader");
+    lv_obj_set_style_text_font(title, FONT_BOLD_SIZE_18, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
+
+    reader_list_obj = lv_list_create(parent);
+    lv_obj_set_size(reader_list_obj, lv_pct(90), lv_pct(75));
+    lv_obj_align(reader_list_obj, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_add_event_cb(reader_list_obj, reader_list_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    scr_back_btn_create(parent, "Reader", scr13_back_btn_event_cb);
+}
+
+static void entry13(void)
+{
+    reader_list_update();
+    ui_disp_full_refr();
+}
+
+static void exit13(void) { ui_disp_full_refr(); }
+static void destroy13(void) { }
+
+scr_lifecycle_t screen13 = {
+    .create = create13,
+    .entry = entry13,
+    .exit  = exit13,
+    .destroy = destroy13,
+};
+#endif
+
+//************************************[ screen 13.1 ]*************************************** Ebook Reader View
+#if 1
+
+static lv_obj_t *reader_view_label;
+
+static void scr13_1_back_btn_event_cb(lv_event_t * e)
+{
+    scr_mgr_pop(false);
+}
+
+static void create13_1(lv_obj_t *parent)
+{
+    reader_view_label = lv_label_create(parent);
+    lv_obj_set_size(reader_view_label, lv_pct(94), lv_pct(78));
+    lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_text_font(reader_view_label, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_label_set_long_mode(reader_view_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(reader_view_label, "");
+
+    scr_back_btn_create(parent, "Reader", scr13_1_back_btn_event_cb);
+}
+
+static void entry13_1(void)
+{
+    char *file_content = ui_reader_read(reader_use_sd, reader_selected_file);
+    if (file_content) {
+        lv_label_set_text(reader_view_label, file_content);
+        free(file_content);
+    } else {
+        lv_label_set_text(reader_view_label, "Error: Could not read file.");
+    }
+    ui_disp_full_refr();
+}
+
+static void exit13_1(void)
+{
+    ui_disp_full_refr();
+}
+
+static void destroy13_1(void) { }
+
+scr_lifecycle_t screen13_1 = {
+    .create = create13_1,
+    .entry = entry13_1,
+    .exit  = exit13_1,
+    .destroy = destroy13_1,
+};
+#endif
+
+
 

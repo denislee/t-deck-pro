@@ -52,6 +52,7 @@ enum {
     SCREEN1_2_ID,
     SCREEN2_ID,
     SCREEN2_1_ID,
+    SCREEN2_2_ID,
     SCREEN3_ID,
     SCREEN4_ID,
     SCREEN4_1_ID,
@@ -69,6 +70,8 @@ enum {
     SCREEN11_ID,
     SCREEN12_ID,
     SCREEN12_1_ID,
+    SCREEN13_ID,
+    SCREEN13_1_ID,
 };
 
 typedef void (*ui_indev_read_cb)(int);
@@ -85,7 +88,6 @@ struct menu_btn {
     uint16_t idx;
     const lv_img_dsc_t *icon;
     const char *name;
-    bool hidden;
 };
 
 enum{
