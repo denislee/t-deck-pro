@@ -62,7 +62,10 @@ void magn_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, u
 */
 void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
 {
+    // bhy.update() pumps callbacks via I2C reads. Same bus as the keypad task.
+    i2c0_lock();
     bhy.update();
+    i2c0_unlock();
 
     switch (val_type) {
         case 1:

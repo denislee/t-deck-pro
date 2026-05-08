@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "hyn_core.h"
 #include "utilities.h"
+#include "factory.h"
 
 #define CONFIG_EXAMPLE_TOUCH_I2C_SDA_PIN BOARD_TOUCH_SDA
 #define CONFIG_EXAMPLE_TOUCH_I2C_SCL_PIN BOARD_TOUCH_SCL
@@ -21,7 +22,15 @@
 const static char *TAG = "[HYN]";
 static struct hyn_ts_data *hyn_data;
 static xQueueHandle gpio_evt_queue;
-static bool touch_press_flag = false;
+static volatile bool touch_press_flag = false;
+
+// Held-state tracking: the CST328 only asserts INT on touch state changes
+// (press, movement, release). A finger held still produces no IRQ between
+// events, so we cache the last reported position and keep reporting it as
+// "touched" until the chip explicitly delivers a 0-finger release event.
+static bool s_touch_held = false;
+static int16_t s_touch_x = 0;
+static int16_t s_touch_y = 0;
 
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
@@ -30,93 +39,63 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     touch_press_flag = true;
 }
 
-static void touch_int_handler(void *arg)
-{
-    uint32_t io_num;
-    for (;;)
-    {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
-        {
-            int ret;
-            hyn_data->hyn_irq_flg = 1;
-            if (hyn_data->work_mode < DIFF_MODE)
-            {
-                ret = hyn_data->hyn_fuc_used->tp_report(); // Read point
-
-                for (u8 i = 0; i < hyn_data->rp_buf.rep_num; i++)
-                { // Modify the coordinate origin according to the configuration
-                    if (hyn_data->plat_data.swap_xy)
-                    {
-                        u16 tmp = hyn_data->rp_buf.pos_info[i].pos_x;
-                        hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->rp_buf.pos_info[i].pos_y;
-                        hyn_data->rp_buf.pos_info[i].pos_y = tmp;
-                    }
-                    if (hyn_data->plat_data.reverse_x)
-                        hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->plat_data.x_resolution - hyn_data->rp_buf.pos_info[i].pos_x;
-                    if (hyn_data->plat_data.reverse_y)
-                        hyn_data->rp_buf.pos_info[i].pos_y = hyn_data->plat_data.y_resolution - hyn_data->rp_buf.pos_info[i].pos_y;
-                }
-                printf("ret:%d num:%d xy:", ret, hyn_data->rp_buf.rep_num);
-                for (int i = 0; i < hyn_data->rp_buf.rep_num; i++)
-                {
-                    printf("(%d,%d) ", hyn_data->rp_buf.pos_info[i].pos_x, hyn_data->rp_buf.pos_info[i].pos_y);
-                }
-                printf("\n");
-            }
-            hyn_data->rp_buf.report_need = REPORT_NONE;
-        }
-    }
-}
-
 uint8_t hyn_touch_get_point(int16_t *x_array, int16_t *y_array, uint8_t get_point)
 {
-    uint32_t io_num;
-
-    // if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
-    // {
-    if(touch_press_flag) {
-        touch_press_flag = false;
-    } else {
+    if (!hyn_data || !hyn_data->hyn_fuc_used || !hyn_data->hyn_fuc_used->tp_report) {
         return 0;
     }
 
-    int ret;
-    hyn_data->hyn_irq_flg = 1;
-    if (hyn_data->work_mode < DIFF_MODE)
-    {
-        ret = hyn_data->hyn_fuc_used->tp_report(); // Read point
+    // CST328 INT is active-low when fresh data is waiting. Either the ISR
+    // flag or a current LOW level on the INT pin means we should query I2C.
+    bool fresh = touch_press_flag || (digitalRead(BOARD_TOUCH_INT) == LOW);
+    touch_press_flag = false;
 
-        for (u8 i = 0; i < hyn_data->rp_buf.rep_num; i++)
-        { // Modify the coordinate origin according to the configuration
-            if (hyn_data->plat_data.swap_xy)
-            {
-                u16 tmp = hyn_data->rp_buf.pos_info[i].pos_x;
-                hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->rp_buf.pos_info[i].pos_y;
-                hyn_data->rp_buf.pos_info[i].pos_y = tmp;
-            }
-            if (hyn_data->plat_data.reverse_x)
-                hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->plat_data.x_resolution - hyn_data->rp_buf.pos_info[i].pos_x;
-            if (hyn_data->plat_data.reverse_y)
-                hyn_data->rp_buf.pos_info[i].pos_y = hyn_data->plat_data.y_resolution - hyn_data->rp_buf.pos_info[i].pos_y;
+    if (fresh) {
+        hyn_data->hyn_irq_flg = 1;
+        hyn_data->rp_buf.rep_num = 0;
+
+        if (hyn_data->work_mode < DIFF_MODE) {
+            hyn_data->hyn_fuc_used->tp_report();
         }
-        // printf("ret:%d num:%d xy:", ret, hyn_data->rp_buf.rep_num);
-        for (int i = 0; i < hyn_data->rp_buf.rep_num; i++)
-        {
-            if(i < get_point)
-            {
-                x_array[i] = hyn_data->rp_buf.pos_info[i].pos_x;
-                y_array[i] = hyn_data->rp_buf.pos_info[i].pos_y;
+        hyn_data->rp_buf.report_need = REPORT_NONE;
+
+        uint8_t n = hyn_data->rp_buf.rep_num;
+        if (n > 0) {
+            for (u8 i = 0; i < n; i++) {
+                if (hyn_data->plat_data.swap_xy) {
+                    u16 tmp = hyn_data->rp_buf.pos_info[i].pos_x;
+                    hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->rp_buf.pos_info[i].pos_y;
+                    hyn_data->rp_buf.pos_info[i].pos_y = tmp;
+                }
+                if (hyn_data->plat_data.reverse_x)
+                    hyn_data->rp_buf.pos_info[i].pos_x = hyn_data->plat_data.x_resolution - hyn_data->rp_buf.pos_info[i].pos_x;
+                if (hyn_data->plat_data.reverse_y)
+                    hyn_data->rp_buf.pos_info[i].pos_y = hyn_data->plat_data.y_resolution - hyn_data->rp_buf.pos_info[i].pos_y;
+
+                if (i < get_point) {
+                    x_array[i] = (int16_t)hyn_data->rp_buf.pos_info[i].pos_x;
+                    y_array[i] = (int16_t)hyn_data->rp_buf.pos_info[i].pos_y;
+                }
             }
-            // printf("(%d,%d) ", hyn_data->rp_buf.pos_info[i].pos_x, hyn_data->rp_buf.pos_info[i].pos_y);
+            s_touch_x = (int16_t)hyn_data->rp_buf.pos_info[0].pos_x;
+            s_touch_y = (int16_t)hyn_data->rp_buf.pos_info[0].pos_y;
+            s_touch_held = true;
+            return (n > get_point) ? get_point : n;
         }
-        // printf("\n");
+
+        // Chip explicitly reported zero fingers -> release event.
+        s_touch_held = false;
+        return 0;
     }
-    hyn_data->rp_buf.report_need = REPORT_NONE;
 
-    return hyn_data->rp_buf.rep_num;
-
-        
-    // }
+    // No fresh chip data but a touch was previously latched. Keep reporting
+    // it so LVGL sees a continuous press while the finger is held still.
+    if (s_touch_held && get_point > 0) {
+        x_array[0] = s_touch_x;
+        y_array[0] = s_touch_y;
+        return 1;
+    }
+    return 0;
 }
 
 int hyn_touch_init(void)

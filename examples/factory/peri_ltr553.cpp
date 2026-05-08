@@ -113,11 +113,17 @@ bool LTR553_init(void)
 
 uint16_t LTR_553ALS_get_channel(int ch) // ch 0~1
 {
-    return als.getLightSensor(ch);
+    i2c0_lock();
+    uint16_t v = als.getLightSensor(ch);
+    i2c0_unlock();
+    return v;
 }
 
 uint16_t LTR_553ALS_get_ps(void)
 {
     bool saturated = false;
-    return als.getProximity(&saturated);
+    i2c0_lock();
+    uint16_t v = als.getProximity(&saturated);
+    i2c0_unlock();
+    return v;
 }

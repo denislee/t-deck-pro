@@ -34,18 +34,12 @@ extern "C" {
 
 // #undef bool
 // #undef NULL
-#undef FALSE
-#undef TRUE
 #undef DISABLE
 #undef ENABLE
-#define NULL  ((void*)0)
 #define FALSE (-1)
 #define TRUE  (0)
 #define DISABLE (0)
 #define ENABLE  (1)
-
-#define HIGH   (1)
-
 
 #define PS_FAR_AWAY    1
 #define PS_NEAR        0

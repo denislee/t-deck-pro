@@ -105,7 +105,7 @@ void gps_task(void *param)
             Serial.println(F("No GPS detected: check wiring."));
             delay(1000);
         }
-        delay(1);
+        vTaskDelay(1);
     }
 }
 

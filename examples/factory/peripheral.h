@@ -6,6 +6,18 @@
 #define WS2812_PRIORITY  (configMAX_PRIORITIES - 3)
 #define BATTERY_PRIORITY (configMAX_PRIORITIES - 4)
 #define A7682E_PRIORITY  (configMAX_PRIORITIES - 5)
+// Above the Arduino loopTask (priority 1) so the keypad drains even while the
+// main loop is blocked inside an e-paper SPI refresh.
+#define KEYPAD_PRIORITY  (configMAX_PRIORITIES - 6)
+
+// Mutex around the primary I2C bus (Wire on BOARD_I2C_SDA/SCL). Any code that
+// touches Wire while the keypad task is running must take this around its
+// full transaction (beginTransmission / write* / endTransmission, or any lib
+// call that wraps those). Without it, the keypad task can preempt mid-call
+// and corrupt TwoWire's internal txBuffer state.
+void i2c0_lock_init(void);
+void i2c0_lock(void);
+void i2c0_unlock(void);
 
 enum {
     E_PERI_LORA = 0,
@@ -49,6 +61,7 @@ int keypad_get_val(char *c);
 void keypad_loop(void);
 void keypad_regetser_cb(keypad_cb cb);
 void keypad_set_flag(void);
+void keypad_task_create(void);
 
 // gyro
 bool BHI260AP_init(void);

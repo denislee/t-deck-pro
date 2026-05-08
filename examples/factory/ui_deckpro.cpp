@@ -4,6 +4,7 @@
 #include "stdio.h"
 #include "ui_deckpro_port.h"
 #include "Arduino.h"
+#include <time.h>
 
 #define SETTING_PAGE_MAX_ITEM 7
 #define GET_BUFF_LEN(a) sizeof(a)/sizeof(a[0])
@@ -26,7 +27,7 @@
 #define LOW_VOLTAGE_THRESHOLD_MV 3300
 #define LOW_VOLTAGE_SOC_THRESHOLD 5
 #define LOW_VOLTAGE_SHUTDOWN_DELAY_MS 20000
-#define LOW_VOLTAGE_POLL_MS 250
+#define LOW_VOLTAGE_POLL_MS 2000
 static char global_buf[GLOBAL_BUF_LEN];
 
 static lv_timer_t *touch_chk_timer = NULL;
@@ -250,22 +251,23 @@ static int page_curr = 0;
 
 static struct menu_btn menu_btn_list[] = 
 {
-    {SCREEN1_ID,  &img_lora,    "Lora",     23,     13},  // Page one
-    {SCREEN2_ID,  &img_setting, "Setting",  95,     13},
-    {SCREEN3_ID,  &img_GPS,     "GPS",      167,    13},
-    {SCREEN4_ID,  &img_wifi,    "Wifi",     23,     101},
-    {SCREEN5_ID,  &img_test,    "Test",     95,     101},
-    {SCREEN6_ID,  &img_batt,    "Battery",  167,    101},
-    {SCREEN7_ID,  &img_touch,   "Input",    23,     189},
-    {SCREEN8_ID,  &img_A7682E,  "A7682E",   95,     189},
-    {SCREEN9_ID,  &img_lora,    "Shutdown", 167,    189},
-    {SCREEN10_ID, &img_PCM5102, "PCM5102",  23,     13},  // Page two
-    {SCREEN11_ID, &img_PCM5102, "Sleep",    95,     13},  // 
+    {SCREEN2_ID,  &img_setting, "Setting",  false},
+    {SCREEN3_ID,  &img_GPS,     "GPS",      true},
+    {SCREEN4_ID,  &img_wifi,    "Wifi",     false},
+    {SCREEN5_ID,  &img_test,    "Test",     true},
+    {SCREEN6_ID,  &img_batt,    "Battery",  true},
+    {SCREEN7_ID,  &img_touch,   "Input",    true},
+    {SCREEN8_ID,  &img_A7682E,  "A7682E",   true},
+    {SCREEN9_ID,  &img_lora,    "Shutdown", false},
+    {SCREEN10_ID, &img_PCM5102, "PCM5102",  true},
+    {SCREEN11_ID, &img_PCM5102, "Sleep",    false},
+    {SCREEN12_1_ID, &img_SD,    "Notes",    false},
 };
 
 static void menu_btn_event_cb(lv_event_t *e)
 {
     struct menu_btn *tgr = (struct menu_btn *)e->user_data;
+    if (tgr->hidden) return;
     scr_mgr_push(tgr->idx, false);
 }
 
@@ -304,9 +306,12 @@ static void menu_get_gesture_dir(int dir)
     }
 }
 
-static void menu_btn_create(lv_obj_t *parent, struct menu_btn *info)
+static void menu_btn_create(lv_obj_t *parent, struct menu_btn *info, int x, int y)
 {
     lv_obj_t * btn = lv_btn_create(parent);
+    if (info->hidden) {
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_remove_style_all(btn);
     lv_obj_set_width(btn, 50);
     lv_obj_set_height(btn, 50);
@@ -330,8 +335,8 @@ static void menu_btn_create(lv_obj_t *parent, struct menu_btn *info)
     lv_obj_set_style_text_color(label, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    lv_obj_set_x(btn, info->pos_x);
-    lv_obj_set_y(btn, info->pos_y);
+    lv_obj_set_x(btn, x);
+    lv_obj_set_y(btn, y);
     lv_obj_set_style_bg_img_src(btn, info->icon, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_label_set_text(label, (info->name));
     lv_obj_set_style_border_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -391,7 +396,11 @@ static void create0(lv_obj_t *parent)
     lv_obj_set_style_text_font(menu_taskbar_battery_percent, &Font_Mono_Bold_14, LV_PART_MAIN);
 
     //
-    page_num = MENU_BTN_NUM / 9;
+    int visible_count = 0;
+    for(int i = 0; i < MENU_BTN_NUM; i++) {
+        if(!menu_btn_list[i].hidden) visible_count++;
+    }
+    page_num = (visible_count - 1) / 9;
 
     menu_screen1 = lv_obj_create(parent);
     lv_obj_set_size(menu_screen1, lv_pct(100), LV_VER_RES - status_bar_height);
@@ -428,15 +437,28 @@ static void create0(lv_obj_t *parent)
         }
     }
 
+    int visible_idx = 0;
+    int col_spacing = 72;
+    int row_spacing = 88;
+    int x_start = 23;
+    int y_start = 13;
+
     for(int i = 0; i < MENU_BTN_NUM; i++) {
-        if(i < 9) {
-            menu_btn_create(menu_screen1, &menu_btn_list[i]);
-        } else {
-            menu_btn_create(menu_screen2, &menu_btn_list[i]);
-        }
+        if (menu_btn_list[i].hidden) continue;
+
+        int x, y;
+        lv_obj_t *scr;
+
+        scr = (visible_idx < 9) ? menu_screen1 : menu_screen2;
+        int pos = visible_idx % 9;
+        x = x_start + (pos % 3) * col_spacing;
+        y = y_start + (pos / 3) * row_spacing;
+        visible_idx++;
+
+        menu_btn_create(scr, &menu_btn_list[i], x, y);
     }
 
-    if(MENU_BTN_NUM > 9) {
+    if(page_num > 0) {
         ui_Panel4 = lv_obj_create(parent);
         lv_obj_set_width(ui_Panel4, 240);
         lv_obj_set_height(ui_Panel4, 25);
@@ -622,14 +644,14 @@ static void lora_mode_sw_event(lv_event_t * e)
             ui_lora_set_mode(LORA_MODE_RECV);
             lv_label_set_text(lora_sw_btn_info, "Recv");
             for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
-                lv_label_set_text_fmt(lora_lab_buf[i], " ", i);
+                lv_label_set_text(lora_lab_buf[i], " ");
             }
             lora_cnt = 0;
         } else if(ui_lora_get_mode() == LORA_MODE_RECV) {
             ui_lora_set_mode(LORA_MODE_SEND);
             lv_label_set_text(lora_sw_btn_info, "Send");
             for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
-                lv_label_set_text_fmt(lora_lab_buf[i], " ", i);
+                lv_label_set_text(lora_lab_buf[i], " ");
             }
             lora_cnt = 0;
         }
@@ -701,7 +723,7 @@ static void create1_1(lv_obj_t *parent)
 
     for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
         lora_lab_buf[i] = scr2_create_label(scr1_1_cont);
-        lv_label_set_text_fmt(lora_lab_buf[i], " ", i);
+        lv_label_set_text(lora_lab_buf[i], " ");
     }
 
     lora_sw_btn = lv_btn_create(parent);
@@ -2130,10 +2152,10 @@ static void input_timer_event(lv_timer_t *t)
         sec = 0;
     }
 
-    ret = ui_input_get_keypay_val(&keypay_v);
-    if(ret > 0)
+    ret = ui_input_get_keypad_val(&keypay_v);
+    if(ret == 1)
     {
-        ui_input_set_keypay_flag();
+        ui_input_set_keypad_flag();
         keypad_str = keypad_str + String(keypay_v);
         lv_label_set_text_fmt(input_keypad, "%s", keypad_str.c_str());
 
@@ -2908,13 +2930,13 @@ static void menu_keypay_get_event(lv_timer_t *t)
     static int sec = 0;
     static int press = false;
     char keypay_v;
-    int ret = ui_input_get_keypay_val(&keypay_v);
+    int ret = ui_input_get_keypad_val(&keypay_v);
 
     if(ret > 0)
     {
         sec = 0;
         press = true;
-        ui_input_set_keypay_flag();
+        ui_input_set_keypad_flag();
         lv_label_set_text_fmt(menu_keypad, "%c", keypay_v);
     }
 
@@ -3011,6 +3033,9 @@ void ui_auto_timer_cb(lv_timer_t *t)
     }
 }
 
+extern scr_lifecycle_t screen12;
+extern scr_lifecycle_t screen12_1;
+
 void ui_deckpro_entry(void)
 {
     lv_disp_t *disp = lv_disp_get_default();
@@ -3051,6 +3076,8 @@ void ui_deckpro_entry(void)
     scr_mgr_register(SCREEN9_ID,    &screen9);      // Shutdown
     scr_mgr_register(SCREEN10_ID,   &screen10);     // PCM5102
     scr_mgr_register(SCREEN11_ID,   &screen11);
+    scr_mgr_register(SCREEN12_ID,   &screen12);
+    scr_mgr_register(SCREEN12_1_ID, &screen12_1);
     
 
     scr_mgr_switch(SCREEN0_ID, false); // set root screen
@@ -3063,3 +3090,244 @@ void ui_deckpro_entry(void)
 
     // menu_timer = lv_timer_create(menu_keypay_get_event, 40, NULL);
 }
+//************************************[ screen 12 ]***************************************** Notes List
+#if 1
+static lv_obj_t *notes_list_obj;
+static bool notes_use_sd = false;
+static char notes_selected_file[32] = {0};
+
+static void notes_list_update(void)
+{
+    lv_obj_clean(notes_list_obj);
+    char list[UI_NOTES_MAX_COUNT][32];
+    int count = 0;
+    ui_notes_get_list(notes_use_sd, list, &count);
+
+    for (int i = 0; i < count; i++) {
+        lv_obj_t * btn = lv_list_add_btn(notes_list_obj, NULL, list[i]);
+        lv_obj_set_style_text_font(btn, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+        
+        struct note_info {
+            char name[32];
+        };
+        // We can't easily pass strings in user_data without allocation, 
+        // so we'll just use the button text in the event handler.
+    }
+}
+
+static void notes_list_btn_event_cb(lv_event_t * e)
+{
+    lv_obj_t * obj = lv_event_get_target(e);
+    const char * name = lv_list_get_btn_text(notes_list_obj, obj);
+    if (name) {
+        strncpy(notes_selected_file, name, 31);
+        scr_mgr_push(SCREEN12_1_ID, false);
+    }
+}
+
+static void notes_storage_sw_event_cb(lv_event_t * e)
+{
+    lv_obj_t * sw = lv_event_get_target(e);
+    notes_use_sd = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    notes_list_update();
+}
+
+static void notes_new_btn_event_cb(lv_event_t * e)
+{
+    notes_selected_file[0] = '\0'; // Empty name means new file
+    scr_mgr_push(SCREEN12_1_ID, false);
+}
+
+static void scr12_back_btn_event_cb(lv_event_t * e)
+{
+    scr_mgr_pop(false);
+}
+
+static void create12(lv_obj_t *parent)
+{
+    lv_obj_t * title = lv_label_create(parent);
+    lv_label_set_text(title, "Notes");
+    lv_obj_set_style_text_font(title, FONT_BOLD_SIZE_18, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
+
+    lv_obj_t * sw = lv_switch_create(parent);
+    lv_obj_set_size(sw, 40, 20);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, -10, 35);
+    if (notes_use_sd) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, notes_storage_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t * sw_label = lv_label_create(parent);
+    lv_label_set_text(sw_label, "SD");
+    lv_obj_set_style_text_font(sw_label, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_align_to(sw_label, sw, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+
+    notes_list_obj = lv_list_create(parent);
+    lv_obj_set_size(notes_list_obj, lv_pct(90), lv_pct(65));
+    lv_obj_align(notes_list_obj, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_add_event_cb(notes_list_obj, notes_list_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * new_btn = lv_btn_create(parent);
+    lv_obj_set_size(new_btn, 80, 30);
+    lv_obj_align(new_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_t * new_label = lv_label_create(new_btn);
+    lv_label_set_text(new_label, "New Note");
+    lv_obj_center(new_label);
+    lv_obj_add_event_cb(new_btn, notes_new_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    scr_back_btn_create(parent, "Notes", scr12_back_btn_event_cb);
+}
+
+static void entry12(void)
+{
+    notes_list_update();
+    ui_disp_full_refr();
+}
+
+static void exit12(void) { ui_disp_full_refr(); }
+static void destroy12(void) { }
+
+scr_lifecycle_t screen12 = {
+    .create = create12,
+    .entry = entry12,
+    .exit  = exit12,
+    .destroy = destroy12,
+};
+#endif
+
+//************************************[ screen 12.1 ]*************************************** Notes Editor
+#if 1
+static lv_obj_t *notes_editor_ta;
+static lv_timer_t *notes_editor_kb_timer = NULL;
+
+// Build a YYYY-MM-DD-HH-mm-ss.txt filename. Prefer system time, fall back to
+// GPS, and if neither is set fall back to a millis-based name so we never
+// fail to save just because there's no time source yet.
+static void notes_make_timestamp_name(char *out, size_t out_len)
+{
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (now > 1700000000 && localtime_r(&now, &tm_now) != NULL) {
+        strftime(out, out_len, "%Y-%m-%d-%H-%M-%S.txt", &tm_now);
+        return;
+    }
+
+    uint16_t y = 0;
+    uint8_t  mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    ui_gps_get_data(&y, &mo, &d);
+    ui_gps_get_time(&h, &mi, &s);
+    if (y >= 2024) {
+        snprintf(out, out_len, "%04u-%02u-%02u-%02u-%02u-%02u.txt",
+                 (unsigned)y, mo, d, h, mi, s);
+        return;
+    }
+
+    snprintf(out, out_len, "note-%lu.txt", (unsigned long)millis());
+}
+
+// Save the current buffer under a fresh timestamp filename. Empty buffers
+// are skipped so backing out of an untouched editor doesn't litter the FS.
+static bool notes_save_current(void)
+{
+    if (!notes_editor_ta) return false;
+    const char *content = lv_textarea_get_text(notes_editor_ta);
+    if (!content || content[0] == '\0') {
+        Serial.println("notes_save: empty, skipping");
+        return false;
+    }
+
+    char fname[40];
+    notes_make_timestamp_name(fname, sizeof(fname));
+    Serial.printf("notes_save: writing '%s' (%u bytes)\n",
+                  fname, (unsigned)strlen(content));
+
+    bool ok = ui_notes_write(notes_use_sd, fname, content);
+    if (!ok) Serial.println("notes_save: write failed");
+    return ok;
+}
+
+static void notes_editor_kb_timer_cb(lv_timer_t *t)
+{
+    // Drain every buffered key per tick so a burst of presses lands in one
+    // textarea update rather than one-per-tick (and one-per-redraw on this
+    // e-paper, which would feel painfully slow).
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 'E') { // Enter
+            lv_textarea_add_char(notes_editor_ta, '\n');
+        } else if (key == 0x08) { // Backspace
+            lv_textarea_del_char(notes_editor_ta);
+        } else if (key >= 32 && key <= 126) {
+            lv_textarea_add_char(notes_editor_ta, key);
+        }
+    }
+}
+
+static void notes_save_btn_event_cb(lv_event_t * e)
+{
+    notes_save_current();
+    scr_mgr_pop(false);
+}
+
+static void notes_editor_back_btn_event_cb(lv_event_t * e)
+{
+    notes_save_current();
+    scr_mgr_pop(false);
+}
+
+static void create12_1(lv_obj_t *parent)
+{
+    notes_editor_ta = lv_textarea_create(parent);
+    lv_obj_set_size(notes_editor_ta, lv_pct(94), lv_pct(78));
+    lv_obj_align(notes_editor_ta, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_text_font(notes_editor_ta, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_textarea_set_text(notes_editor_ta, "");
+
+    lv_obj_t * save_btn = lv_btn_create(parent);
+    lv_obj_set_size(save_btn, 80, 36);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    lv_obj_set_ext_click_area(save_btn, 8);
+    lv_obj_t * save_label = lv_label_create(save_btn);
+    lv_label_set_text(save_label, "Save");
+    lv_obj_center(save_label);
+    lv_obj_add_event_cb(save_btn, notes_save_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    scr_back_btn_create(parent, "Notes", notes_editor_back_btn_event_cb);
+
+    lv_group_t * g = lv_group_get_default();
+    if (!g) {
+        g = lv_group_create();
+        lv_group_set_default(g);
+    }
+    lv_group_add_obj(g, notes_editor_ta);
+    lv_group_focus_obj(notes_editor_ta);
+}
+
+static void entry12_1(void)
+{
+    // Poll the keypad buffer often. The buffer absorbs bursts already, but a
+    // tight tick keeps perceived latency low between keypress and the next
+    // partial e-paper refresh.
+    notes_editor_kb_timer = lv_timer_create(notes_editor_kb_timer_cb, 20, NULL);
+    ui_disp_full_refr();
+}
+
+static void exit12_1(void)
+{
+    if (notes_editor_kb_timer) {
+        lv_timer_del(notes_editor_kb_timer);
+        notes_editor_kb_timer = NULL;
+    }
+    ui_disp_full_refr();
+}
+
+static void destroy12_1(void) { }
+
+scr_lifecycle_t screen12_1 = {
+    .create = create12_1,
+    .entry = entry12_1,
+    .exit  = exit12_1,
+    .destroy = destroy12_1,
+};
+#endif
+

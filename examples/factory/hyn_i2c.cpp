@@ -2,6 +2,7 @@
 #ifdef ARDUINO
 #include <Arduino.h>
 #include <Wire.h>
+#include "peripheral.h"
 #endif
 
 esp_err_t hyn_i2c_init(u8 pin_sda ,u8 pin_scl)
@@ -29,11 +30,13 @@ int hyn_write_data(struct hyn_ts_data *ts_data, u8 *buf, u8 reg_len, u16 len)
 {
 #ifdef ARDUINO
     (void)reg_len;
+    i2c0_lock();
     Wire.beginTransmission(ts_data->salve_addr);
     for (u16 i = 0; i < len; ++i) {
         Wire.write(buf[i]);
     }
     uint8_t err = Wire.endTransmission(true);
+    i2c0_unlock();
     return err == 0 ? 0 : -1;
 #else
     int ret = i2c_master_write_to_device(0, ts_data->salve_addr, buf, len, 1000 / portTICK_RATE_MS);
@@ -44,11 +47,13 @@ int hyn_write_data(struct hyn_ts_data *ts_data, u8 *buf, u8 reg_len, u16 len)
 int hyn_read_data(struct hyn_ts_data *ts_data,u8 *buf, u16 len)
 {
 #ifdef ARDUINO
+    i2c0_lock();
     int n = Wire.requestFrom((int)ts_data->salve_addr, (int)len);
-    if (n != (int)len) return -1;
+    if (n != (int)len) { i2c0_unlock(); return -1; }
     for (u16 i = 0; i < len && Wire.available(); ++i) {
         buf[i] = Wire.read();
     }
+    i2c0_unlock();
     return 0;
 #else
     int ret = i2c_master_read_from_device(0, ts_data->salve_addr, buf, len, 1000 / portTICK_RATE_MS);
@@ -59,20 +64,22 @@ int hyn_read_data(struct hyn_ts_data *ts_data,u8 *buf, u16 len)
 int hyn_wr_reg(struct hyn_ts_data *ts_data, u32 reg_addr, u8 reg_len, u8 *rbuf, u16 rlen)
 {
 #ifdef ARDUINO
+    i2c0_lock();
     Wire.beginTransmission(ts_data->salve_addr);
     for (int i = reg_len - 1; i >= 0; --i) {
         uint8_t b = (reg_addr >> (i * 8)) & 0xFF;
         Wire.write(b);
     }
     uint8_t err = Wire.endTransmission(rlen ? false : true);
-    if (err != 0) return -1;
+    if (err != 0) { i2c0_unlock(); return -1; }
     if (rlen) {
         int n = Wire.requestFrom((int)ts_data->salve_addr, (int)rlen);
-        if (n != (int)rlen) return -1;
+        if (n != (int)rlen) { i2c0_unlock(); return -1; }
         for (u16 i = 0; i < rlen && Wire.available(); ++i) {
             rbuf[i] = Wire.read();
         }
     }
+    i2c0_unlock();
     return 0;
 #else
     u8 wbuf[4];

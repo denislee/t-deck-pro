@@ -12,65 +12,48 @@
  *                                  INCLUDES
  * *******************************************************************************/
 #include "lvgl.h"
-
 #include "peripheral.h"
 #include "ui_deckpro.h"
 #include "utilities.h"
+#include "factory.h"
+
+/*********************************************************************************
+ *                                   DEFINES
+ * *******************************************************************************/
+#ifndef DEFAULT_LANGUAGE_EN
+#define DEFAULT_LANGUAGE_EN 1
+#endif
+#ifndef DEFAULT_LANGUAGE_CN
+#define DEFAULT_LANGUAGE_CN 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-/*********************************************************************************
- *                                   DEFINES
- * *******************************************************************************/
-// default language
-#define DEFAULT_LANGUAGE_EN 0 // English
-#define DEFAULT_LANGUAGE_CN 1 // Chinese
 
-/*********************************************************************************
- *                                   MACROS
- * *******************************************************************************/
-
-/*********************************************************************************
- *                                  TYPEDEFS
- * *******************************************************************************/
-
-/*********************************************************************************
- *                              GLOBAL PROTOTYPES
- * *******************************************************************************/
 void ui_disp_full_refr(void);
 
-// [ screen 1 ] --- lora
-float ui_lora_get_freq(void);
-void ui_lora_set_freq(float freq);
-int ui_lora_get_bandwidth(void);
-void ui_lora_set_bandwidth(float bd);
-int ui_lora_get_power(void);
-void ui_lora_set_power(float po);
-void ui_lora_param_set(void);
-int ui_lora_get_mode(void);
-void ui_lora_set_mode(int mode);
-void ui_lora_send(const char *str);
-void ui_lora_recv_loop(void);
-bool ui_lora_get_recv(const char **str, int *rssi);
-void ui_lora_set_recv_flag(void);
-
-// [ screen 2 ] --- setting
+// DEFAULT_LANGUAGE_CN、DEFAULT_LANGUAGE_EN
 void ui_setting_set_language(int language);
+int ui_setting_get_language(void);
+
+// settings persistence
+void ui_settings_load(void);
+void ui_settings_save(void);
+
+bool ui_setting_get_keypad_light(void);
+bool ui_setting_get_motor_status(void);
+bool ui_setting_get_gps_status(void);
+bool ui_setting_get_lora_status(void);
+bool ui_setting_get_gyro_status(void);
+bool ui_setting_get_a7682_status(void);
+
 void ui_setting_set_keypad_light(bool on);
 void ui_setting_set_motor_status(bool on);
 void ui_setting_set_gps_status(bool on);
 void ui_setting_set_lora_status(bool on);
 void ui_setting_set_gyro_status(bool on);
 void ui_setting_set_a7682_status(bool on);
-
-int ui_setting_get_language(void);
-bool ui_setting_get_keypad_light(void);
-bool ui_setting_get_motor_status(void);
-bool ui_setting_get_gps_status(void);  
-bool ui_setting_get_lora_status(void); 
-bool ui_setting_get_gyro_status(void); 
-bool ui_setting_get_a7682_status(void);
 
 // setting - > About System
 const char *ui_setting_get_sf_ver(void);
@@ -119,35 +102,58 @@ int16_t ui_battery_27220_get_current(void);
 uint16_t ui_battery_27220_get_temperature(void);
 uint16_t ui_battery_27220_get_full_capacity(void);
 uint16_t ui_battery_27220_get_design_capacity(void);
+uint16_t ui_battery_27220_get_remaining_capacity(void);
 uint16_t ui_battery_27220_get_remain_capacity(void);
 uint16_t ui_battery_27220_get_percent(void);
 uint16_t ui_battery_27220_get_health(void);
-bool ui_battery_27220_is_low_alarm(void);
-bool ui_battery_is_external_power_present(void);
 const char * ui_battert_27220_get_percent_level(void);
+bool ui_battery_27220_is_low_alarm(void);
+
+/* status bar info */
+bool ui_battery_is_external_power_present(void);
 
 // [ screen 7 ] --- Input
 int ui_input_get_touch_coord(int *x, int *y);
-int ui_input_get_keypay_val(char *v);
-void ui_input_set_keypay_flag(void);
-int ui_other_get_LTR(int *ch0, int *ch1, int *ps);
-int ui_other_get_gyro(float *gyro_x, float *gyro_y, float *gyro_z);
+int ui_input_get_keypad_val(char *val);
+void ui_input_set_keypad_flag(void);
+int ui_other_get_gyro(float *x, float *y, float *z);
 
-// [ screen 8 ] --- A7682E
-bool ui_a7682_at_cb(const char *at_cmd);
-void ui_a7682_call(const char *number);
-void ui_a7682_hang_up(void);
-void ui_a7682_loop_resume(void);
-void ui_a7682_loop_suspend(void);
+// [ screen 8 ] --- Lora
+float ui_lora_get_freq(void);
+void ui_lora_set_freq(float freq);
+int ui_lora_get_bandwidth(void);
+void ui_lora_set_bandwidth(float bd);
+int ui_lora_get_power(void);
+void ui_lora_set_power(float po);
+void ui_lora_param_set(void);
+int ui_lora_get_mode(void);
+void ui_lora_set_mode(int mode);
+void ui_lora_send(const char *str);
+void ui_lora_recv_loop(void);
+bool ui_lora_get_recv(const char **str, int *rssi);
+void ui_lora_set_recv_flag(void);
 
 // shutdown
 void ui_shutdown_on(void);
 
 // [ screen 10 ] --- A7682E
-bool ui_pcm5102_cb(const char *at_cmd);void ui_pcm5102_stop(void);
+void ui_a7682_call(const char *num);
+void ui_a7682_hang_up(void);
+void ui_a7682_loop_resume(void);
+void ui_a7682_loop_suspend(void);
+bool ui_a7682_at_cb(const char *at_cmd);
+bool ui_pcm5102_cb(const char *at_cmd);
 void ui_pcm5102_stop(void);
 
+// [ screen 12 ] --- Notes
+#define UI_NOTES_MAX_COUNT 20
+void ui_notes_get_list(bool is_sd, char list[UI_NOTES_MAX_COUNT][32], int *count);
+char* ui_notes_read(bool is_sd, const char *filename);
+bool ui_notes_write(bool is_sd, const char *filename, const char *content);
+bool ui_notes_delete(bool is_sd, const char *filename);
+
 #ifdef __cplusplus
-} /*extern "C"*/
+}
 #endif
+
 #endif /* __UI_PORT_DECKPOR_H__ */

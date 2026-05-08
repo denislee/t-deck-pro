@@ -12,7 +12,7 @@
 #include "WiFi.h"
 #include <ctype.h>
 #include <TouchDrvCSTXXX.hpp>
-
+#include <Preferences.h>
 
 // extern 
 extern TouchDrvCSTXXX touch;
@@ -25,6 +25,34 @@ volatile bool default_gps_status = true;
 volatile bool default_lora_status = true;
 volatile bool default_gyro_status = true;
 volatile bool default_a7682_status = true;
+
+void ui_settings_save(void)
+{
+    Preferences prefs;
+    prefs.begin("t-deck-pro", false);
+    prefs.putInt("lang", default_language);
+    prefs.putBool("kplight", default_keypad_light);
+    prefs.putBool("motor", default_motor_status);
+    prefs.putBool("gps", default_gps_status);
+    prefs.putBool("lora", default_lora_status);
+    prefs.putBool("gyro", default_gyro_status);
+    prefs.putBool("a7682", default_a7682_status);
+    prefs.end();
+}
+
+void ui_settings_load(void)
+{
+    Preferences prefs;
+    prefs.begin("t-deck-pro", true);
+    default_language = prefs.getInt("lang", DEFAULT_LANGUAGE_EN);
+    default_keypad_light = prefs.getBool("kplight", false);
+    default_motor_status = prefs.getBool("motor", false);
+    default_gps_status = prefs.getBool("gps", true);
+    default_lora_status = prefs.getBool("lora", true);
+    default_gyro_status = prefs.getBool("gyro", true);
+    default_a7682_status = prefs.getBool("a7682", true);
+    prefs.end();
+}
 // ----
 
 void ui_disp_full_refr(void)
@@ -39,11 +67,11 @@ static int lora_default_band = 125;
 static int lora_default_power = 22;
 
 float ui_lora_get_freq(void) { return lora_default_freq; }
-void ui_lora_set_freq(float freq) { lora_default_freq = freq; }
+void ui_lora_set_freq(float freq) { lora_default_freq = freq; ui_settings_save(); }
 int ui_lora_get_bandwidth(void) { return lora_default_band; }
-void ui_lora_set_bandwidth(float bd) { lora_default_band = bd; }
+void ui_lora_set_bandwidth(float bd) { lora_default_band = bd; ui_settings_save(); }
 int ui_lora_get_power(void) { return lora_default_power; }
-void ui_lora_set_power(float po) { lora_default_power = po; }
+void ui_lora_set_power(float po) { lora_default_power = po; ui_settings_save(); }
 
 void ui_lora_param_set(void)
 {
@@ -81,34 +109,41 @@ void ui_lora_set_recv_flag(void)
 void ui_setting_set_language(int language)
 {
     default_language = language;
+    ui_settings_save();
 }
 void ui_setting_set_keypad_light(bool on)
 {
     digitalWrite(BOARD_KEYBOARD_LED, on);
     default_keypad_light = on;
+    ui_settings_save();
 }
 void ui_setting_set_motor_status(bool on)
 {
     digitalWrite(BOARD_MOTOR_PIN, on);
     default_motor_status = on;
+    ui_settings_save();
 }
 void ui_setting_set_gps_status(bool on)
 {
     // enable GPS module power
     digitalWrite(BOARD_GPS_EN, on);
     default_gps_status = on;
+    ui_settings_save();
 }
 void ui_setting_set_lora_status(bool on)
 {
     // enable LORA module power
     digitalWrite(BOARD_LORA_EN, on);
     default_lora_status = on;
+    ui_settings_save();
 }
 void ui_setting_set_gyro_status(bool on)
 {
-    // enable gyroscope module power
-    digitalWrite(BOARD_1V8_EN, on);
+    // VDD1V8 also powers the CST328 touch controller, so we must not cut
+    // it from the gyro toggle. Track the preference; the gyro driver itself
+    // can honor it at the software level.
     default_gyro_status = on;
+    ui_settings_save();
 }
 void ui_setting_set_a7682_status(bool on)
 {
@@ -116,6 +151,7 @@ void ui_setting_set_a7682_status(bool on)
     digitalWrite(BOARD_6609_EN, on);
     digitalWrite(BOARD_A7682E_PWRKEY, on);
     default_a7682_status = on;
+    ui_settings_save();
 }
 
 // get function
@@ -319,33 +355,44 @@ const char * ui_batt_25896_get_ntc_st(void)
     // return "hello";
 }
 /* 27220 */
+// All these helpers touch the primary I2C bus (BQ25896 PMU and BQ27220 fuel
+// gauge). They are called from LVGL UI tasks (battery indicator, etc.) which
+// race with the keypad drain task — guard each call with the bus mutex.
 bool ui_battery_27220_is_vaild(void) {return peri_init_st[E_PERI_BQ27220]; }
 bool ui_battery_is_external_power_present(void)
 {
     if (peri_init_st[E_PERI_BQ25896]) {
-        return PPM.isVbusIn();
+        i2c0_lock();
+        bool v = PPM.isVbusIn();
+        i2c0_unlock();
+        return v;
     }
     if (peri_init_st[E_PERI_BQ27220]) {
-        return bq27220.getAverageCurrent() > 0;
+        i2c0_lock();
+        bool v = bq27220.getAverageCurrent() > 0;
+        i2c0_unlock();
+        return v;
     }
     return false;
 }
 bool ui_battery_27220_get_input(void) { return ui_battery_is_external_power_present(); }
-bool ui_battery_27220_get_charge_finish(void) { return bq27220.getCharingFinish();}
-uint16_t ui_battery_27220_get_status(void) 
+bool ui_battery_27220_get_charge_finish(void) { i2c0_lock(); bool v = bq27220.getCharingFinish(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_status(void)
 {
     BQ27220BatteryStatus batt;
+    i2c0_lock();
     bq27220.getBatteryStatus(&batt);
+    i2c0_unlock();
     return batt.full;
 }
-uint16_t ui_battery_27220_get_voltage(void) { return bq27220.getVoltage(); }
-int16_t ui_battery_27220_get_current(void) { return bq27220.getCurrent(); }
-uint16_t ui_battery_27220_get_temperature(void) { return bq27220.getTemperature(); }
-uint16_t ui_battery_27220_get_full_capacity(void) { return bq27220.getFullChargeCapacity(); }
-uint16_t ui_battery_27220_get_design_capacity(void) { return bq27220.getDesignCapacity(); }
-uint16_t ui_battery_27220_get_remain_capacity(void) { return bq27220.getRemainingCapacity(); }
-uint16_t ui_battery_27220_get_percent(void) { return bq27220.getStateOfCharge(); }
-uint16_t ui_battery_27220_get_health(void) { return bq27220.getStateOfHealth(); }
+uint16_t ui_battery_27220_get_voltage(void) { i2c0_lock(); uint16_t v = bq27220.getVoltage(); i2c0_unlock(); return v; }
+int16_t ui_battery_27220_get_current(void) { i2c0_lock(); int16_t v = bq27220.getCurrent(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_temperature(void) { i2c0_lock(); uint16_t v = bq27220.getTemperature(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_full_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getFullChargeCapacity(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_design_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getDesignCapacity(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_remain_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getRemainingCapacity(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_percent(void) { i2c0_lock(); uint16_t v = bq27220.getStateOfCharge(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_health(void) { i2c0_lock(); uint16_t v = bq27220.getStateOfHealth(); i2c0_unlock(); return v; }
 bool ui_battery_27220_is_low_alarm(void)
 {
     if (!peri_init_st[E_PERI_BQ27220]) {
@@ -356,14 +403,18 @@ bool ui_battery_27220_is_low_alarm(void)
     BQ27220OperationStatus oper = {0};
     BQ27220GaugingStatus gauging = {0};
 
+    i2c0_lock();
     bq27220.getBatteryStatus(&batt);
     bq27220.getGaugingStatus(&gauging);
+    i2c0_unlock();
 
     return batt.reg.SYSDWN || batt.reg.TDA || gauging.reg.EDV;
 }
 const char * ui_battert_27220_get_percent_level(void)
 {
+    i2c0_lock();
     int percent = bq27220.getStateOfCharge();
+    i2c0_unlock();
     const char * str = NULL;
     if(percent < 20)      str =  LV_SYMBOL_BATTERY_EMPTY;
     else if(percent < 40) str =  LV_SYMBOL_BATTERY_1;
@@ -386,12 +437,12 @@ int ui_input_get_touch_coord(int *x, int *y)
     return ret;
 }
 
-int ui_input_get_keypay_val(char *v)
+int ui_input_get_keypad_val(char *v)
 {
     return keypad_get_val(v);
 }
 
-void ui_input_set_keypay_flag(void)
+void ui_input_set_keypad_flag(void)
 {
     keypad_set_flag();
 }
@@ -521,3 +572,136 @@ void audio_info(const char *info){
 // void audio_lasthost(const char *info){  //stream URL played
 //     Serial.print("lasthost    ");Serial.println(info);
 // }
+
+//************************************[ screen 12 ]****************************************** Notes
+#include <SPIFFS.h>
+
+void ui_notes_get_list(bool is_sd, char list[UI_NOTES_MAX_COUNT][32], int *count)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    *count = 0;
+    
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    if (!fs.exists("/notes")) {
+        fs.mkdir("/notes");
+    }
+
+    File root = fs.open("/notes");
+    if (root && root.isDirectory()) {
+        File file = root.openNextFile();
+        while (file && *count < UI_NOTES_MAX_COUNT) {
+            if (!file.isDirectory()) {
+                const char* name = file.name();
+                // file.name() might return full path or just name depending on version
+                const char* lastSlash = strrchr(name, '/');
+                if (lastSlash) {
+                    strncpy(list[*count], lastSlash + 1, 31);
+                } else {
+                    strncpy(list[*count], name, 31);
+                }
+                list[*count][31] = '\0';
+                (*count)++;
+            }
+            file = root.openNextFile();
+        }
+    }
+
+    if (is_sd) {
+        shared_spi_unlock();
+    }
+}
+
+char* ui_notes_read(bool is_sd, const char *filename)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/notes/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    File file = fs.open(path, FILE_READ);
+    if (!file) {
+        if (is_sd) shared_spi_unlock();
+        return NULL;
+    }
+
+    size_t size = file.size();
+    char *content = (char *)malloc(size + 1);
+    if (content) {
+        file.readBytes(content, size);
+        content[size] = '\0';
+    }
+    file.close();
+
+    if (is_sd) shared_spi_unlock();
+    return content;
+}
+
+bool ui_notes_write(bool is_sd, const char *filename, const char *content)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+
+    // Strip leading/trailing whitespace and any embedded control chars from
+    // the filename — the on-screen keypad sends '\n' on Enter, which would
+    // otherwise leak into the path and make fs.open() fail.
+    char clean_name[32] = {0};
+    size_t out = 0;
+    for (size_t i = 0; filename[i] && out < sizeof(clean_name) - 1; i++) {
+        unsigned char c = (unsigned char)filename[i];
+        if (c >= 32 && c < 127) clean_name[out++] = (char)c;
+    }
+    while (out > 0 && clean_name[out - 1] == ' ') clean_name[--out] = '\0';
+    if (out == 0) return false;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/notes/%s", clean_name);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    if (!fs.exists("/notes")) {
+        fs.mkdir("/notes");
+    }
+
+    File file = fs.open(path, FILE_WRITE);
+    if (!file) {
+        Serial.printf("ui_notes_write: open(%s) failed\n", path);
+        if (is_sd) shared_spi_unlock();
+        return false;
+    }
+
+    size_t content_len = strlen(content);
+    size_t written = content_len ? file.print(content) : 0;
+    file.close();
+
+    if (is_sd) shared_spi_unlock();
+
+    // Empty content writes a zero-byte file, which is a valid save.
+    return written == content_len;
+}
+
+bool ui_notes_delete(bool is_sd, const char *filename)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/notes/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+
+    bool ret = fs.remove(path);
+
+    if (is_sd) shared_spi_unlock();
+    return ret;
+}

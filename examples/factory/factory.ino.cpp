@@ -1,13 +1,7 @@
-/**
- * @file      test_touchpad.h
- * @author    ShallowGreen123
- * @license   MIT
- * @copyright Copyright (c) 2023  Shenzhen Xin Yuan Electronic Technology Co., Ltd
- * @date      2024-05-27
- *
- */
-
-
+# 1 "/tmp/tmpretfan_e"
+#include <Arduino.h>
+# 1 "/home/dns/tmp/t-deck-pro/examples/factory/factory.ino"
+# 11 "/home/dns/tmp/t-deck-pro/examples/factory/factory.ino"
 #include <Arduino.h>
 #include "utilities.h"
 #include <GxEPD2_BW.h>
@@ -42,7 +36,7 @@ static constexpr uint32_t FACTORY_BQ25896_RUNTIME_CHECK_MS = 5000;
 static constexpr uint32_t FACTORY_BQ25896_RECOVERY_COOLDOWN_MS = 30000;
 static constexpr uint32_t FACTORY_EPD_SPI_HZ = 2000000;
 TouchDrvCSTXXX touch;
-GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)); // GDEQ031T10 240x320, UC8253, (no inking, backside mark KEGMO 3100)
+GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY));
 
 uint8_t *decodebuffer = NULL;
 lv_timer_t *flush_timer = NULL;
@@ -54,7 +48,32 @@ const char Version_str2[] = "T-Deck-Pro V1.1";
 
 bool peri_init_st[E_PERI_NUM_MAX] = {0};
 static SemaphoreHandle_t shared_spi_mutex = nullptr;
-
+static void shared_spi_release_all_cs();
+void shared_spi_bus_init(void);
+void shared_spi_lock(void);
+void shared_spi_unlock(void);
+void shared_spi_prepare_device(int cs_pin);
+static bool ink_screen_init();
+static void convert_lvgl_buf_to_epd_bitmap(const lv_color_t *color_p, lv_coord_t width, lv_coord_t height);
+static void flush_epd_bitmap(const lv_area_t *area);
+static void flush_timer_cb(lv_timer_t *t);
+static void dips_render_start_cb(struct _lv_disp_drv_t * disp_drv);
+static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p);
+static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data);
+static void lvgl_init(void);
+void ink_screen_prepare_shutdown(void);
+static bool bq25896_apply_factory_profile(void);
+static bool bq25896_init(void);
+static bool bq27220_init(void);
+static void bq25896_runtime_maintain(void);
+static bool sd_care_init(void);
+static void a7682_task(void *param);
+static bool A7682E_init(void);
+static bool pcm5102a_init(void);
+void setup();
+void loop();
+void disp_full_refr(void);
+#line 58 "/home/dns/tmp/t-deck-pro/examples/factory/factory.ino"
 static void shared_spi_release_all_cs()
 {
     digitalWrite(BOARD_LORA_CS, HIGH);
@@ -100,15 +119,15 @@ void shared_spi_prepare_device(int cs_pin)
     }
 }
 
-/*********************************************************************************
- *                              STATIC PROTOTYPES
- * *******************************************************************************/
+
+
+
 static bool ink_screen_init()
 {
     shared_spi_lock();
     shared_spi_prepare_device(BOARD_EPD_CS);
 
-    // SPI.begin(BOARD_SPI_SCK, -1, BOARD_SPI_MOSI, BOARD_EPD_CS);
+
     display.epd2.selectSPI(SPI, SPISettings(FACTORY_EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
     display.init(115200, true, 2, false);
     display.setRotation(0);
@@ -181,7 +200,7 @@ static void flush_timer_cb(lv_timer_t *t)
         full_area.y2 = LCD_VER_SIZE - 1;
 
         flush_epd_bitmap(&full_area);
-        
+
         Serial.printf("flush_timer_cb:%d, %s\n", idx++, (disp_refr_mode == DISP_REFR_MODE_FULL ? "full" : "part"));
 
         disp_refr_mode = DISP_REFR_MODE_PART;
@@ -202,7 +221,7 @@ static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_colo
 {
     convert_lvgl_buf_to_epd_bitmap(color_p, lv_area_get_width(area), lv_area_get_height(area));
     flush_epd_bitmap(area);
-    
+
     static int idx = 0;
     Serial.printf("disp_flush:%d, %s, area=(%d,%d)-(%d,%d)\n",
                   idx++,
@@ -211,10 +230,10 @@ static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_colo
 
     disp_refr_mode = DISP_REFR_MODE_PART;
 
-    // Serial.printf("x1=%d, y1=%d, x2=%d, y2=%d\n", area->x1, area->y1, area->x2, area->y2);
 
-    /*IMPORTANT!!!
-     *Inform the graphics library that you are ready with the flushing*/
+
+
+
     lv_disp_flush_ready(disp_drv);
 }
 
@@ -223,7 +242,7 @@ static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
     static lv_coord_t last_x = 0;
     static lv_coord_t last_y = 0;
 
-    // uint8_t touched = touch.getPoint(&last_x, &last_y, 1);
+
     uint8_t touched = hyn_touch_get_point(&last_x, &last_y, 1);
     if(touched) {
         data->state = LV_INDEV_STATE_PR;
@@ -232,8 +251,8 @@ static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
-    // Serial.printf("touch=%d, x = %d, y = %d\n", touched, last_x, last_y);
-    /*Set the last pressed coordinates*/
+
+
     data->point.x = last_x;
     data->point.y = last_y;
 }
@@ -246,7 +265,7 @@ static void lvgl_init(void)
     lv_color_t *buf_1 = (lv_color_t *)ps_calloc(sizeof(lv_color_t), DISP_BUF_SIZE);
     lv_disp_draw_buf_init(&draw_buf_dsc_1, buf_1, NULL, LCD_HOR_SIZE * LCD_VER_SIZE);
     decodebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_BITMAP_BUF_SIZE);
-    // lv_disp_draw_buf_init(&draw_buf, lv_disp_buf_p, NULL, DISP_BUF_SIZE);
+
 
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
@@ -255,15 +274,15 @@ static void lvgl_init(void)
     disp_drv.flush_cb = disp_flush;
     disp_drv.render_start_cb = dips_render_start_cb;
     disp_drv.draw_buf = &draw_buf_dsc_1;
-    // disp_drv.rounder_cb = display_driver_rounder_cb;
+
     disp_drv.full_refresh = 1;
 
     lv_disp_drv_register(&disp_drv);
 
-    /*------------------
-     * Touchpad
-     * -----------------*/
-    /*Register a touchpad input device*/
+
+
+
+
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
@@ -303,7 +322,7 @@ static bool bq25896_apply_factory_profile(void)
 
 static bool bq25896_init(void)
 {
-    // BQ25896 --- 0x6B
+
     Wire.beginTransmission(BOARD_I2C_ADDR_BQ25896);
     if (Wire.endTransmission() == 0)
     {
@@ -320,8 +339,8 @@ static bool bq27220_init(void)
 {
     bq27220.setDefaultCapacity(FACTORY_BATTERY_DESIGN_CAPACITY_MAH);
     bool ret = bq27220.init();
-    // if(ret) 
-    //     bq27220.reset();
+
+
     return ret;
 }
 
@@ -407,12 +426,12 @@ static bool A7682E_init(void)
 {
     Serial.println("Place your board outside to catch satelite signal");
 
-    // Set module baud rate and UART pins
+
     SerialAT.begin(115200, SERIAL_8N1, BOARD_A7682E_TXD, BOARD_A7682E_RXD);
 
     Serial.println("Start modem...");
 
-    // power on
+
     digitalWrite(BOARD_A7682E_PWRKEY, LOW);
     delay(10);
     digitalWrite(BOARD_A7682E_PWRKEY, HIGH);
@@ -435,7 +454,7 @@ static bool A7682E_init(void)
             break;
         }
     }
-    
+
     Serial.println();
     delay(200);
 
@@ -448,15 +467,15 @@ static bool pcm5102a_init(void)
 {
     bool ret = audio.setPinout(BOARD_I2S_BCLK, BOARD_I2S_LRC, BOARD_I2S_DOUT);
 
-    if (ret == false) 
+    if (ret == false)
         Serial.printf("[%d] Execution error\n", __LINE__);
 
-    audio.setVolume(21); // 0...21
+    audio.setVolume(21);
 
     pinMode(BOARD_6609_EN, OUTPUT);
     digitalWrite(BOARD_6609_EN, HIGH);
 
-    // audio_paly_flag = audio.connecttoFS(SD, "/voice_time/BBIBBI.mp3");
+
 
     return true;
 }
@@ -505,40 +524,13 @@ void setup()
     Serial.begin(115200);
 
     ui_settings_load();
-
-    // delay(3000);
-
-    // // frist startup
-    // preferences.begin("my-app", false);
-    // bool start = preferences.getBool("counter", false);
-    // Serial.printf("start = %d\n", start);
-    // if(start == false)
-    // {
-    //     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
-    //     bool ret = bq25896_init();
-    //     if(ret == true)
-    //     {
-    //         preferences.putBool("counter", true);
-    //         Serial.printf("bq25896 init success\n");
-    //     }else{
-    //         Serial.printf("bq25896 init failure\n");
-    //     }
-
-    //     while (PPM.isVbusIn())
-    //     {
-    //         delay(1000);
-    //         Serial.println("Unplug the USB");
-    //     }
-    //     PPM.shutdown();
-    // }
-
-    // IO
+# 536 "/home/dns/tmp/t-deck-pro/examples/factory/factory.ino"
     pinMode(BOARD_KEYBOARD_LED, OUTPUT);
     pinMode(BOARD_MOTOR_PIN, OUTPUT);
-    pinMode(BOARD_6609_EN, OUTPUT);         // enable 7682 module
-    pinMode(BOARD_LORA_EN, OUTPUT);         // enable LORA module
-    pinMode(BOARD_GPS_EN, OUTPUT);          // enable GPS module
-    pinMode(BOARD_1V8_EN, OUTPUT);          // 1.8V rail (gyro AND touch IC)
+    pinMode(BOARD_6609_EN, OUTPUT);
+    pinMode(BOARD_LORA_EN, OUTPUT);
+    pinMode(BOARD_GPS_EN, OUTPUT);
+    pinMode(BOARD_1V8_EN, OUTPUT);
     pinMode(BOARD_A7682E_PWRKEY, OUTPUT);
 
     digitalWrite(BOARD_KEYBOARD_LED, ui_setting_get_keypad_light());
@@ -546,24 +538,24 @@ void setup()
     digitalWrite(BOARD_6609_EN, ui_setting_get_a7682_status());
     digitalWrite(BOARD_LORA_EN, ui_setting_get_lora_status());
     digitalWrite(BOARD_GPS_EN, ui_setting_get_gps_status());
-    // VDD1V8 powers the CST328 touch controller as well as the gyro,
-    // so this rail must stay on regardless of the user's gyro toggle.
+
+
     digitalWrite(BOARD_1V8_EN, HIGH);
     digitalWrite(BOARD_A7682E_PWRKEY, ui_setting_get_a7682_status());
 
-    // LORA、SD、EPD use the same SPI, in order to avoid mutual influence;
-    // before powering on, all CS signals should be pulled high and in an unselected state;
-    pinMode(BOARD_LORA_CS, OUTPUT); 
+
+
+    pinMode(BOARD_LORA_CS, OUTPUT);
     digitalWrite(BOARD_LORA_CS, HIGH);
-    pinMode(BOARD_LORA_RST, OUTPUT); 
+    pinMode(BOARD_LORA_RST, OUTPUT);
     digitalWrite(BOARD_LORA_RST, HIGH);
-    pinMode(BOARD_SD_CS, OUTPUT); 
+    pinMode(BOARD_SD_CS, OUTPUT);
     digitalWrite(BOARD_SD_CS, HIGH);
-    pinMode(BOARD_EPD_CS, OUTPUT); 
+    pinMode(BOARD_EPD_CS, OUTPUT);
     digitalWrite(BOARD_EPD_CS, HIGH);
 
 
-    // i2c devices
+
     byte error, address;
     int nDevices = 0;
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
@@ -571,10 +563,10 @@ void setup()
     for(address = 0x01; address < 0x7F; address++){
         Wire.beginTransmission(address);
         error = Wire.endTransmission();
-        if(error == 0){ // 0: success.
+        if(error == 0){
             nDevices++;
             if(address == BOARD_I2C_ADDR_TOUCH){
-                // flag_Touch_init = true;
+
                 Serial.printf("[0x%x] TOUCH find!\n", address);
             } else if (address == BOARD_I2C_ADDR_LTR_553ALS) {
                 Serial.printf("[0x%x] LTR_553ALS find!\n", address);
@@ -620,22 +612,22 @@ void setup()
     listDir(SPIFFS, "/", 0);
     Serial.println(" ------------- PERI ------------- ");
 
-    // SPI
+
     SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI);
 
-    // init peripheral
-    // touch.setPins(BOARD_TOUCH_RST, BOARD_TOUCH_INT);
+
+
     peri_init_st[E_PERI_INK_SCREEN] = ink_screen_init();
-    peri_init_st[E_PERI_LORA]       = lora_init();
-    // peri_init_st[E_PERI_TOUCH]      = touch.begin(Wire, BOARD_I2C_ADDR_TOUCH, BOARD_TOUCH_SDA, BOARD_TOUCH_SCL);
-    peri_init_st[E_PERI_KYEPAD]     = keypad_init(BOARD_I2C_ADDR_KEYBOARD);
-    peri_init_st[E_PERI_BQ25896]    = bq25896_init();
-    peri_init_st[E_PERI_BQ27220]    = bq27220_init();
-    peri_init_st[E_PERI_SD]         = sd_care_init();
-    peri_init_st[E_PERI_GPS]        = gps_init();
-    peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
+    peri_init_st[E_PERI_LORA] = lora_init();
+
+    peri_init_st[E_PERI_KYEPAD] = keypad_init(BOARD_I2C_ADDR_KEYBOARD);
+    peri_init_st[E_PERI_BQ25896] = bq25896_init();
+    peri_init_st[E_PERI_BQ27220] = bq27220_init();
+    peri_init_st[E_PERI_SD] = sd_care_init();
+    peri_init_st[E_PERI_GPS] = gps_init();
+    peri_init_st[E_PERI_BHI260AP] = BHI260AP_init();
     peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
-    peri_init_st[E_PERI_A7682E]     = A7682E_init();
+    peri_init_st[E_PERI_A7682E] = A7682E_init();
 
     if(peri_init_st[E_PERI_A7682E] == false)
     {
@@ -650,9 +642,9 @@ void setup()
 
     disp_full_refr();
 
-    // Start the keypad drain task last so the rest of the I2C bus init has
-    // settled. From here on, every Wire user on bus 0 must serialize via
-    // i2c0_lock() / i2c0_unlock() — see peripheral.h.
+
+
+
     if (peri_init_st[E_PERI_KYEPAD]) {
         keypad_task_create();
     }
@@ -664,34 +656,32 @@ uint32_t tick = 0;
 void loop()
 {
     lv_task_handler();
-    // keypad is drained by a dedicated FreeRTOS task — see keypad_task_create().
+
     bq25896_runtime_maintain();
 
-    if(peri_init_st[E_PERI_PCM5102A] == true) 
+    if(peri_init_st[E_PERI_PCM5102A] == true)
     {
         audio.loop();
     }
-    
+
     vTaskDelay(1);
 
 
     if(millis() - tick > 3000) {
         tick = millis();
-        // printf("BOARD_LORA_CS=%d\n", digitalRead(BOARD_LORA_CS));
-        // printf("BOARD_LORA_RST=%d\n", digitalRead(BOARD_LORA_RST));
-        // printf("BOARD_LORA_BUSY=%d\n", digitalRead(BOARD_LORA_BUSY));
-        // printf("BOARD_LORA_EN=%d\n", digitalRead(BOARD_LORA_EN));
 
-        // printf("BOARD_EPD_CS=%d\n", digitalRead(BOARD_EPD_CS));
+
+
+
+
+
     }
 }
 
-/*********************************************************************************
- *                              GLOBAL PROTOTYPES
- * *******************************************************************************/
+
+
+
 void disp_full_refr(void)
 {
     disp_refr_mode = DISP_REFR_MODE_FULL;
 }
-
-
