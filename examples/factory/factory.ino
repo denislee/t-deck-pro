@@ -174,11 +174,14 @@ static void flush_timer_cb(lv_timer_t *t)
     static int idx = 0;
     lv_disp_t *disp = lv_disp_get_default();
     if(disp->rendering_in_progress == false) {
+        // Use the live driver dimensions, not LCD_HOR_SIZE/LCD_VER_SIZE,
+        // so the forced full refresh tracks the current rotation
+        // (factory_set_landscape swaps hor_res/ver_res).
         lv_area_t full_area;
         full_area.x1 = 0;
         full_area.y1 = 0;
-        full_area.x2 = LCD_HOR_SIZE - 1;
-        full_area.y2 = LCD_VER_SIZE - 1;
+        full_area.x2 = disp->driver->hor_res - 1;
+        full_area.y2 = disp->driver->ver_res - 1;
 
         flush_epd_bitmap(&full_area);
         
@@ -223,6 +226,13 @@ static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
     static lv_coord_t last_x = 0;
     static lv_coord_t last_y = 0;
 
+    if (!ui_setting_get_touch_status()) {
+        data->state = LV_INDEV_STATE_REL;
+        data->point.x = last_x;
+        data->point.y = last_y;
+        return;
+    }
+
     // uint8_t touched = touch.getPoint(&last_x, &last_y, 1);
     uint8_t touched = hyn_touch_get_point(&last_x, &last_y, 1);
     if(touched) {
@@ -257,6 +267,11 @@ static void lvgl_init(void)
     disp_drv.draw_buf = &draw_buf_dsc_1;
     // disp_drv.rounder_cb = display_driver_rounder_cb;
     disp_drv.full_refresh = 1;
+    // sw_rotate intentionally NOT set: LVGL 8.3 silently bails out of the
+    // rotation path when full_refresh && sw_rotate are both on
+    // (lib/lvgl/src/core/lv_refr.c:1186 — "cannot rotate a full refreshed
+    // display!"), so flushes never reach the EPD when rotated. We rotate at
+    // the GxEPD2 level instead via factory_set_landscape().
 
     lv_disp_drv_register(&disp_drv);
 
@@ -298,6 +313,7 @@ static bool bq25896_apply_factory_profile(void)
     PPM.setTerminationCurr(FACTORY_BQ25896_TERMINATION_MA);
     PPM.enableChargingTermination();
     PPM.enableCharge();
+    PPM.disableStatPin();
     return PPM.enableMeasure();
 }
 
@@ -506,6 +522,17 @@ void setup()
 
     ui_settings_load();
 
+    // If a WiFi SSID is configured, kick off an asynchronous connect now so
+    // NTP can finish before the user notices. Connect runs on its own task,
+    // so it does not delay the rest of setup().
+    {
+        char saved_ssid[33] = {0};
+        ui_wifi_get_ssid(saved_ssid, sizeof(saved_ssid));
+        if (saved_ssid[0] != '\0') {
+            ui_wifi_set_enabled(true);
+        }
+    }
+
     // delay(3000);
 
     // // frist startup
@@ -692,6 +719,61 @@ void loop()
 void disp_full_refr(void)
 {
     disp_refr_mode = DISP_REFR_MODE_FULL;
+}
+
+void disp_hard_refresh(void)
+{
+    // Multiple B/W flashes are needed to fully clear residual charge on this
+    // panel — a single pair leaves visible ghosting of the prior frame.
+    const int cycles = 3;
+
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_EPD_CS);
+    display.setFullWindow();
+
+    for (int i = 0; i < cycles; i++) {
+        display.firstPage();
+        do {
+            display.fillScreen(GxEPD_BLACK);
+        } while (display.nextPage());
+
+        display.firstPage();
+        do {
+            display.fillScreen(GxEPD_WHITE);
+        } while (display.nextPage());
+    }
+
+    shared_spi_unlock();
+
+    // Flag next LVGL flush as FULL so it draws the UI on a clean slate
+    disp_full_refr();
+}
+
+// Switch the display+LVGL into landscape (320x240) or portrait (240x320).
+// Workaround for the LVGL 8.3 full_refresh+sw_rotate bug: instead of asking
+// LVGL to rotate the buffer (which silently no-ops), we swap LVGL's logical
+// resolution and let GxEPD2's setRotation handle the actual pixel rotation
+// when the bitmap is drawn to the panel.
+void factory_set_landscape(bool landscape)
+{
+    lv_disp_t *disp = lv_disp_get_default();
+    if (!disp || !disp->driver) return;
+
+    lv_coord_t want_w = landscape ? LCD_VER_SIZE : LCD_HOR_SIZE; // 320 vs 240
+    lv_coord_t want_h = landscape ? LCD_HOR_SIZE : LCD_VER_SIZE; // 240 vs 320
+    if (disp->driver->hor_res == want_w && disp->driver->ver_res == want_h) return;
+
+    disp->driver->hor_res = want_w;
+    disp->driver->ver_res = want_h;
+
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_EPD_CS);
+    display.setRotation(landscape ? 1 : 0);
+    shared_spi_unlock();
+
+    lv_disp_drv_update(disp, disp->driver);
+
+    disp_full_refr();
 }
 
 

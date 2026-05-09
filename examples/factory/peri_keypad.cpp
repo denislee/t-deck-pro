@@ -13,11 +13,11 @@
 #define KEYPAD_RELEASE_VAL_MIN 1
 #define KEYPAD_RELEASE_VAL_MAX 35
 
-// Modifier-key sentinels. Picked outside printable ASCII (32-126) so text
-// consumers skip them, but distinct so modifier-aware code can tell them
-// apart. Only sym is currently treated as a held modifier.
-#define KEY_ALT_SENTINEL  0x1B
-#define KEY_SYM_SENTINEL  0x1A
+// Modifier sentinels. Picked outside printable ASCII (32-126) so text
+// consumers skip them. Both sym and shift are held modifiers tracked across
+// press/release events; the sentinels themselves never reach the input buffer.
+#define KEY_SYM_SENTINEL    0x1A
+#define KEY_SHIFT_SENTINEL  0x19
 
 const char keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
@@ -29,14 +29,12 @@ const char keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     // (swapped with the bottom-row left-shift slot for thumb ergonomics).
     {KEY_SYM_SENTINEL, 'z', 'x', 'c', 'v', 'b', 'n', 'm', '$', 'E'},
     // Bottom row has a left-shift, mic, wide spacebar, sym, and right-shift.
-    // The left-shift slot (index 5) emits the alt sentinel, while the
-    // top-of-z-row slot acts as sym — the two were swapped from the silkscreen
-    // labels for thumb ergonomics. Sym at index 8 still works as a sym
-    // modifier so either thumb can reach it. The right-shift (index 9)
-    // doubles as a secondary spacebar. The wide spacebar lands on native
-    // col 2 (array index 7 after the col reversal), which used to be 'S' —
-    // pressing space registered as the letter S.
-    {' ', ' ', ' ', ' ', ' ', KEY_ALT_SENTINEL, '*', ' ', KEY_SYM_SENTINEL, ' '},
+    // Left-shift (index 5) is a held modifier that selects shift_keymap. The
+    // mic key (index 6) emits ASCII ESC (0x1B) so it doubles as Escape. The
+    // wide spacebar (index 7, col 2 after the col reversal) emits a literal
+    // space. Sym at index 8 is a held modifier; the top-of-z-row slot also
+    // acts as sym so either thumb can reach it.
+    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
 };
 
 // Symbol overlay applied while the sym key is held. Reads off each key's
@@ -47,7 +45,17 @@ const char sym_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'#', '1', '2', '3', '(', ')', '_', '-', '+', '@'},
     {'*', '4', '5', '6', '/', ':', ';', '\'', '"', 0x08},
     {KEY_SYM_SENTINEL, '7', '8', '9', '?', '!', ',', '.', '$', 'E'},
-    {' ', ' ', ' ', ' ', ' ', KEY_ALT_SENTINEL, '*', ' ', KEY_SYM_SENTINEL, ' '},
+    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
+};
+
+// Uppercase overlay applied while the shift key is held. Non-letter slots
+// match keymap so backspace, enter, ESC, and modifiers behave normally with
+// shift held. Shift takes precedence over sym when both are held.
+const char shift_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
+    {'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'},
+    {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0x08},
+    {KEY_SYM_SENTINEL, 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '$', 'E'},
+    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
 };
 
 Adafruit_TCA8418 keypad;
@@ -105,9 +113,10 @@ static inline void keypad_buf_push(char c)
 
 int keypad_state = KEYPAD_RELEASE;
 
-// Tracks whether the sym modifier is currently held. Updated from
-// keypad_loop on press/release of the sym key.
+// Tracks whether the sym/shift modifiers are currently held. Updated from
+// keypad_loop on press/release of the corresponding modifier key.
 static volatile bool sym_held = false;
+static volatile bool shift_held = false;
 
 bool keypad_init(int address)
 {
@@ -184,10 +193,14 @@ void keypad_loop(void)
         int row = k / KEYPAD_COLS;
         int col = (KEYPAD_COLS - 1) - k % KEYPAD_COLS;
 
-        // Sym is a held modifier — track its state on both press and release,
-        // and never push its sentinel to the buffer.
+        // Sym/shift are held modifiers — track their state on both press and
+        // release, and never push the sentinel to the buffer.
         if (keymap[row][col] == KEY_SYM_SENTINEL) {
             sym_held = (state == KEYPAD_PRESS);
+            continue;
+        }
+        if (keymap[row][col] == KEY_SHIFT_SENTINEL) {
+            shift_held = (state == KEYPAD_PRESS);
             continue;
         }
 
@@ -195,7 +208,10 @@ void keypad_loop(void)
             continue;
         }
 
-        char c = sym_held ? sym_keymap[row][col] : keymap[row][col];
+        char c;
+        if (shift_held)    c = shift_keymap[row][col];
+        else if (sym_held) c = sym_keymap[row][col];
+        else               c = keymap[row][col];
         keypad_state = state;
         keypad_buf_push(c);
     }

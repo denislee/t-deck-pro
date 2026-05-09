@@ -72,6 +72,9 @@ enum {
     SCREEN12_1_ID,
     SCREEN13_ID,
     SCREEN13_1_ID,
+    SCREEN13_2_ID,        // Reader font settings
+    SCREEN_USB_MSC_ID,
+    SCREEN_LOCK_ID,
 };
 
 typedef void (*ui_indev_read_cb)(int);
@@ -130,8 +133,9 @@ typedef struct _ui_pcm5102 {
 
 
 typedef struct {
-    char name[16];
-    int rssi;
+    char name[33];
+    int  rssi;
+    bool open;   // true = open network (no auth), false = encrypted
 }ui_wifi_scan_info_t;
 /*********************************************************************************
  *                              GLOBAL PROTOTYPES

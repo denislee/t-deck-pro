@@ -7,12 +7,21 @@
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
+#include "USB.h"
+#include "USBMSC.h"
 #include <TinyGPS++.h>
 #include "peripheral.h"
 #include "WiFi.h"
 #include <ctype.h>
+#include <stdlib.h>
+#include <time.h>
 #include <TouchDrvCSTXXX.hpp>
 #include <Preferences.h>
+#include "esp_sntp.h"
+#include "ping/ping_sock.h"
+#include "lwip/ip_addr.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // extern 
 extern TouchDrvCSTXXX touch;
@@ -25,6 +34,32 @@ volatile bool default_gps_status = true;
 volatile bool default_lora_status = true;
 volatile bool default_gyro_status = true;
 volatile bool default_a7682_status = true;
+volatile bool default_touch_status = false;
+
+// System font preferences. face: 0=Mono Bold (built-in), 1=Sans (Montserrat).
+// size index picks from the per-face size table in ui_deckpro.cpp.
+static int default_font_face = 0;
+static int default_font_size = 1; // medium by default
+static int default_reader_rotation  = 0; // 0=portrait, 1=landscape
+
+// WiFi credentials and timezone. Persisted via Preferences. Keep buffers
+// generously sized so callers can pass through without truncating spec-legal
+// values (32 bytes SSID, 63 bytes WPA2 password).
+static char default_wifi_ssid[33] = {0};
+static char default_wifi_password[65] = {0};
+static char default_wifi_tz[48] = "UTC0";
+
+// Live WiFi state. Bumped from the connect/disconnect helpers and the
+// asynchronous WiFi event handler so the UI can poll without blocking.
+static volatile ui_wifi_status_t wifi_status = UI_WIFI_STATUS_DISABLED;
+static volatile bool ntp_synced = false;
+
+int  ui_font_face_get(void)        { return default_font_face; }
+void ui_font_face_set(int f)       { default_font_face = f; ui_settings_save(); }
+int  ui_font_size_get(void)        { return default_font_size; }
+void ui_font_size_set(int s)       { default_font_size = s; ui_settings_save(); }
+int  ui_reader_rotation_get(void)         { return default_reader_rotation; }
+void ui_reader_rotation_set(int r)        { default_reader_rotation = r ? 1 : 0; ui_settings_save(); }
 
 void ui_settings_save(void)
 {
@@ -37,6 +72,13 @@ void ui_settings_save(void)
     prefs.putBool("lora", default_lora_status);
     prefs.putBool("gyro", default_gyro_status);
     prefs.putBool("a7682", default_a7682_status);
+    prefs.putBool("touch", default_touch_status);
+    prefs.putInt("sys_face", default_font_face);
+    prefs.putInt("sys_size", default_font_size);
+    prefs.putInt("rd_rot",  default_reader_rotation);
+    prefs.putString("wifi_ssid", default_wifi_ssid);
+    prefs.putString("wifi_pass", default_wifi_password);
+    prefs.putString("wifi_tz",   default_wifi_tz);
     prefs.end();
 }
 
@@ -51,13 +93,47 @@ void ui_settings_load(void)
     default_lora_status = prefs.getBool("lora", true);
     default_gyro_status = prefs.getBool("gyro", true);
     default_a7682_status = prefs.getBool("a7682", true);
+    default_touch_status = prefs.getBool("touch", false);
+    default_font_face = prefs.getInt("sys_face", 0);
+    default_font_size = prefs.getInt("sys_size", 1);
+    default_reader_rotation  = prefs.getInt("rd_rot",  0);
+
+    String s = prefs.getString("wifi_ssid", "");
+    strncpy(default_wifi_ssid, s.c_str(), sizeof(default_wifi_ssid) - 1);
+    default_wifi_ssid[sizeof(default_wifi_ssid) - 1] = '\0';
+
+    s = prefs.getString("wifi_pass", "");
+    strncpy(default_wifi_password, s.c_str(), sizeof(default_wifi_password) - 1);
+    default_wifi_password[sizeof(default_wifi_password) - 1] = '\0';
+
+    s = prefs.getString("wifi_tz", "UTC0");
+    strncpy(default_wifi_tz, s.c_str(), sizeof(default_wifi_tz) - 1);
+    default_wifi_tz[sizeof(default_wifi_tz) - 1] = '\0';
+
     prefs.end();
+
+    // Apply TZ now so any later localtime() call (before NTP completes) at
+    // least uses the correct offset once the clock is set.
+    setenv("TZ", default_wifi_tz, 1);
+    tzset();
 }
 // ----
 
 void ui_disp_full_refr(void)
 {
     disp_full_refr();
+    lv_obj_invalidate(lv_scr_act());
+}
+
+void ui_disp_hard_refr(void)
+{
+    disp_hard_refresh();
+    lv_obj_invalidate(lv_scr_act());
+}
+
+void ui_set_reader_landscape(bool landscape)
+{
+    factory_set_landscape(landscape);
 }
 //************************************[ screen 0 ]****************************************** menu
 //************************************[ screen 1 ]****************************************** lora
@@ -117,6 +193,10 @@ void ui_setting_set_keypad_light(bool on)
     default_keypad_light = on;
     ui_settings_save();
 }
+void ui_setting_apply_keypad_light(bool on)
+{
+    digitalWrite(BOARD_KEYBOARD_LED, on);
+}
 void ui_setting_set_motor_status(bool on)
 {
     digitalWrite(BOARD_MOTOR_PIN, on);
@@ -153,6 +233,14 @@ void ui_setting_set_a7682_status(bool on)
     default_a7682_status = on;
     ui_settings_save();
 }
+void ui_setting_set_touch_status(bool on)
+{
+    // Soft toggle: the CST328 IC stays powered (its 1V8 rail is shared with
+    // the gyro and must stay up), but the LVGL touchpad_read callback honors
+    // this flag and stops reporting points when off.
+    default_touch_status = on;
+    ui_settings_save();
+}
 
 // get function
 int ui_setting_get_language(void)
@@ -182,6 +270,10 @@ bool ui_setting_get_gyro_status(void)
 bool ui_setting_get_a7682_status(void)
 {
     return default_a7682_status;
+}
+bool ui_setting_get_touch_status(void)
+{
+    return default_touch_status;
 }
 
 // About System
@@ -259,19 +351,334 @@ int is_chinese_utf8(const char *str) {
 
 void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len)
 {
-    int n = WiFi.scanNetworks();
-    if(n > list_len)
-        n = list_len;
-    
     memset(list, 0, (sizeof(*list) * list_len));
-    for(int i = 0; i < n; i++)
-    {
-        const char *str = WiFi.SSID(i).c_str();
-        if(is_chinese_utf8(str))
-            continue;
-        strncpy(list[i].name, WiFi.SSID(i).c_str(), 16);
-        list[i].rssi = WiFi.RSSI(i);
+
+    // Force STA mode and tear down any in-flight association first. An active
+    // WiFi.begin() (e.g. from boot autoconnect) blocks scanNetworks() and
+    // returns -1, leaving the user staring at an empty list. Settling for a
+    // moment after mode/disconnect avoids racing the WiFi event loop.
+    WiFi.mode(WIFI_STA);
+    if (WiFi.status() == WL_CONNECTED || WiFi.status() == WL_IDLE_STATUS) {
+        WiFi.disconnect(false, false);
     }
+    // Drain a previously-running scan if any: scanNetworks(async=true,...) can
+    // be called from another path; we wait for it to settle so the new scan
+    // doesn't clobber state.
+    int prev = WiFi.scanComplete();
+    if (prev == WIFI_SCAN_RUNNING) {
+        Serial.println("[wifi] previous scan still running, waiting...");
+        for (int i = 0; i < 50 && WiFi.scanComplete() == WIFI_SCAN_RUNNING; i++) {
+            delay(100);
+        }
+    }
+    delay(100);
+
+    // Synchronous scan with hidden networks revealed.
+    int n = WiFi.scanNetworks(/*async*/ false, /*show_hidden*/ true);
+    Serial.printf("[wifi] scanNetworks returned %d\n", n);
+    if (n < 0) {
+        // Common case after a failed begin(): radio is in a half-state. Reset
+        // it and try once more before giving up.
+        Serial.println("[wifi] scan failed, resetting radio and retrying");
+        WiFi.disconnect(true, true);
+        delay(200);
+        WiFi.mode(WIFI_STA);
+        delay(200);
+        n = WiFi.scanNetworks(false, true);
+        Serial.printf("[wifi] retry scanNetworks returned %d\n", n);
+    }
+    if (n < 0) n = 0;
+    if (n > list_len) n = list_len;
+
+    int dst = 0;
+    for (int i = 0; i < n && dst < list_len; i++)
+    {
+        String s = WiFi.SSID(i);
+        const char *str = s.c_str();
+        if (!str) continue;
+        if (str[0] == '\0') {
+            // Hidden SSID — surface it as "<hidden>" so the user can still
+            // pick it (they'll need the SSID to actually connect though).
+            strncpy(list[dst].name, "<hidden>", sizeof(list[dst].name) - 1);
+        } else if (is_chinese_utf8(str)) {
+            // Skip CJK SSIDs — our font has no glyphs for them.
+            Serial.printf("[wifi] skipping non-latin SSID '%s'\n", str);
+            continue;
+        } else {
+            strncpy(list[dst].name, str, sizeof(list[dst].name) - 1);
+        }
+        list[dst].name[sizeof(list[dst].name) - 1] = '\0';
+        list[dst].rssi = WiFi.RSSI(i);
+        list[dst].open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        Serial.printf("[wifi]   %2d: %-32s %4d dBm enc=%d\n",
+                      i, list[dst].name, list[dst].rssi,
+                      (int)WiFi.encryptionType(i));
+        dst++;
+    }
+    // Free the scan-result buffer the WiFi driver allocated. Otherwise
+    // repeated scans (e.g. via 'r') leak memory.
+    WiFi.scanDelete();
+}
+
+static bool wifi_enabled = false;
+
+void ui_wifi_get_ssid(char *out, int out_len)
+{
+    if (!out || out_len <= 0) return;
+    strncpy(out, default_wifi_ssid, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
+void ui_wifi_set_ssid(const char *ssid)
+{
+    if (!ssid) return;
+    strncpy(default_wifi_ssid, ssid, sizeof(default_wifi_ssid) - 1);
+    default_wifi_ssid[sizeof(default_wifi_ssid) - 1] = '\0';
+    ui_settings_save();
+}
+
+void ui_wifi_get_password(char *out, int out_len)
+{
+    if (!out || out_len <= 0) return;
+    strncpy(out, default_wifi_password, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
+void ui_wifi_set_password(const char *password)
+{
+    if (!password) return;
+    strncpy(default_wifi_password, password, sizeof(default_wifi_password) - 1);
+    default_wifi_password[sizeof(default_wifi_password) - 1] = '\0';
+    ui_settings_save();
+}
+
+void ui_wifi_get_tz(char *out, int out_len)
+{
+    if (!out || out_len <= 0) return;
+    strncpy(out, default_wifi_tz, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
+void ui_wifi_set_tz(const char *tz)
+{
+    if (!tz) return;
+    strncpy(default_wifi_tz, tz, sizeof(default_wifi_tz) - 1);
+    default_wifi_tz[sizeof(default_wifi_tz) - 1] = '\0';
+    setenv("TZ", default_wifi_tz, 1);
+    tzset();
+    ui_settings_save();
+}
+
+int ui_wifi_get_status(void)
+{
+    return (int)wifi_status;
+}
+
+void ui_wifi_get_ip(char *out, int out_len)
+{
+    if (!out || out_len <= 0) return;
+    if (WiFi.status() == WL_CONNECTED) {
+        strncpy(out, WiFi.localIP().toString().c_str(), out_len - 1);
+    } else {
+        out[0] = '\0';
+        return;
+    }
+    out[out_len - 1] = '\0';
+}
+
+bool ui_time_is_synced(void)
+{
+    return ntp_synced;
+}
+
+bool ui_time_get_local(struct tm *out)
+{
+    if (!out) return false;
+    time_t now = time(NULL);
+    localtime_r(&now, out);
+    if (!ntp_synced && (out->tm_year + 1900) >= 2024) {
+        ntp_synced = true;
+    }
+    return ntp_synced;
+}
+
+void ui_ntp_resync(void)
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+    setenv("TZ", default_wifi_tz, 1);
+    tzset();
+    // configTzTime applies the TZ string and starts SNTP polling. Multiple
+    // servers give us a fallback if pool.ntp.org is unreachable.
+    configTzTime(default_wifi_tz, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+// ----- ICMP ping -----
+//
+// esp_ping runs the actual ICMP exchange on its own internal task and signals
+// us via callbacks. The caller blocks on a semaphore until the session ends
+// (success, timeout, or hard failure), so the calling task can treat ping as
+// a simple synchronous "did it reply" boolean.
+
+typedef struct {
+    volatile bool replied;
+    volatile uint32_t rtt_ms;
+    SemaphoreHandle_t done;
+} ui_ping_result_t;
+
+static void ui_ping_on_success(esp_ping_handle_t hdl, void *args)
+{
+    ui_ping_result_t *r = (ui_ping_result_t *)args;
+    uint32_t elapsed = 0;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+    r->rtt_ms = elapsed;
+    r->replied = true;
+}
+
+static void ui_ping_on_timeout(esp_ping_handle_t hdl, void *args)
+{
+    // No-op — replied stays false, on_end will signal completion.
+    (void)hdl; (void)args;
+}
+
+static void ui_ping_on_end(esp_ping_handle_t hdl, void *args)
+{
+    ui_ping_result_t *r = (ui_ping_result_t *)args;
+    if (r && r->done) xSemaphoreGive(r->done);
+}
+
+bool ui_ping(const char *host_or_ip, int timeout_ms, int *rtt_ms_out)
+{
+    if (rtt_ms_out) *rtt_ms_out = -1;
+    if (!host_or_ip || !*host_or_ip) return false;
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[ping] not connected");
+        return false;
+    }
+
+    IPAddress addr;
+    if (!addr.fromString(host_or_ip)) {
+        if (!WiFi.hostByName(host_or_ip, addr)) {
+            Serial.printf("[ping] DNS lookup failed for %s\n", host_or_ip);
+            return false;
+        }
+    }
+    ip_addr_t target = {0};
+    target.type = IPADDR_TYPE_V4;
+    target.u_addr.ip4.addr = (uint32_t)addr;
+
+    ui_ping_result_t result = {};
+    result.done = xSemaphoreCreateBinary();
+    if (!result.done) return false;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.count = 1;
+    cfg.interval_ms = 0;
+    cfg.timeout_ms = (uint32_t)timeout_ms;
+    cfg.target_addr = target;
+    cfg.task_stack_size = 4096;
+
+    esp_ping_callbacks_t cbs = {};
+    cbs.cb_args = &result;
+    cbs.on_ping_success = ui_ping_on_success;
+    cbs.on_ping_timeout = ui_ping_on_timeout;
+    cbs.on_ping_end     = ui_ping_on_end;
+
+    esp_ping_handle_t hdl = NULL;
+    if (esp_ping_new_session(&cfg, &cbs, &hdl) != ESP_OK) {
+        Serial.println("[ping] esp_ping_new_session failed");
+        vSemaphoreDelete(result.done);
+        return false;
+    }
+
+    Serial.printf("[ping] -> %s\n", addr.toString().c_str());
+    esp_ping_start(hdl);
+
+    // Wait a bit beyond the timeout to give on_end a chance to fire.
+    if (xSemaphoreTake(result.done, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) {
+        Serial.println("[ping] semaphore timeout");
+    }
+
+    esp_ping_stop(hdl);
+    esp_ping_delete_session(hdl);
+    vSemaphoreDelete(result.done);
+
+    if (result.replied) {
+        if (rtt_ms_out) *rtt_ms_out = (int)result.rtt_ms;
+        Serial.printf("[ping] reply rtt=%u ms\n", (unsigned)result.rtt_ms);
+        return true;
+    }
+    Serial.println("[ping] no reply");
+    return false;
+}
+
+// Background task: WiFi.begin() can take many seconds; we don't want to stall
+// the LVGL/main loop. The task self-deletes when done.
+static void wifi_connect_task(void *arg)
+{
+    wifi_status = UI_WIFI_STATUS_CONNECTING;
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false, true);
+    WiFi.begin(default_wifi_ssid, default_wifi_password);
+
+    const uint32_t t0 = millis();
+    while (millis() - t0 < 20000) {
+        if (WiFi.status() == WL_CONNECTED) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifi_status = UI_WIFI_STATUS_CONNECTED;
+        wifi_enabled = true;
+        ui_ntp_resync();
+        Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
+    } else {
+        wifi_status = UI_WIFI_STATUS_FAILED;
+        Serial.printf("[wifi] connect failed (ssid=%s)\n", default_wifi_ssid);
+    }
+
+    vTaskDelete(NULL);
+}
+
+bool ui_wifi_connect(void)
+{
+    if (default_wifi_ssid[0] == '\0') {
+        wifi_status = UI_WIFI_STATUS_IDLE;
+        return false;
+    }
+    if (wifi_status == UI_WIFI_STATUS_CONNECTING) return true;
+    // Stack of 4096 is enough for WiFi.begin + a String op or two; lower
+    // priority than the keypad task so we never preempt I2C transactions.
+    xTaskCreate(wifi_connect_task, "wifi_conn", 4096, NULL, 1, NULL);
+    return true;
+}
+
+void ui_wifi_disconnect(void)
+{
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    wifi_enabled = false;
+    wifi_status = UI_WIFI_STATUS_DISABLED;
+    ntp_synced = false;
+}
+
+void ui_wifi_set_enabled(bool en)
+{
+    if (en) {
+        WiFi.mode(WIFI_STA);
+        wifi_enabled = true;
+        if (default_wifi_ssid[0] != '\0') {
+            ui_wifi_connect();
+        } else {
+            wifi_status = UI_WIFI_STATUS_IDLE;
+        }
+    } else {
+        ui_wifi_disconnect();
+    }
+}
+
+bool ui_wifi_get_enabled(void)
+{
+    return wifi_enabled;
 }
 //************************************[ screen 5 ]****************************************** Test
 bool ui_test_get(int peri_id)
@@ -576,6 +983,85 @@ void audio_info(const char *info){
 //************************************[ screen 12 ]****************************************** Notes
 #include <SPIFFS.h>
 
+#if CONFIG_TINYUSB_MSC_ENABLED
+static USBMSC msc;
+static bool msc_active = false;
+
+static int32_t onRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+    uint32_t count = bufsize / 512;
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_SD_CS);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!SD.readRAW((uint8_t*)buffer + (i * 512), lba + i)) {
+            shared_spi_unlock();
+            return -1;
+        }
+    }
+    shared_spi_unlock();
+    return bufsize;
+}
+
+static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    uint32_t count = bufsize / 512;
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_SD_CS);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!SD.writeRAW(buffer + (i * 512), lba + i)) {
+            shared_spi_unlock();
+            return -1;
+        }
+    }
+    shared_spi_unlock();
+    return bufsize;
+}
+
+static bool onStartStop(uint8_t power_condition, bool start, bool load_eject) {
+    return true;
+}
+
+void ui_usb_msc_begin(void) {
+    if (msc_active) return;
+    
+    if (!ui_test_sd_card()) return;
+
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_SD_CS);
+    uint32_t sectorCount = SD.cardSize() / 512;
+    shared_spi_unlock();
+
+    msc.vendorID("LilyGo");
+    msc.productID("T-Deck Pro");
+    msc.productRevision("1.0");
+    msc.onRead(onRead);
+    msc.onWrite(onWrite);
+    msc.onStartStop(onStartStop);
+    msc.mediaPresent(true);
+    msc.begin(sectorCount, 512);
+    USB.begin();
+    msc_active = true;
+}
+
+void ui_usb_msc_end(void) {
+    if (!msc_active) return;
+    Serial.println("[usb_msc] disabling mass storage");
+    // Tell the host the medium has gone away. Give it a polling cycle to
+    // notice via TEST UNIT READY before we tear down the LUN — otherwise
+    // some hosts keep the drive cached as if still mounted.
+    msc.mediaPresent(false);
+    delay(200);
+    msc.end();
+    msc_active = false;
+}
+
+bool ui_usb_msc_is_active(void) {
+    return msc_active;
+}
+#else
+void ui_usb_msc_begin(void) {}
+void ui_usb_msc_end(void) {}
+bool ui_usb_msc_is_active(void) { return false; }
+#endif
+
 void ui_notes_get_list(bool is_sd, char list[UI_NOTES_MAX_COUNT][32], int *count)
 {
     fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
@@ -718,11 +1204,11 @@ void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *cou
         shared_spi_prepare_device(BOARD_SD_CS);
     }
 
-    if (!fs.exists("/reader")) {
-        fs.mkdir("/reader");
+    if (!fs.exists("/books")) {
+        fs.mkdir("/books");
     }
 
-    File root = fs.open("/reader");
+    File root = fs.open("/books");
     if (root && root.isDirectory()) {
         File file = root.openNextFile();
         while (file && *count < UI_READER_MAX_COUNT) {
@@ -751,7 +1237,7 @@ char* ui_reader_read(bool is_sd, const char *filename)
 {
     fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
     char path[64];
-    snprintf(path, sizeof(path), "/reader/%s", filename);
+    snprintf(path, sizeof(path), "/books/%s", filename);
 
     if (is_sd) {
         shared_spi_lock();
@@ -760,19 +1246,77 @@ char* ui_reader_read(bool is_sd, const char *filename)
 
     File file = fs.open(path, FILE_READ);
     if (!file) {
+        log_e("reader: open failed: %s", path);
         if (is_sd) shared_spi_unlock();
         return NULL;
     }
 
     size_t size = file.size();
-    char *content = (char *)malloc(size + 1);
-    if (content) {
-        file.readBytes(content, size);
-        content[size] = '\0';
+    log_i("reader: opened %s size=%u psram=%u heap=%u",
+          path, (unsigned)size,
+          (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+
+    // Books can be large; prefer PSRAM, fall back to internal heap.
+    char *content = (char *)ps_malloc(size + 1);
+    if (!content) content = (char *)malloc(size + 1);
+    if (!content) {
+        log_e("reader: alloc %u failed", (unsigned)(size + 1));
+        file.close();
+        if (is_sd) shared_spi_unlock();
+        return NULL;
     }
+
+    size_t got = file.readBytes(content, size);
+    content[got] = '\0';
+    if (got != size) log_w("reader: short read %u/%u", (unsigned)got, (unsigned)size);
     file.close();
 
     if (is_sd) shared_spi_unlock();
     return content;
+}
+
+size_t ui_reader_size(bool is_sd, const char *filename)
+{
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/books/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+    File file = fs.open(path, FILE_READ);
+    size_t size = file ? file.size() : 0;
+    if (file) file.close();
+    if (is_sd) shared_spi_unlock();
+    return size;
+}
+
+size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset,
+                            char *buf, size_t buf_size)
+{
+    if (!buf || buf_size == 0) return 0;
+    buf[0] = '\0';
+
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/books/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+    File file = fs.open(path, FILE_READ);
+    size_t got = 0;
+    if (file) {
+        if (offset > 0) file.seek(offset);
+        got = file.readBytes(buf, buf_size - 1);
+        buf[got] = '\0';
+        file.close();
+    } else {
+        log_e("reader_range: open failed: %s", path);
+    }
+    if (is_sd) shared_spi_unlock();
+    return got;
 }
 

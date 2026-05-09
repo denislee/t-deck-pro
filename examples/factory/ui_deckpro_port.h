@@ -32,6 +32,8 @@ extern "C" {
 #endif
 
 void ui_disp_full_refr(void);
+void ui_disp_hard_refr(void);
+void ui_set_reader_landscape(bool landscape);
 
 // DEFAULT_LANGUAGE_CN、DEFAULT_LANGUAGE_EN
 void ui_setting_set_language(int language);
@@ -47,13 +49,19 @@ bool ui_setting_get_gps_status(void);
 bool ui_setting_get_lora_status(void);
 bool ui_setting_get_gyro_status(void);
 bool ui_setting_get_a7682_status(void);
+bool ui_setting_get_touch_status(void);
 
 void ui_setting_set_keypad_light(bool on);
+// Drive the keypad LED without touching the persisted user preference.
+// Used by the lock screen to turn the LED off while locked and restore it
+// to the user's setting on unlock.
+void ui_setting_apply_keypad_light(bool on);
 void ui_setting_set_motor_status(bool on);
 void ui_setting_set_gps_status(bool on);
 void ui_setting_set_lora_status(bool on);
 void ui_setting_set_gyro_status(bool on);
 void ui_setting_set_a7682_status(bool on);
+void ui_setting_set_touch_status(bool on);
 
 // setting - > About System
 const char *ui_setting_get_sf_ver(void);
@@ -71,6 +79,44 @@ void ui_gps_get_speed(double *speed);
 
 // [ screen 4 ] --- Wifi Scan
 void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len);
+void ui_wifi_set_enabled(bool en);
+bool ui_wifi_get_enabled(void);
+
+// [ screen 4.1 ] --- Wifi Config + NTP
+// Stored credentials. Buffers must be at least 33 bytes for SSID and 65 for password.
+void ui_wifi_get_ssid(char *out, int out_len);
+void ui_wifi_set_ssid(const char *ssid);
+void ui_wifi_get_password(char *out, int out_len);
+void ui_wifi_set_password(const char *password);
+// Timezone string in POSIX TZ format (e.g. "UTC0", "EST5EDT,M3.2.0,M11.1.0").
+void ui_wifi_get_tz(char *out, int out_len);
+void ui_wifi_set_tz(const char *tz);
+
+typedef enum {
+    UI_WIFI_STATUS_DISABLED = 0,
+    UI_WIFI_STATUS_IDLE,
+    UI_WIFI_STATUS_CONNECTING,
+    UI_WIFI_STATUS_CONNECTED,
+    UI_WIFI_STATUS_FAILED,
+} ui_wifi_status_t;
+int ui_wifi_get_status(void);
+void ui_wifi_get_ip(char *out, int out_len);
+// Kicks off an asynchronous connect attempt using stored creds. Returns false
+// immediately if creds are missing.
+bool ui_wifi_connect(void);
+void ui_wifi_disconnect(void);
+
+// True once SNTP has produced a plausible local time (year >= 2024).
+bool ui_time_is_synced(void);
+// Fills 'out' with current local time. Returns true when the clock is synced.
+bool ui_time_get_local(struct tm *out);
+// Triggers a manual NTP refresh (no-op if WiFi is not connected).
+void ui_ntp_resync(void);
+
+// ICMP ping. Blocks for up to (timeout_ms + ~500ms) on the calling task.
+// Returns true on reply; rtt_ms_out (if non-NULL) gets the RTT in ms on
+// success or -1 on failure. Returns false immediately if not associated.
+bool ui_ping(const char *host_or_ip, int timeout_ms, int *rtt_ms_out);
 
 // [ screen 5 ] --- State
 bool ui_test_get(int peri_id);
@@ -156,6 +202,23 @@ bool ui_notes_delete(bool is_sd, const char *filename);
 #define UI_READER_MAX_COUNT 20
 void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *count);
 char* ui_reader_read(bool is_sd, const char *filename);
+size_t ui_reader_size(bool is_sd, const char *filename);
+// Reads up to buf_size-1 bytes starting at `offset`, null-terminates buf,
+// returns bytes actually read (0 on failure / EOF).
+size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset, char *buf, size_t buf_size);
+
+// System font selection (persisted via Preferences).
+int  ui_font_face_get(void);
+void ui_font_face_set(int f);
+int  ui_font_size_get(void);
+void ui_font_size_set(int s);
+int  ui_reader_rotation_get(void);   // 0=portrait, 1=landscape
+void ui_reader_rotation_set(int r);
+
+// USB MSC
+void ui_usb_msc_begin(void);
+void ui_usb_msc_end(void);
+bool ui_usb_msc_is_active(void);
 
 #ifdef __cplusplus
 }
