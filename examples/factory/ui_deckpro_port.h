@@ -33,6 +33,7 @@ extern "C" {
 
 void ui_disp_full_refr(void);
 void ui_disp_hard_refr(void);
+void ui_disp_white_clear(void);
 void ui_set_reader_landscape(bool landscape);
 
 // DEFAULT_LANGUAGE_CN、DEFAULT_LANGUAGE_EN
@@ -44,6 +45,7 @@ void ui_settings_load(void);
 void ui_settings_save(void);
 
 bool ui_setting_get_keypad_light(void);
+bool ui_setting_get_red_led(void);
 bool ui_setting_get_motor_status(void);
 bool ui_setting_get_gps_status(void);
 bool ui_setting_get_lora_status(void);
@@ -56,6 +58,7 @@ void ui_setting_set_keypad_light(bool on);
 // Used by the lock screen to turn the LED off while locked and restore it
 // to the user's setting on unlock.
 void ui_setting_apply_keypad_light(bool on);
+void ui_setting_set_red_led(bool on);
 void ui_setting_set_motor_status(bool on);
 void ui_setting_set_gps_status(bool on);
 void ui_setting_set_lora_status(bool on);
@@ -208,12 +211,31 @@ size_t ui_reader_size(bool is_sd, const char *filename);
 size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset, char *buf, size_t buf_size);
 
 // System font selection (persisted via Preferences).
-int  ui_font_face_get(void);
-void ui_font_face_set(int f);
-int  ui_font_size_get(void);
-void ui_font_size_set(int s);
+//
+// Each slot holds an independent (face, size) pair so the four broad font
+// regions can be styled separately:
+//   GENERAL       — every UI label that goes through ui_get_font(pt, false)
+//   TOPBAR        — clock + battery + wifi/charge symbols in the status bar
+//   READER_BODY   — the reader page content
+//   READER_FOOTER — the small status line at the bottom of the reader view
+#define UI_FONT_SLOT_GENERAL       0
+#define UI_FONT_SLOT_TOPBAR        1
+#define UI_FONT_SLOT_READER_BODY   2
+#define UI_FONT_SLOT_READER_FOOTER 3
+#define UI_FONT_SLOT_COUNT         4
+
+int  ui_font_face_get(int slot);
+void ui_font_face_set(int slot, int f);
+int  ui_font_size_get(int slot);
+void ui_font_size_set(int slot, int s);
 int  ui_reader_rotation_get(void);   // 0=portrait, 1=landscape
 void ui_reader_rotation_set(int r);
+
+// Last-read bookmark: filename + byte offset of the page the reader was
+// showing when the user left the view. Returns true if a saved entry exists
+// and `filename` is non-empty.
+bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset);
+void ui_reader_resume_set(const char *filename, size_t offset);
 
 // USB MSC
 void ui_usb_msc_begin(void);

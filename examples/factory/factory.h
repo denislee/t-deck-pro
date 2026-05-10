@@ -70,6 +70,7 @@ extern "C" {
 
 void disp_full_refr(void); // Next global refresh
 void disp_hard_refresh(void); // Thorough B/W cycle refresh
+void disp_white_clear(void); // Single full-screen white frame
 void factory_set_landscape(bool landscape); // Reader-view rotation hook
 void ink_screen_prepare_shutdown(void);
 void shared_spi_bus_init(void);

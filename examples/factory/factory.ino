@@ -21,6 +21,7 @@
 #include "peripheral.h"
 #include <Preferences.h>
 #include <freertos/semphr.h>
+#include "esp_pm.h"
 
 Preferences preferences;
 
@@ -508,6 +509,27 @@ static void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
     }
 }
 
+static void peripheral_init_task(void *param)
+{
+    // SPI must be initialized before this task starts
+    peri_init_st[E_PERI_LORA]       = lora_init();
+    peri_init_st[E_PERI_BQ25896]    = bq25896_init();
+    peri_init_st[E_PERI_BQ27220]    = bq27220_init();
+    peri_init_st[E_PERI_SD]         = sd_care_init();
+    peri_init_st[E_PERI_GPS]        = gps_init();
+    peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
+    peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
+    peri_init_st[E_PERI_A7682E]     = A7682E_init();
+
+    if(peri_init_st[E_PERI_A7682E] == false)
+    {
+        peri_init_st[E_PERI_PCM5102A] = pcm5102a_init();
+    }
+
+    Serial.println("Background peripheral initialization complete.");
+    vTaskDelete(NULL);
+}
+
 void setup()
 {
     gpio_hold_dis((gpio_num_t)BOARD_6609_EN);
@@ -522,9 +544,7 @@ void setup()
 
     ui_settings_load();
 
-    // If a WiFi SSID is configured, kick off an asynchronous connect now so
-    // NTP can finish before the user notices. Connect runs on its own task,
-    // so it does not delay the rest of setup().
+    // If a WiFi SSID is configured, kick off an asynchronous connect now
     {
         char saved_ssid[33] = {0};
         ui_wifi_get_ssid(saved_ssid, sizeof(saved_ssid));
@@ -533,53 +553,26 @@ void setup()
         }
     }
 
-    // delay(3000);
-
-    // // frist startup
-    // preferences.begin("my-app", false);
-    // bool start = preferences.getBool("counter", false);
-    // Serial.printf("start = %d\n", start);
-    // if(start == false)
-    // {
-    //     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
-    //     bool ret = bq25896_init();
-    //     if(ret == true)
-    //     {
-    //         preferences.putBool("counter", true);
-    //         Serial.printf("bq25896 init success\n");
-    //     }else{
-    //         Serial.printf("bq25896 init failure\n");
-    //     }
-
-    //     while (PPM.isVbusIn())
-    //     {
-    //         delay(1000);
-    //         Serial.println("Unplug the USB");
-    //     }
-    //     PPM.shutdown();
-    // }
-
     // IO
     pinMode(BOARD_KEYBOARD_LED, OUTPUT);
+    pinMode(BOARD_RED_LED, OUTPUT);
     pinMode(BOARD_MOTOR_PIN, OUTPUT);
-    pinMode(BOARD_6609_EN, OUTPUT);         // enable 7682 module
-    pinMode(BOARD_LORA_EN, OUTPUT);         // enable LORA module
-    pinMode(BOARD_GPS_EN, OUTPUT);          // enable GPS module
-    pinMode(BOARD_1V8_EN, OUTPUT);          // 1.8V rail (gyro AND touch IC)
+    pinMode(BOARD_6609_EN, OUTPUT);         
+    pinMode(BOARD_LORA_EN, OUTPUT);         
+    pinMode(BOARD_GPS_EN, OUTPUT);          
+    pinMode(BOARD_1V8_EN, OUTPUT);          
     pinMode(BOARD_A7682E_PWRKEY, OUTPUT);
 
     digitalWrite(BOARD_KEYBOARD_LED, ui_setting_get_keypad_light());
+    digitalWrite(BOARD_RED_LED, ui_setting_get_red_led());
     digitalWrite(BOARD_MOTOR_PIN, ui_setting_get_motor_status());
     digitalWrite(BOARD_6609_EN, ui_setting_get_a7682_status());
     digitalWrite(BOARD_LORA_EN, ui_setting_get_lora_status());
     digitalWrite(BOARD_GPS_EN, ui_setting_get_gps_status());
-    // VDD1V8 powers the CST328 touch controller as well as the gyro,
-    // so this rail must stay on regardless of the user's gyro toggle.
     digitalWrite(BOARD_1V8_EN, HIGH);
     digitalWrite(BOARD_A7682E_PWRKEY, ui_setting_get_a7682_status());
 
-    // LORA、SD、EPD use the same SPI, in order to avoid mutual influence;
-    // before powering on, all CS signals should be pulled high and in an unselected state;
+    // SPI Pins
     pinMode(BOARD_LORA_CS, OUTPUT); 
     digitalWrite(BOARD_LORA_CS, HIGH);
     pinMode(BOARD_LORA_RST, OUTPUT); 
@@ -589,43 +582,33 @@ void setup()
     pinMode(BOARD_EPD_CS, OUTPUT); 
     digitalWrite(BOARD_EPD_CS, HIGH);
 
-
-    // i2c devices
-    byte error, address;
-    int nDevices = 0;
+    // Optimized I2C Check
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
     Serial.printf(" ------------- I2C ------------- \n");
-    for(address = 0x01; address < 0x7F; address++){
+    const uint8_t known_addresses[] = {
+        BOARD_I2C_ADDR_TOUCH,
+        BOARD_I2C_ADDR_LTR_553ALS,
+        BOARD_I2C_ADDR_GYROSCOPDE,
+        BOARD_I2C_ADDR_KEYBOARD,
+        BOARD_I2C_ADDR_BQ27220,
+        BOARD_I2C_ADDR_BQ25896
+    };
+
+    for (uint8_t address : known_addresses) {
         Wire.beginTransmission(address);
-        error = Wire.endTransmission();
-        if(error == 0){ // 0: success.
-            nDevices++;
-            if(address == BOARD_I2C_ADDR_TOUCH){
-                // flag_Touch_init = true;
-                Serial.printf("[0x%x] TOUCH find!\n", address);
-            } else if (address == BOARD_I2C_ADDR_LTR_553ALS) {
-                Serial.printf("[0x%x] LTR_553ALS find!\n", address);
-            } else if (address == BOARD_I2C_ADDR_GYROSCOPDE) {
-                Serial.printf("[0x%x] GYROSCOPDE find!\n", address);
-            } else if (address == BOARD_I2C_ADDR_KEYBOARD) {
-                Serial.printf("[0x%x] KEYBOARD find!\n", address);
-            } else if (address == BOARD_I2C_ADDR_BQ27220) {
-                Serial.printf("[0x%x] BQ27220 find!\n", address);
-            } else if (address == BOARD_I2C_ADDR_BQ25896) {
-                Serial.printf("[0x%x] BQ25896 find!\n", address);
-            }
+        if (Wire.endTransmission() == 0) {
+            if (address == BOARD_I2C_ADDR_TOUCH) Serial.printf("[0x%x] TOUCH find!\n", address);
+            else if (address == BOARD_I2C_ADDR_LTR_553ALS) Serial.printf("[0x%x] LTR_553ALS find!\n", address);
+            else if (address == BOARD_I2C_ADDR_GYROSCOPDE) Serial.printf("[0x%x] GYROSCOPDE find!\n", address);
+            else if (address == BOARD_I2C_ADDR_KEYBOARD) Serial.printf("[0x%x] KEYBOARD find!\n", address);
+            else if (address == BOARD_I2C_ADDR_BQ27220) Serial.printf("[0x%x] BQ27220 find!\n", address);
+            else if (address == BOARD_I2C_ADDR_BQ25896) Serial.printf("[0x%x] BQ25896 find!\n", address);
         }
     }
 
-    for(int i = 0; i < 3; i++) {
-        Wire.beginTransmission(0x5A);
-        error = Wire.endTransmission();
-        if(error == 0) {
-            isT_Deck_Pro_v1_0 = 0;
-        } else {
-            isT_Deck_Pro_v1_0 = 1;
-        }
-    }
+    // Hardware version detection (V1.1 has DRV2605 at 0x5A)
+    Wire.beginTransmission(0x5A);
+    isT_Deck_Pro_v1_0 = (Wire.endTransmission() != 0);
 
 #ifdef T_DECK_PRO_V1_0
     if(!isT_Deck_Pro_v1_0){
@@ -637,52 +620,40 @@ void setup()
     }
 #endif
 
-    Serial.printf(" ------------- SPIFFS ------------- \n");
-
     if(!SPIFFS.begin(true)){
         Serial.println("SPIFFS Mount Failed");
         return;
     }
 
-    listDir(SPIFFS, "/", 0);
-    Serial.println(" ------------- PERI ------------- ");
-
     // SPI
     SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI);
+    shared_spi_bus_init();
 
-    // init peripheral
-    // touch.setPins(BOARD_TOUCH_RST, BOARD_TOUCH_INT);
+    // Critical Peripheral Init (Required for UI/Input)
     peri_init_st[E_PERI_INK_SCREEN] = ink_screen_init();
-    peri_init_st[E_PERI_LORA]       = lora_init();
-    // peri_init_st[E_PERI_TOUCH]      = touch.begin(Wire, BOARD_I2C_ADDR_TOUCH, BOARD_TOUCH_SDA, BOARD_TOUCH_SCL);
     peri_init_st[E_PERI_KYEPAD]     = keypad_init(BOARD_I2C_ADDR_KEYBOARD);
-    peri_init_st[E_PERI_BQ25896]    = bq25896_init();
-    peri_init_st[E_PERI_BQ27220]    = bq27220_init();
-    peri_init_st[E_PERI_SD]         = sd_care_init();
-    peri_init_st[E_PERI_GPS]        = gps_init();
-    peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
-    peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
-    peri_init_st[E_PERI_A7682E]     = A7682E_init();
-
-    if(peri_init_st[E_PERI_A7682E] == false)
-    {
-        peri_init_st[E_PERI_PCM5102A] = pcm5102a_init();
-    }
-
-    peri_init_st[E_PERI_TOUCH] = hyn_touch_init();
+    peri_init_st[E_PERI_TOUCH]      = hyn_touch_init();
 
     lvgl_init();
-
     ui_deckpro_entry();
-
     disp_full_refr();
 
-    // Start the keypad drain task last so the rest of the I2C bus init has
-    // settled. From here on, every Wire user on bus 0 must serialize via
-    // i2c0_lock() / i2c0_unlock() — see peripheral.h.
+    // Start background initialization for slow peripherals
+    xTaskCreate(peripheral_init_task, "peri_init", 1024 * 4, NULL, 1, NULL);
+
+    // Start keypad task
     if (peri_init_st[E_PERI_KYEPAD]) {
         keypad_task_create();
     }
+
+    // Power management
+    esp_pm_config_esp32s3_t pm_config = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 10,
+        .light_sleep_enable = true
+    };
+    esp_pm_configure(&pm_config);
+    setCpuFrequencyMhz(80);
 }
 
 
@@ -747,6 +718,19 @@ void disp_hard_refresh(void)
 
     // Flag next LVGL flush as FULL so it draws the UI on a clean slate
     disp_full_refr();
+}
+
+void disp_white_clear(void)
+{
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_EPD_CS);
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
+    display.powerOff();
+    shared_spi_unlock();
 }
 
 // Switch the display+LVGL into landscape (320x240) or portrait (240x320).

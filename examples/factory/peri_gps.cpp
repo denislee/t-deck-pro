@@ -23,8 +23,8 @@ static uint32_t gps_active_baud = 0;
 uint8_t buffer[256];
 
 static constexpr uint32_t GPS_BAUD_CANDIDATES[] = {
-    38400,
     9600,
+    38400,
     115200,
     57600,
     19200,
@@ -35,9 +35,9 @@ static void gps_power_cycle()
 {
     SerialGPS.end();
     digitalWrite(BOARD_GPS_EN, LOW);
-    delay(300);
+    delay(100);
     digitalWrite(BOARD_GPS_EN, HIGH);
-    delay(600);
+    delay(200);
 }
 
 static bool gps_try_baud(uint32_t baud)

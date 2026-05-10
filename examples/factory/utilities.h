@@ -92,6 +92,7 @@
 #define BOARD_GPS_RXD 44
 #define BOARD_GPS_TXD 43
 #define BOARD_GPS_PPS 1
+#define BOARD_RED_LED 1
 
 // A7682E Modem
 #define BOARD_A7682E_RI     7

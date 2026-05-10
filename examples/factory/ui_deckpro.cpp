@@ -23,8 +23,13 @@
 #define FONT_BOLD_MONO_SIZE_18 ui_get_font(18, true)
 #define FONT_BOLD_MONO_SIZE_19 ui_get_font(19, true)
 
-// Forward declaration for the font helper
+// Forward declarations for the font helpers (defined alongside the reader
+// font catalog further down). The taskbar/menu code that references the
+// per-slot accessors lives above the catalog, so we need these visible early.
 static const lv_font_t* ui_get_font(int pt, bool force_mono);
+static const lv_font_t* topbar_font_get(void);
+static const lv_font_t* reader_body_font_get(void);
+static const lv_font_t* reader_footer_font_get(void);
 
 #define GLOBAL_BUF_LEN 30
 #define LOW_VOLTAGE_THRESHOLD_MV 3300
@@ -743,10 +748,15 @@ static void ui_taskbar_create(lv_obj_t *parent)
     lv_obj_set_scrollbar_mode(menu_taskbar, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(menu_taskbar, LV_OBJ_FLAG_SCROLLABLE);
     
+    // Top bar elements (clock, battery icon+%, wifi/charge symbols) all share
+    // the TOPBAR slot's font so the row scales together when the user changes
+    // the top-bar font in System Font settings.
+    const lv_font_t *tb_font = topbar_font_get();
+
     menu_taskbar_time = lv_label_create(menu_taskbar);
     lv_obj_set_style_border_width(menu_taskbar_time, 0, 0);
     lv_label_set_text_fmt(menu_taskbar_time, "%02d:%02d", 10, 19);
-    lv_obj_set_style_text_font(menu_taskbar_time, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(menu_taskbar_time, tb_font, LV_PART_MAIN);
     lv_obj_align(menu_taskbar_time, LV_ALIGN_LEFT_MID, 10, 0);
 
     lv_obj_t *status_parent = lv_obj_create(menu_taskbar);
@@ -767,10 +777,12 @@ static void ui_taskbar_create(lv_obj_t *parent)
 
     menu_taskbar_wifi = lv_label_create(status_parent);
     lv_label_set_text_fmt(menu_taskbar_wifi, "%s", LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(menu_taskbar_wifi, tb_font, LV_PART_MAIN);
     lv_obj_add_flag(menu_taskbar_wifi, LV_OBJ_FLAG_HIDDEN);
 
     menu_taskbar_charge = lv_label_create(status_parent);
     lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_CHARGE);
+    lv_obj_set_style_text_font(menu_taskbar_charge, tb_font, LV_PART_MAIN);
     lv_obj_add_flag(menu_taskbar_charge, LV_OBJ_FLAG_HIDDEN);
 
     if(taskbar_statue[TASKBAR_ID_WIFI])
@@ -780,9 +792,10 @@ static void ui_taskbar_create(lv_obj_t *parent)
         lv_obj_clear_flag(menu_taskbar_charge, LV_OBJ_FLAG_HIDDEN);
 
     menu_taskbar_battery = lv_label_create(status_parent);
-    
+    lv_obj_set_style_text_font(menu_taskbar_battery, tb_font, LV_PART_MAIN);
+
     menu_taskbar_battery_percent = lv_label_create(status_parent);
-    lv_obj_set_style_text_font(menu_taskbar_battery_percent, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(menu_taskbar_battery_percent, tb_font, LV_PART_MAIN);
 }
 
 static void create0(lv_obj_t *parent)
@@ -836,9 +849,11 @@ static void create0(lv_obj_t *parent)
     lv_obj_t *sc_right = lv_label_create(parent);
     lv_label_set_text(sc_right,
         "r   Reader\n"
+        "c   Resume\n"
         "q   USB\n"
         "p   Ping\n"
-        "l   Lock");
+        "l   Lock\n"
+        "d   Sleep");
     lv_obj_set_style_text_font(sc_right, &lv_font_tamzen_8x16, LV_PART_MAIN);
     lv_obj_set_style_text_color(sc_right, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_align(sc_right, LV_ALIGN_TOP_LEFT, 132, 60);
@@ -1453,6 +1468,8 @@ static int setting_page_num = 0;
 static int setting_curr_page = 0;
 static ui_setting_handle setting_handle_list[] = {
     {.name = "- WIFI Setup",     .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN4_ID},
+    {.name = "- System Font",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN13_2_ID},
+    {.name = "Red LED",          .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_red_led,      .get_cb = ui_setting_get_red_led},
     {.name = "Keypad Backlight", .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_keypad_light, .get_cb = ui_setting_get_keypad_light},
     {.name = "Motor Status",     .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_motor_status, .get_cb = ui_setting_get_motor_status},
     {.name = "Power GPS",        .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gps_status,   .get_cb = ui_setting_get_gps_status},
@@ -1460,7 +1477,6 @@ static ui_setting_handle setting_handle_list[] = {
     {.name = "Power Gyro",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gyro_status,  .get_cb = ui_setting_get_gyro_status},
     {.name = "Power A7682",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_a7682_status, .get_cb = ui_setting_get_a7682_status},
     {.name = "Touchscreen",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_touch_status, .get_cb = ui_setting_get_touch_status},
-    {.name = "- System Font",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN13_2_ID},
     {.name = "- Lora",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN1_ID},
     {.name = "- GPS",            .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN3_ID},
     {.name = "- Test",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN5_ID},
@@ -4150,6 +4166,16 @@ static void ui_do_ntp_sync(void)
     ui_disp_full_refr();
 }
 
+// Reader-screen statics are defined here (rather than alongside the rest of
+// the reader code below) because the home-screen 'c' shortcut in
+// menu_keypay_get_event needs to stage a resume target before pushing
+// SCREEN13_1, and C++ doesn't allow two file-scope static definitions.
+static char   reader_selected_file[32] = {0};
+// Set true by 'c' on the home screen; entry13_1 consumes it to seed
+// reader_page_offsets[0] so the first render is the user's last-read page.
+static bool   reader_resume_pending = false;
+static size_t reader_resume_offset  = 0;
+
 static void menu_keypay_get_event(lv_timer_t *timer)
 {
     uint16_t curr_id = scr_mgr_get_curr_scr_id();
@@ -4166,6 +4192,22 @@ static void menu_keypay_get_event(lv_timer_t *timer)
                 case 'r':
                     scr_mgr_push(SCREEN13_ID, false);
                     break;
+                case 'c': {
+                    // Resume reading the last book at its saved byte
+                    // offset. Skip if no bookmark exists.
+                    char saved[32] = {0};
+                    size_t saved_off = 0;
+                    if (ui_reader_resume_get(saved, sizeof(saved), &saved_off)
+                        && saved[0]) {
+                        strncpy(reader_selected_file, saved,
+                                sizeof(reader_selected_file) - 1);
+                        reader_selected_file[sizeof(reader_selected_file) - 1] = '\0';
+                        reader_resume_offset = saved_off;
+                        reader_resume_pending = true;
+                        scr_mgr_push(SCREEN13_1_ID, false);
+                    }
+                    break;
+                }
                 case 'n':
                     notes_selected_file[0] = '\0';
                     scr_mgr_push(SCREEN12_1_ID, false);
@@ -4175,6 +4217,10 @@ static void menu_keypay_get_event(lv_timer_t *timer)
                     break;
                 case 'l':
                     scr_mgr_push(SCREEN_LOCK_ID, false);
+                    break;
+                case 'd':
+                    ui_disp_white_clear();
+                    scr_mgr_push(SCREEN11_ID, false);
                     break;
                 case 'w':
                     ui_wifi_set_enabled(!ui_wifi_get_enabled());
@@ -4601,7 +4647,8 @@ static bool ends_with(const char *str, const char *suffix) {
 
 static lv_obj_t *reader_list_obj;
 static bool reader_use_sd = true; // Always use SD for ebooks
-static char reader_selected_file[32] = {0};
+// reader_selected_file, reader_resume_pending, and reader_resume_offset are
+// defined earlier in the file so the home-screen 'c' shortcut can reach them.
 static lv_group_t *reader_group = NULL;
 static lv_timer_t *reader_kb_timer = NULL;
 
@@ -4819,26 +4866,31 @@ static const reader_face_t reader_faces[] = {
 };
 #define READER_FACE_COUNT ((int)(sizeof(reader_faces)/sizeof(reader_faces[0])))
 
-static const reader_face_t* reader_face_current(void)
+static const reader_face_t* reader_face_for_slot(int slot)
 {
-    int f = ui_font_face_get();
+    int f = ui_font_face_get(slot);
     if (f < 0 || f >= READER_FACE_COUNT) f = 0;
     return &reader_faces[f];
 }
 
-static int reader_size_clamped(void)
+static int reader_size_clamped_slot(int slot)
 {
-    const reader_face_t *fc = reader_face_current();
-    int s = ui_font_size_get();
+    const reader_face_t *fc = reader_face_for_slot(slot);
+    int s = ui_font_size_get(slot);
     if (s < 0) s = 0;
     if (s >= fc->n_sizes) s = fc->n_sizes - 1;
     return s;
 }
 
-static const lv_font_t* reader_font_get(void)
+static const lv_font_t* reader_font_for_slot(int slot)
 {
-    return reader_face_current()->fonts[reader_size_clamped()];
+    return reader_face_for_slot(slot)->fonts[reader_size_clamped_slot(slot)];
 }
+
+// Convenience accessors for each slot's resolved font.
+static const lv_font_t* topbar_font_get(void)        { return reader_font_for_slot(UI_FONT_SLOT_TOPBAR); }
+static const lv_font_t* reader_body_font_get(void)   { return reader_font_for_slot(UI_FONT_SLOT_READER_BODY); }
+static const lv_font_t* reader_footer_font_get(void) { return reader_font_for_slot(UI_FONT_SLOT_READER_FOOTER); }
 
 static const lv_font_t* ui_get_font(int pt, bool force_mono)
 {
@@ -4854,50 +4906,38 @@ static const lv_font_t* ui_get_font(int pt, bool force_mono)
         return &Font_Mono_Bold_20;
     }
 
-    // Otherwise, respect the global face and size index.
-    // For System UI, we map the base size index to the face's font list.
-    // However, since System UI uses many different sizes (14..19),
-    // we use the 'pt' as a hint but allow the global size index to scale it.
-    
-    int face_idx = ui_font_face_get();
-    if (face_idx < 0 || face_idx >= READER_FACE_COUNT) face_idx = 0;
-    const reader_face_t *face = &reader_faces[face_idx];
-
-    int size_idx = ui_font_size_get();
-    if (size_idx < 0) size_idx = 0;
-    if (size_idx >= face->n_sizes) size_idx = face->n_sizes - 1;
-
-    // If we're not in Mono mode, we use the selected size index for all UI elements
-    // to ensure consistency. This might scale some elements up/down slightly
-    // but ensures the chosen face is used.
-    return face->fonts[size_idx];
+    // Non-mono: every general-UI label resolves through here, so route them
+    // all through the General slot. The `pt` argument becomes a hint that the
+    // selected size index can override — this preserves the prior behavior
+    // that all general labels follow one face/size choice.
+    return reader_font_for_slot(UI_FONT_SLOT_GENERAL);
 }
 
-static const char* reader_font_face_label(void)
+static const char* reader_font_face_label(int slot)
 {
-    return reader_face_current()->name;
+    return reader_face_for_slot(slot)->name;
 }
 
-static int reader_font_size_pt(void)
+static int reader_font_size_pt(int slot)
 {
-    return reader_face_current()->pts[reader_size_clamped()];
+    return reader_face_for_slot(slot)->pts[reader_size_clamped_slot(slot)];
 }
 
-static void reader_font_step_face(int dir)
+static void reader_font_step_face(int slot, int dir)
 {
-    int f = (ui_font_face_get() + dir + READER_FACE_COUNT) % READER_FACE_COUNT;
-    ui_font_face_set(f);
+    int f = (ui_font_face_get(slot) + dir + READER_FACE_COUNT) % READER_FACE_COUNT;
+    ui_font_face_set(slot, f);
     // Clamp size to new face's range so we don't index past the new size list.
     int max = reader_faces[f].n_sizes - 1;
-    if (ui_font_size_get() > max) ui_font_size_set(max);
+    if (ui_font_size_get(slot) > max) ui_font_size_set(slot, max);
 }
-static void reader_font_step_size(int dir)
+static void reader_font_step_size(int slot, int dir)
 {
-    int n = reader_face_current()->n_sizes;
-    ui_font_size_set((ui_font_size_get() + dir + n) % n);
+    int n = reader_face_for_slot(slot)->n_sizes;
+    ui_font_size_set(slot, (ui_font_size_get(slot) + dir + n) % n);
 }
-static void reader_font_cycle_face(void) { reader_font_step_face(+1); }
-static void reader_font_cycle_size(void) { reader_font_step_size(+1); }
+static void reader_font_cycle_face(int slot) { reader_font_step_face(slot, +1); }
+static void reader_font_cycle_size(int slot) { reader_font_step_size(slot, +1); }
 
 static void scr13_1_back_btn_event_cb(lv_event_t * e)
 {
@@ -4912,7 +4952,7 @@ static void scr13_1_back_btn_event_cb(lv_event_t * e)
 static size_t reader_clip_to_visible(size_t got)
 {
     if (got == 0 || reader_view_label == NULL) return got;
-    const lv_font_t *font = reader_font_get();
+    const lv_font_t *font = reader_body_font_get();
     lv_coord_t line_h = lv_font_get_line_height(font);
     lv_coord_t letter_space = lv_obj_get_style_text_letter_space(reader_view_label, LV_PART_MAIN);
     lv_coord_t line_space = lv_obj_get_style_text_line_space(reader_view_label, LV_PART_MAIN);
@@ -4943,17 +4983,16 @@ static size_t reader_clip_to_visible(size_t got)
     return got;
 }
 
-// Loads the chunk at reader_page_offsets[reader_page_idx], trims to a clean
-// word boundary, and records the next page's offset.
-static void reader_load_current_page(void)
+// Reads and trims one page starting at `off` into reader_page_buf, applying
+// the same word-boundary and visible-line-fit rules as
+// reader_load_current_page. Returns the byte count consumed (== the page
+// size) or 0 at EOF. Used both by the renderer and by reader_seek_to_offset
+// to silently walk page boundaries.
+static size_t reader_read_one_page(size_t off)
 {
-    size_t off = reader_page_offsets[reader_page_idx];
     size_t got = ui_reader_read_range(reader_use_sd, reader_selected_file,
                                       off, reader_page_buf, sizeof(reader_page_buf));
-    if (got == 0) {
-        lv_label_set_text(reader_view_label, "(end of file)");
-        return;
-    }
+    if (got == 0) return 0;
 
     // If we filled the buffer and aren't at EOF, back up to the last whitespace
     // so we don't cut a word in half.
@@ -4977,6 +5016,20 @@ static void reader_load_current_page(void)
         reader_page_buf[got] = '\0';
     }
 
+    return got;
+}
+
+// Loads the chunk at reader_page_offsets[reader_page_idx], trims to a clean
+// word boundary, and records the next page's offset.
+static void reader_load_current_page(void)
+{
+    size_t off = reader_page_offsets[reader_page_idx];
+    size_t got = reader_read_one_page(off);
+    if (got == 0) {
+        lv_label_set_text(reader_view_label, "(end of file)");
+        return;
+    }
+
     // Record the next page's start offset if it's the first time we see it.
     int next_idx = reader_page_idx + 1;
     if (next_idx >= reader_pages_known && reader_pages_known < READER_MAX_PAGES) {
@@ -4994,9 +5047,56 @@ static void reader_load_current_page(void)
     }
 }
 
+// Walks page boundaries forward from offset 0 using the same trimming rules
+// as the renderer, populating reader_page_offsets[0..N] until reaching the
+// page that contains `target`. Sets reader_page_idx and reader_pages_known
+// so the resumed reader has a correct page number and can navigate back to
+// every page leading up to the target. Falls through gracefully at EOF and
+// when target falls slightly off a page boundary (e.g., font changed since
+// the bookmark was saved).
+static void reader_seek_to_offset(size_t target)
+{
+    reader_page_offsets[0] = 0;
+    reader_pages_known = 1;
+    reader_page_idx = 0;
+
+    if (target == 0 || reader_file_size == 0) return;
+
+    int idx = 0;
+    while (idx + 1 < READER_MAX_PAGES) {
+        size_t off = reader_page_offsets[idx];
+        size_t got = reader_read_one_page(off);
+        if (got == 0) {
+            // Hit EOF before reaching the saved offset (file shrank or
+            // pagination drifted). Land on the last valid page.
+            reader_page_idx = idx;
+            return;
+        }
+        size_t next_off = off + got;
+        if (next_off > target) {
+            // Target falls inside page `idx`.
+            reader_page_idx = idx;
+            return;
+        }
+        idx++;
+        reader_page_offsets[idx] = next_off;
+        reader_pages_known = idx + 1;
+        if (next_off == target) {
+            // Target is exactly the start of page `idx`.
+            reader_page_idx = idx;
+            return;
+        }
+    }
+    // Walked the whole array without reaching target; stick at the last slot.
+    reader_page_idx = idx;
+}
+
 static void reader_apply_font_and_reflow(void)
 {
-    lv_obj_set_style_text_font(reader_view_label, reader_font_get(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
+    if (reader_view_status) {
+        lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
+    }
     // Page byte boundaries depend on file content, not font, so we keep the
     // current offset but invalidate any pre-computed page after this one —
     // the *visible* page changes (different font = different wrap) but the
@@ -5056,12 +5156,12 @@ static void reader_view_kb_timer_cb(lv_timer_t *t)
                 reader_page_idx--;
                 changed = true;
             }
-        } else if (key == 'f') { // cycle font face
-            reader_font_cycle_face();
+        } else if (key == 'f') { // cycle reader body font face
+            reader_font_cycle_face(UI_FONT_SLOT_READER_BODY);
             reader_apply_font_and_reflow();
             ui_disp_full_refr();
-        } else if (key == 's') { // cycle font size
-            reader_font_cycle_size();
+        } else if (key == 's') { // cycle reader body font size
+            reader_font_cycle_size(UI_FONT_SLOT_READER_BODY);
             reader_apply_font_and_reflow();
             ui_disp_full_refr();
         } else if (key == 'r') { // toggle portrait/landscape
@@ -5111,14 +5211,14 @@ static void create13_1(lv_obj_t *parent)
     lv_obj_set_size(reader_view_label, lv_pct(100),
                     LV_VER_RES - status_bar_height - footer_height);
     lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, status_bar_height);
-    lv_obj_set_style_text_font(reader_view_label, reader_font_get(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
     lv_label_set_long_mode(reader_view_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(reader_view_label, "");
 
     reader_view_status = lv_label_create(parent);
     lv_obj_set_size(reader_view_status, lv_pct(100), footer_height);
     lv_obj_align(reader_view_status, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_text_font(reader_view_status, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(reader_view_status, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(reader_view_status, LV_OPA_COVER, LV_PART_MAIN);
     lv_label_set_text(reader_view_status, "");
@@ -5150,12 +5250,25 @@ static void entry13_1(void)
     reader_apply_layout();
 
     // Re-apply font in case it was changed in settings since last visit.
-    lv_obj_set_style_text_font(reader_view_label, reader_font_get(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
+    if (reader_view_status) {
+        lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
+    }
 
     reader_file_size = ui_reader_size(reader_use_sd, reader_selected_file);
-    reader_page_offsets[0] = 0;
-    reader_pages_known = 1;
-    reader_page_idx = 0;
+    // If the home-screen 'c' shortcut launched us with a saved offset for
+    // this file, walk page boundaries from offset 0 up to that point so
+    // both the page number and back-navigation are correct from the very
+    // first render. (Previously we just seeded offsets[0] with the saved
+    // offset, which made every resumed session look like "page 1" with no
+    // history.)
+    size_t target_off = 0;
+    if (reader_resume_pending && reader_resume_offset < reader_file_size) {
+        target_off = reader_resume_offset;
+    }
+    reader_resume_pending = false;
+    reader_resume_offset = 0;
+    reader_seek_to_offset(target_off);
 
     if (reader_file_size == 0) {
         lv_label_set_text_fmt(reader_view_label,
@@ -5174,6 +5287,15 @@ static void entry13_1(void)
 
 static void exit13_1(void)
 {
+    // Persist the page the user was on so the home-screen 'c' shortcut can
+    // resume here next time. Save the byte offset of the *current* page
+    // start, not the next page, so 'c' lands on the same page they left.
+    if (reader_selected_file[0] && reader_file_size > 0 &&
+        reader_page_idx >= 0 && reader_page_idx < reader_pages_known) {
+        ui_reader_resume_set(reader_selected_file,
+                             reader_page_offsets[reader_page_idx]);
+    }
+
     lv_timer_pause(taskbar_update_timer);
     if (reader_view_kb_timer) {
         lv_timer_del(reader_view_kb_timer);
@@ -5203,24 +5325,52 @@ scr_lifecycle_t screen13_1 = {
 //************************************[ screen 13.2 ]*************************************** Reader Font
 #if 1
 
+static lv_obj_t *system_font_slot_btn = NULL;
 static lv_obj_t *system_font_face_btn = NULL;
 static lv_obj_t *system_font_size_btn = NULL;
 static lv_obj_t *system_font_preview = NULL;
 static lv_timer_t *system_font_kb_timer = NULL;
 
-// j/k navigates between the two buttons. Enter toggles "edit mode" on the
-// focused button — while editing, j/k cycles that button's value instead of
-// moving focus. Esc exits edit mode if active, otherwise pops the screen.
-typedef enum { SF_FOCUS_FACE = 0, SF_FOCUS_SIZE = 1 } system_font_focus_t;
-static system_font_focus_t system_font_focus = SF_FOCUS_FACE;
+// j/k navigates between the three buttons (Slot, Face, Size). Enter toggles
+// "edit mode" on the focused button — while editing, j/k cycles that button's
+// value instead of moving focus. Esc exits edit mode if active, otherwise
+// pops the screen. The Slot button picks which font slot the Face/Size
+// buttons (and the live preview) operate on.
+typedef enum {
+    SF_FOCUS_SLOT = 0,
+    SF_FOCUS_FACE = 1,
+    SF_FOCUS_SIZE = 2,
+    SF_FOCUS_COUNT = 3,
+} system_font_focus_t;
+static system_font_focus_t system_font_focus = SF_FOCUS_SLOT;
+static int  system_font_slot = UI_FONT_SLOT_GENERAL;
 static bool system_font_editing = false;
+
+static const char* system_font_slot_label(int slot)
+{
+    switch (slot) {
+        case UI_FONT_SLOT_GENERAL:       return "General";
+        case UI_FONT_SLOT_TOPBAR:        return "Top bar";
+        case UI_FONT_SLOT_READER_BODY:   return "Reader body";
+        case UI_FONT_SLOT_READER_FOOTER: return "Reader footer";
+        default:                         return "?";
+    }
+}
+
+static void system_font_step_slot(int dir)
+{
+    int s = (system_font_slot + dir + UI_FONT_SLOT_COUNT) % UI_FONT_SLOT_COUNT;
+    system_font_slot = s;
+}
 
 static void system_font_apply_focus_style(void)
 {
-    if (!system_font_face_btn || !system_font_size_btn) return;
+    if (!system_font_slot_btn || !system_font_face_btn || !system_font_size_btn) return;
 
-    lv_obj_t *btns[2] = {system_font_face_btn, system_font_size_btn};
-    for (int i = 0; i < 2; i++) {
+    lv_obj_t *btns[SF_FOCUS_COUNT] = {
+        system_font_slot_btn, system_font_face_btn, system_font_size_btn
+    };
+    for (int i = 0; i < SF_FOCUS_COUNT; i++) {
         bool focused = (i == (int)system_font_focus);
         bool editing = focused && system_font_editing;
         if (editing) {
@@ -5242,24 +5392,31 @@ static void system_font_apply_focus_style(void)
 
 static void system_font_refresh_labels(void)
 {
+    int slot = system_font_slot;
+    if (system_font_slot_btn) {
+        lv_obj_t *lab = lv_obj_get_child(system_font_slot_btn, 0);
+        if (lab) lv_label_set_text_fmt(lab, "Slot: %s", system_font_slot_label(slot));
+    }
     if (system_font_face_btn) {
         lv_obj_t *lab = lv_obj_get_child(system_font_face_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Face: %s", reader_font_face_label());
+        if (lab) lv_label_set_text_fmt(lab, "Face: %s", reader_font_face_label(slot));
     }
     if (system_font_size_btn) {
         lv_obj_t *lab = lv_obj_get_child(system_font_size_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Size: %d", reader_font_size_pt());
+        if (lab) lv_label_set_text_fmt(lab, "Size: %d", reader_font_size_pt(slot));
     }
     if (system_font_preview) {
-        lv_obj_set_style_text_font(system_font_preview, reader_font_get(), LV_PART_MAIN);
+        lv_obj_set_style_text_font(system_font_preview, reader_font_for_slot(slot), LV_PART_MAIN);
     }
     system_font_apply_focus_style();
 }
 
 static void system_font_step_focused(int dir)
 {
-    if (system_font_focus == SF_FOCUS_FACE) reader_font_step_face(dir);
-    else                                    reader_font_step_size(dir);
+    int slot = system_font_slot;
+    if      (system_font_focus == SF_FOCUS_SLOT) system_font_step_slot(dir);
+    else if (system_font_focus == SF_FOCUS_FACE) reader_font_step_face(slot, dir);
+    else                                         reader_font_step_size(slot, dir);
 }
 
 static void system_font_kb_timer_cb(lv_timer_t *t)
@@ -5285,8 +5442,8 @@ static void system_font_kb_timer_cb(lv_timer_t *t)
                 system_font_step_focused(+1);
                 system_font_refresh_labels();
                 ui_disp_full_refr();
-            } else if (system_font_focus != SF_FOCUS_SIZE) {
-                system_font_focus = SF_FOCUS_SIZE;
+            } else if ((int)system_font_focus < SF_FOCUS_COUNT - 1) {
+                system_font_focus = (system_font_focus_t)((int)system_font_focus + 1);
                 system_font_apply_focus_style();
                 ui_disp_full_refr();
             }
@@ -5295,8 +5452,8 @@ static void system_font_kb_timer_cb(lv_timer_t *t)
                 system_font_step_focused(-1);
                 system_font_refresh_labels();
                 ui_disp_full_refr();
-            } else if (system_font_focus != SF_FOCUS_FACE) {
-                system_font_focus = SF_FOCUS_FACE;
+            } else if ((int)system_font_focus > 0) {
+                system_font_focus = (system_font_focus_t)((int)system_font_focus - 1);
                 system_font_apply_focus_style();
                 ui_disp_full_refr();
             }
@@ -5304,10 +5461,18 @@ static void system_font_kb_timer_cb(lv_timer_t *t)
     }
 }
 
+static void system_font_slot_event_cb(lv_event_t *e)
+{
+    if (e->code != LV_EVENT_CLICKED) return;
+    system_font_step_slot(+1);
+    system_font_refresh_labels();
+    ui_disp_full_refr();
+}
+
 static void system_font_face_event_cb(lv_event_t *e)
 {
     if (e->code != LV_EVENT_CLICKED) return;
-    reader_font_cycle_face();
+    reader_font_cycle_face(system_font_slot);
     system_font_refresh_labels();
     ui_disp_full_refr();
 }
@@ -5315,7 +5480,7 @@ static void system_font_face_event_cb(lv_event_t *e)
 static void system_font_size_event_cb(lv_event_t *e)
 {
     if (e->code != LV_EVENT_CLICKED) return;
-    reader_font_cycle_size();
+    reader_font_cycle_size(system_font_slot);
     system_font_refresh_labels();
     ui_disp_full_refr();
 }
@@ -5332,6 +5497,17 @@ static void create13_2(lv_obj_t *parent)
     lv_obj_set_style_pad_all(cont, 8, LV_PART_MAIN);
     lv_obj_set_style_pad_row(cont, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
+
+    system_font_slot_btn = lv_btn_create(cont);
+    lv_obj_set_width(system_font_slot_btn, lv_pct(100));
+    lv_obj_set_style_bg_color(system_font_slot_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_text_color(system_font_slot_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_border_width(system_font_slot_btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(system_font_slot_btn, 5, LV_PART_MAIN);
+    lv_obj_t *sloblbl = lv_label_create(system_font_slot_btn);
+    lv_obj_set_style_text_font(sloblbl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
+    lv_obj_center(sloblbl);
+    lv_obj_add_event_cb(system_font_slot_btn, system_font_slot_event_cb, LV_EVENT_CLICKED, NULL);
 
     system_font_face_btn = lv_btn_create(cont);
     lv_obj_set_width(system_font_face_btn, lv_pct(100));
@@ -5369,7 +5545,8 @@ static void entry13_2(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    system_font_focus = SF_FOCUS_FACE;
+    system_font_focus = SF_FOCUS_SLOT;
+    system_font_slot = UI_FONT_SLOT_GENERAL;
     system_font_editing = false;
     system_font_refresh_labels();
     if (!system_font_kb_timer)
@@ -5390,6 +5567,7 @@ static void destroy13_2(void) {
         lv_obj_del(menu_taskbar);
         menu_taskbar = NULL;
     }
+    system_font_slot_btn = NULL;
     system_font_face_btn = NULL;
     system_font_size_btn = NULL;
     system_font_preview = NULL;

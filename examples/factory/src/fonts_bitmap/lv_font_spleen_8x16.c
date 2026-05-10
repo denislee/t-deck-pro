@@ -246,7 +246,10 @@ lv_font_t lv_font_spleen_8x16 = {
     .underline_position = 0,
     .underline_thickness = 0,
 #endif
-    .dsc = &font_dsc
+    .dsc = &font_dsc,
+#if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
+    .fallback = &lv_font_montserrat_14,
+#endif
 };
 
 #endif /*#if LV_FONT_SPLEEN_8X16*/

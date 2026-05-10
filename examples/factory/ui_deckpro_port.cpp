@@ -29,6 +29,7 @@ extern TouchDrvCSTXXX touch;
 
 volatile int default_language = DEFAULT_LANGUAGE_EN;
 volatile bool default_keypad_light = false;
+volatile bool default_red_led_status = false;
 volatile bool default_motor_status = false;
 volatile bool default_gps_status = true;
 volatile bool default_lora_status = true;
@@ -36,11 +37,22 @@ volatile bool default_gyro_status = true;
 volatile bool default_a7682_status = true;
 volatile bool default_touch_status = false;
 
-// System font preferences. face: 0=Mono Bold (built-in), 1=Sans (Montserrat).
-// size index picks from the per-face size table in ui_deckpro.cpp.
-static int default_font_face = 0;
-static int default_font_size = 1; // medium by default
+// System font preferences. face: 0=Mono Bold (built-in), 1=Sans (Montserrat),
+// 2=Serif, 3=Pixel, 4=Spleen, 5=Tamzen, 6=Tiny — see reader_faces[] in
+// ui_deckpro.cpp. The size index picks from the per-face size table there.
+//
+// One (face, size) pair per slot. Defaults: General/Topbar use Mono Bold 16
+// (size index 1); reader body uses size 2 (18 pt) for comfortable reading;
+// reader footer uses the smallest available size for a discreet status line.
+static int default_font_face[UI_FONT_SLOT_COUNT] = {0, 0, 0, 0};
+static int default_font_size[UI_FONT_SLOT_COUNT] = {1, 1, 2, 0};
 static int default_reader_rotation  = 0; // 0=portrait, 1=landscape
+
+static int font_slot_clamp(int slot)
+{
+    if (slot < 0 || slot >= UI_FONT_SLOT_COUNT) return UI_FONT_SLOT_GENERAL;
+    return slot;
+}
 
 // WiFi credentials and timezone. Persisted via Preferences. Keep buffers
 // generously sized so callers can pass through without truncating spec-legal
@@ -54,12 +66,36 @@ static char default_wifi_tz[48] = "UTC0";
 static volatile ui_wifi_status_t wifi_status = UI_WIFI_STATUS_DISABLED;
 static volatile bool ntp_synced = false;
 
-int  ui_font_face_get(void)        { return default_font_face; }
-void ui_font_face_set(int f)       { default_font_face = f; ui_settings_save(); }
-int  ui_font_size_get(void)        { return default_font_size; }
-void ui_font_size_set(int s)       { default_font_size = s; ui_settings_save(); }
+int  ui_font_face_get(int slot)         { return default_font_face[font_slot_clamp(slot)]; }
+void ui_font_face_set(int slot, int f)  { default_font_face[font_slot_clamp(slot)] = f; ui_settings_save(); }
+int  ui_font_size_get(int slot)         { return default_font_size[font_slot_clamp(slot)]; }
+void ui_font_size_set(int slot, int s)  { default_font_size[font_slot_clamp(slot)] = s; ui_settings_save(); }
 int  ui_reader_rotation_get(void)         { return default_reader_rotation; }
 void ui_reader_rotation_set(int r)        { default_reader_rotation = r ? 1 : 0; ui_settings_save(); }
+
+bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset)
+{
+    if (!filename || fn_size == 0) return false;
+    Preferences prefs;
+    prefs.begin("t-deck-pro", true);
+    String s = prefs.getString("rd_last", "");
+    uint32_t off = prefs.getUInt("rd_off", 0);
+    prefs.end();
+    if (s.length() == 0) { filename[0] = '\0'; return false; }
+    strncpy(filename, s.c_str(), fn_size - 1);
+    filename[fn_size - 1] = '\0';
+    if (offset) *offset = off;
+    return true;
+}
+
+void ui_reader_resume_set(const char *filename, size_t offset)
+{
+    Preferences prefs;
+    prefs.begin("t-deck-pro", false);
+    prefs.putString("rd_last", filename ? filename : "");
+    prefs.putUInt("rd_off", (uint32_t)offset);
+    prefs.end();
+}
 
 void ui_settings_save(void)
 {
@@ -67,14 +103,24 @@ void ui_settings_save(void)
     prefs.begin("t-deck-pro", false);
     prefs.putInt("lang", default_language);
     prefs.putBool("kplight", default_keypad_light);
+    prefs.putBool("redled", default_red_led_status);
     prefs.putBool("motor", default_motor_status);
     prefs.putBool("gps", default_gps_status);
     prefs.putBool("lora", default_lora_status);
     prefs.putBool("gyro", default_gyro_status);
     prefs.putBool("a7682", default_a7682_status);
     prefs.putBool("touch", default_touch_status);
-    prefs.putInt("sys_face", default_font_face);
-    prefs.putInt("sys_size", default_font_size);
+    // sys_face/sys_size remain the General slot (back-compat with older builds
+    // that only knew about one font pair). The other three slots get their
+    // own keys.
+    prefs.putInt("sys_face",  default_font_face[UI_FONT_SLOT_GENERAL]);
+    prefs.putInt("sys_size",  default_font_size[UI_FONT_SLOT_GENERAL]);
+    prefs.putInt("tb_face",   default_font_face[UI_FONT_SLOT_TOPBAR]);
+    prefs.putInt("tb_size",   default_font_size[UI_FONT_SLOT_TOPBAR]);
+    prefs.putInt("rdb_face",  default_font_face[UI_FONT_SLOT_READER_BODY]);
+    prefs.putInt("rdb_size",  default_font_size[UI_FONT_SLOT_READER_BODY]);
+    prefs.putInt("rdf_face",  default_font_face[UI_FONT_SLOT_READER_FOOTER]);
+    prefs.putInt("rdf_size",  default_font_size[UI_FONT_SLOT_READER_FOOTER]);
     prefs.putInt("rd_rot",  default_reader_rotation);
     prefs.putString("wifi_ssid", default_wifi_ssid);
     prefs.putString("wifi_pass", default_wifi_password);
@@ -88,14 +134,26 @@ void ui_settings_load(void)
     prefs.begin("t-deck-pro", true);
     default_language = prefs.getInt("lang", DEFAULT_LANGUAGE_EN);
     default_keypad_light = prefs.getBool("kplight", false);
+    default_red_led_status = prefs.getBool("redled", false);
     default_motor_status = prefs.getBool("motor", false);
     default_gps_status = prefs.getBool("gps", true);
     default_lora_status = prefs.getBool("lora", true);
     default_gyro_status = prefs.getBool("gyro", true);
     default_a7682_status = prefs.getBool("a7682", true);
     default_touch_status = prefs.getBool("touch", false);
-    default_font_face = prefs.getInt("sys_face", 0);
-    default_font_size = prefs.getInt("sys_size", 1);
+    int gen_face = prefs.getInt("sys_face", 0);
+    int gen_size = prefs.getInt("sys_size", 1);
+    default_font_face[UI_FONT_SLOT_GENERAL]       = gen_face;
+    default_font_size[UI_FONT_SLOT_GENERAL]       = gen_size;
+    // Each non-general slot defaults to the General slot's pair when its own
+    // pref is missing — that way upgrading from an older build leaves the
+    // device looking identical until the user customises a slot.
+    default_font_face[UI_FONT_SLOT_TOPBAR]        = prefs.getInt("tb_face",  gen_face);
+    default_font_size[UI_FONT_SLOT_TOPBAR]        = prefs.getInt("tb_size",  gen_size);
+    default_font_face[UI_FONT_SLOT_READER_BODY]   = prefs.getInt("rdb_face", gen_face);
+    default_font_size[UI_FONT_SLOT_READER_BODY]   = prefs.getInt("rdb_size", 2);
+    default_font_face[UI_FONT_SLOT_READER_FOOTER] = prefs.getInt("rdf_face", gen_face);
+    default_font_size[UI_FONT_SLOT_READER_FOOTER] = prefs.getInt("rdf_size", 0);
     default_reader_rotation  = prefs.getInt("rd_rot",  0);
 
     String s = prefs.getString("wifi_ssid", "");
@@ -129,6 +187,11 @@ void ui_disp_hard_refr(void)
 {
     disp_hard_refresh();
     lv_obj_invalidate(lv_scr_act());
+}
+
+void ui_disp_white_clear(void)
+{
+    disp_white_clear();
 }
 
 void ui_set_reader_landscape(bool landscape)
@@ -197,6 +260,12 @@ void ui_setting_apply_keypad_light(bool on)
 {
     digitalWrite(BOARD_KEYBOARD_LED, on);
 }
+void ui_setting_set_red_led(bool on)
+{
+    digitalWrite(BOARD_RED_LED, on);
+    default_red_led_status = on;
+    ui_settings_save();
+}
 void ui_setting_set_motor_status(bool on)
 {
     digitalWrite(BOARD_MOTOR_PIN, on);
@@ -205,15 +274,24 @@ void ui_setting_set_motor_status(bool on)
 }
 void ui_setting_set_gps_status(bool on)
 {
-    // enable GPS module power
-    digitalWrite(BOARD_GPS_EN, on);
+    if (on) {
+        digitalWrite(BOARD_GPS_EN, HIGH);
+        gps_task_resume();
+    } else {
+        gps_task_suspend();
+        digitalWrite(BOARD_GPS_EN, LOW);
+    }
     default_gps_status = on;
     ui_settings_save();
 }
 void ui_setting_set_lora_status(bool on)
 {
-    // enable LORA module power
-    digitalWrite(BOARD_LORA_EN, on);
+    if (on) {
+        digitalWrite(BOARD_LORA_EN, HIGH);
+    } else {
+        lora_sleep();
+        digitalWrite(BOARD_LORA_EN, LOW);
+    }
     default_lora_status = on;
     ui_settings_save();
 }
@@ -227,9 +305,15 @@ void ui_setting_set_gyro_status(bool on)
 }
 void ui_setting_set_a7682_status(bool on)
 {
-    // enable 7682 module power
-    digitalWrite(BOARD_6609_EN, on);
-    digitalWrite(BOARD_A7682E_PWRKEY, on);
+    if (on) {
+        digitalWrite(BOARD_6609_EN, HIGH);
+        digitalWrite(BOARD_A7682E_PWRKEY, HIGH);
+        if (a7682_handle) vTaskResume(a7682_handle);
+    } else {
+        if (a7682_handle) vTaskSuspend(a7682_handle);
+        digitalWrite(BOARD_6609_EN, LOW);
+        digitalWrite(BOARD_A7682E_PWRKEY, LOW);
+    }
     default_a7682_status = on;
     ui_settings_save();
 }
@@ -250,6 +334,10 @@ int ui_setting_get_language(void)
 bool ui_setting_get_keypad_light(void)
 {
     return default_keypad_light;
+}
+bool ui_setting_get_red_led(void)
+{
+    return default_red_led_status;
 }
 bool ui_setting_get_motor_status(void)
 {

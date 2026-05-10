@@ -1190,7 +1190,7 @@ lv_font_t Font_Mono_Bold_20 = {
 #endif
     .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
 #if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
-    .fallback = NULL,
+    .fallback = &lv_font_montserrat_20,
 #endif
     .user_data = NULL,
 };
