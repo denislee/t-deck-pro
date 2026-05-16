@@ -41,13 +41,18 @@ static constexpr uint16_t FACTORY_BQ25896_INPUT_LIMIT_MA = 1000;
 static constexpr uint16_t FACTORY_BQ25896_SYS_POWER_DOWN_MV = 3300;
 static constexpr uint32_t FACTORY_BQ25896_RUNTIME_CHECK_MS = 5000;
 static constexpr uint32_t FACTORY_BQ25896_RECOVERY_COOLDOWN_MS = 30000;
-static constexpr uint32_t FACTORY_EPD_SPI_HZ = 2000000;
+static constexpr uint32_t FACTORY_EPD_SPI_HZ = 20000000;
 TouchDrvCSTXXX touch;
 GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)); // GDEQ031T10 240x320, UC8253, (no inking, backside mark KEGMO 3100)
 
 uint8_t *decodebuffer = NULL;
-lv_timer_t *flush_timer = NULL;
 int disp_refr_mode = DISP_REFR_MODE_PART;
+// Tracks whether LVGL is rendering in landscape (320x240 logical). We do the
+// 90° rotation ourselves during bitmap packing instead of using LVGL's
+// sw_rotate, which would split a full-screen rotated flush into ~6-8 strips
+// (lv_refr.c:1201, max_row = LV_DISP_ROT_MAX_BUF / area_w) — each strip
+// triggering its own ~700 ms EPD refresh.
+static bool s_landscape = false;
 
 bool isT_Deck_Pro_v1_0 = false;
 const char Version_str1[] = "T-Deck-Pro V1.0";
@@ -121,28 +126,90 @@ static bool ink_screen_init()
     return true;
 }
 
-static void convert_lvgl_buf_to_epd_bitmap(const lv_color_t *color_p, lv_coord_t width, lv_coord_t height)
+// Pack the LVGL render buffer into decodebuffer in panel-native (portrait)
+// orientation. In portrait mode the layout is a direct 1:1 row-major pack;
+// in landscape we rotate 90° CW during the pack itself so a single writeImage
+// can push the whole dirty area to the panel — avoiding LVGL's sw_rotate
+// strip-splitting (and its multiple EPD refresh cycles).
+//
+// Polarity is panel-native: bit clear = black, bit set = white.
+static void convert_lvgl_buf_to_epd_bitmap_portrait(const lv_color_t *color_p,
+                                                    lv_coord_t width, lv_coord_t height)
 {
     const size_t stride = EPD_BITMAP_STRIDE(width);
-    const size_t bitmap_size = stride * size_t(height);
-
-    memset(decodebuffer, 0xFF, bitmap_size);
-
     for (lv_coord_t y = 0; y < height; ++y) {
-        size_t row_offset = size_t(y) * stride;
-        for (lv_coord_t x = 0; x < width; ++x) {
-            const size_t pixel_index = size_t(y) * size_t(width) + size_t(x);
-            if (lv_color_brightness(color_p[pixel_index]) < 128) {
-                decodebuffer[row_offset + size_t(x / 8)] &= ~(0x80 >> (x & 0x7));
+        const lv_color_t *row = color_p + size_t(y) * size_t(width);
+        uint8_t *dst = decodebuffer + size_t(y) * stride;
+        lv_coord_t x = 0;
+        for (size_t byte_idx = 0; byte_idx < stride; ++byte_idx) {
+            uint8_t byte = 0xFF;
+            uint8_t mask = 0x80;
+            for (int b = 0; b < 8 && x < width; ++b, ++x) {
+                if (lv_color_brightness(row[x]) < 128) {
+                    byte &= ~mask;
+                }
+                mask >>= 1;
+            }
+            dst[byte_idx] = byte;
+        }
+    }
+}
+
+// 90° CW rotation: logical (lx, ly) maps to panel (LCD_HOR_SIZE - 1 - ly, lx),
+// matching the prior Adafruit_GFX setRotation(1) behaviour. Panel area
+// dimensions swap: panel_w = lh, panel_h = lw. The rounder_cb guarantees lh
+// is a multiple of 8 so panel_x_min stays 8-aligned for writeImage.
+//
+// Loop is transposed so color_p reads are sequential (good for PSRAM); each
+// pixel writes one bit into decodebuffer, so we memset the affected region
+// to 0xFF (all-white) first and then clear bits for dark pixels.
+static void convert_lvgl_buf_to_epd_bitmap_landscape(const lv_color_t *color_p,
+                                                     lv_coord_t lw, lv_coord_t lh)
+{
+    const lv_coord_t panel_w = lh; // panel columns spanned
+    const lv_coord_t panel_h = lw; // panel rows spanned
+    const size_t stride = EPD_BITMAP_STRIDE(panel_w);
+    memset(decodebuffer, 0xFF, size_t(panel_h) * stride);
+
+    for (lv_coord_t ly = 0; ly < lh; ++ly) {
+        // For this logical row, the corresponding panel column offset within
+        // the area is (lh - 1 - ly). Compute byte index + bit mask once per
+        // logical row instead of per pixel.
+        const lv_coord_t panel_col_off = lh - 1 - ly;
+        const size_t byte_idx = size_t(panel_col_off) >> 3;
+        const uint8_t bit_mask = uint8_t(1u << (7 - (panel_col_off & 0x7)));
+        const lv_color_t *row = color_p + size_t(ly) * size_t(lw);
+
+        for (lv_coord_t lx = 0; lx < lw; ++lx) {
+            if (lv_color_brightness(row[lx]) < 128) {
+                // panel row offset == lx (logical column maps to panel row)
+                decodebuffer[size_t(lx) * stride + byte_idx] &= ~bit_mask;
             }
         }
     }
 }
 
-static void flush_epd_bitmap(const lv_area_t *area)
+// Convert a logical LVGL area to panel-native coordinates, applying 90° CW
+// rotation in landscape mode. Output area always describes pixels in the
+// physical 240x320 panel coordinate system.
+static void logical_area_to_panel(const lv_area_t *logical, lv_area_t *panel)
 {
-    const lv_coord_t width = lv_area_get_width(area);
-    const lv_coord_t height = lv_area_get_height(area);
+    const lv_coord_t lw = lv_area_get_width(logical);
+    const lv_coord_t lh = lv_area_get_height(logical);
+    if (s_landscape) {
+        panel->x1 = LCD_HOR_SIZE - logical->y1 - lh;   // = LCD_HOR_SIZE - y2 - 1
+        panel->x2 = panel->x1 + lh - 1;
+        panel->y1 = logical->x1;
+        panel->y2 = panel->y1 + lw - 1;
+    } else {
+        *panel = *logical;
+    }
+}
+
+static void flush_epd_bitmap(const lv_area_t *panel_area)
+{
+    const lv_coord_t width = lv_area_get_width(panel_area);
+    const lv_coord_t height = lv_area_get_height(panel_area);
 
     if ((width <= 0) || (height <= 0)) {
         return;
@@ -151,71 +218,58 @@ static void flush_epd_bitmap(const lv_area_t *area)
     shared_spi_lock();
     shared_spi_prepare_device(BOARD_EPD_CS);
 
+    // Direct write to controller memory + refresh, skipping the
+    // firstPage()/nextPage() Adafruit_GFX raster path. decodebuffer is already
+    // in panel-native polarity and orientation; the rounder_cb enforces the
+    // 8-pixel x-alignment writeImage requires.
+    //
+    // writeImageAgain after refresh updates the controller's "previous"
+    // buffer — UC8253 partial refresh diffs current vs. previous, so without
+    // this step the next partial flush would overlay onto a stale baseline,
+    // causing ghosting on page turns. writeImageForFullRefresh seeds both
+    // buffers in one call, so the full path doesn't need writeImageAgain.
     if (disp_refr_mode == DISP_REFR_MODE_PART) {
-        display.setPartialWindow(area->x1, area->y1, width, height);
+        display.epd2.writeImage(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
+        display.epd2.refresh(panel_area->x1, panel_area->y1, width, height);
+        display.epd2.writeImageAgain(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
     } else {
-        display.setFullWindow();
+        display.epd2.writeImageForFullRefresh(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
+        display.epd2.refresh(false);
     }
 
-    display.firstPage();
-    do {
-        if (disp_refr_mode == DISP_REFR_MODE_FULL) {
-            display.fillScreen(GxEPD_WHITE);
-        }
-        display.drawInvertedBitmap(area->x1, area->y1, decodebuffer, width, height, GxEPD_BLACK);
-    }
-    while (display.nextPage());
-
-    display.powerOff();
+    display.epd2.powerOff();
     shared_spi_unlock();
 }
 
-static void flush_timer_cb(lv_timer_t *t)
+// GDEQ031T10::writeImage requires the partial-update X window to start and
+// span multiples of 8 pixels (one byte per 8 horizontal pixels). LVGL hands us
+// arbitrary invalidate bounding boxes in *logical* coordinates, called before
+// sw_rotate runs — so in landscape (ROT_90) logical-Y is what becomes panel-X
+// after rotation. Round both axes to be safe regardless of orientation.
+static void display_driver_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
 {
-    static int idx = 0;
-    lv_disp_t *disp = lv_disp_get_default();
-    if(disp->rendering_in_progress == false) {
-        // Use the live driver dimensions, not LCD_HOR_SIZE/LCD_VER_SIZE,
-        // so the forced full refresh tracks the current rotation
-        // (factory_set_landscape swaps hor_res/ver_res).
-        lv_area_t full_area;
-        full_area.x1 = 0;
-        full_area.y1 = 0;
-        full_area.x2 = disp->driver->hor_res - 1;
-        full_area.y2 = disp->driver->ver_res - 1;
-
-        flush_epd_bitmap(&full_area);
-        
-        Serial.printf("flush_timer_cb:%d, %s\n", idx++, (disp_refr_mode == DISP_REFR_MODE_FULL ? "full" : "part"));
-
-        disp_refr_mode = DISP_REFR_MODE_PART;
-        lv_timer_pause(flush_timer);
-    }
-}
-
-static void dips_render_start_cb(struct _lv_disp_drv_t * disp_drv)
-{
-    if(flush_timer == NULL) {
-        flush_timer = lv_timer_create(flush_timer_cb, 10, NULL);
-    } else {
-        lv_timer_resume(flush_timer);
-    }
+    area->x1 &= ~0x7;
+    area->x2 |= 0x7;
+    area->y1 &= ~0x7;
+    area->y2 |= 0x7;
 }
 
 static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
 {
-    convert_lvgl_buf_to_epd_bitmap(color_p, lv_area_get_width(area), lv_area_get_height(area));
-    flush_epd_bitmap(area);
-    
-    static int idx = 0;
-    Serial.printf("disp_flush:%d, %s, area=(%d,%d)-(%d,%d)\n",
-                  idx++,
-                  (disp_refr_mode == DISP_REFR_MODE_FULL ? "full" : "part"),
-                  area->x1, area->y1, area->x2, area->y2);
+    const lv_coord_t lw = lv_area_get_width(area);
+    const lv_coord_t lh = lv_area_get_height(area);
+
+    if (s_landscape) {
+        convert_lvgl_buf_to_epd_bitmap_landscape(color_p, lw, lh);
+    } else {
+        convert_lvgl_buf_to_epd_bitmap_portrait(color_p, lw, lh);
+    }
+
+    lv_area_t panel_area;
+    logical_area_to_panel(area, &panel_area);
+    flush_epd_bitmap(&panel_area);
 
     disp_refr_mode = DISP_REFR_MODE_PART;
-
-    // Serial.printf("x1=%d, y1=%d, x2=%d, y2=%d\n", area->x1, area->y1, area->x2, area->y2);
 
     /*IMPORTANT!!!
      *Inform the graphics library that you are ready with the flushing*/
@@ -264,15 +318,14 @@ static void lvgl_init(void)
     disp_drv.hor_res = LCD_HOR_SIZE;
     disp_drv.ver_res = LCD_VER_SIZE;
     disp_drv.flush_cb = disp_flush;
-    disp_drv.render_start_cb = dips_render_start_cb;
     disp_drv.draw_buf = &draw_buf_dsc_1;
-    // disp_drv.rounder_cb = display_driver_rounder_cb;
-    disp_drv.full_refresh = 1;
-    // sw_rotate intentionally NOT set: LVGL 8.3 silently bails out of the
-    // rotation path when full_refresh && sw_rotate are both on
-    // (lib/lvgl/src/core/lv_refr.c:1186 — "cannot rotate a full refreshed
-    // display!"), so flushes never reach the EPD when rotated. We rotate at
-    // the GxEPD2 level instead via factory_set_landscape().
+    disp_drv.rounder_cb = display_driver_rounder_cb;
+    // full_refresh=0 lets LVGL push only the invalidated bounding box per
+    // flush instead of the whole framebuffer; partial e-paper updates are
+    // ~10x cheaper than full ones, so small UI changes (battery icon, key
+    // blink) no longer cost a full-screen redraw. Opt-in full refresh still
+    // works via disp_refr_mode = DISP_REFR_MODE_FULL.
+    disp_drv.full_refresh = 0;
 
     lv_disp_drv_register(&disp_drv);
 
@@ -321,24 +374,43 @@ static bool bq25896_apply_factory_profile(void)
 static bool bq25896_init(void)
 {
     // BQ25896 --- 0x6B
+    // The keypad task runs at priority 19 and will preempt this init,
+    // corrupting multi-byte I2C transactions. Hold i2c0_lock for the whole
+    // probe + init path.
+    i2c0_lock();
     Wire.beginTransmission(BOARD_I2C_ADDR_BQ25896);
-    if (Wire.endTransmission() == 0)
-    {
-        if (!PPM.init(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_ADDR_BQ25896)) {
-            return false;
-        }
-
-        return bq25896_apply_factory_profile();
+    if (Wire.endTransmission() != 0) {
+        i2c0_unlock();
+        return false;
     }
-    return false;
+    if (!PPM.init(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_ADDR_BQ25896)) {
+        i2c0_unlock();
+        return false;
+    }
+    bool ok = bq25896_apply_factory_profile();
+    i2c0_unlock();
+    return ok;
 }
 
 static bool bq27220_init(void)
 {
+    // BQ27220 init issues a long sequence of control subcommands (DEVICE_NUMBER
+    // probe, unseal, CFGUPDATE entry, data-memory writes, CFGUPDATE exit). A
+    // keypad preempt mid-sequence has been observed to return 0xFFFF on the
+    // chip-ID read, aborting init and leaving battery_percent stuck at 0.
+    i2c0_lock();
     bq27220.setDefaultCapacity(FACTORY_BATTERY_DESIGN_CAPACITY_MAH);
     bool ret = bq27220.init();
-    // if(ret) 
-    //     bq27220.reset();
+    uint16_t soc = 0, vbat = 0;
+    int16_t curr = 0;
+    if (ret) {
+        soc  = bq27220.getStateOfCharge();
+        vbat = bq27220.getVoltage();
+        curr = bq27220.getCurrent();
+    }
+    i2c0_unlock();
+    Serial.printf("[BQ27220] init=%s soc=%u%% vbat=%umV curr=%dmA\n",
+                  ret ? "ok" : "FAIL", soc, vbat, curr);
     return ret;
 }
 
@@ -385,11 +457,52 @@ static bool sd_care_init(void)
     shared_spi_lock();
     shared_spi_prepare_device(BOARD_SD_CS);
 
-    if(!SD.begin(BOARD_SD_CS, SPI)){
+    // SD spec requires >=74 clocks with CS HIGH after power-up before the
+    // first command. On a shared bus the card may also have seen unrelated
+    // traffic (EPD/LoRa init) with its CS wiggling — pulse out a dozen
+    // 0xFF bytes with CS deasserted to guarantee a clean idle state.
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    digitalWrite(BOARD_SD_CS, HIGH);
+    for (int i = 0; i < 12; ++i) {
+        SPI.transfer(0xFF);
+    }
+    SPI.endTransaction();
+
+    // SD.begin default is 4 MHz. Retry at a lower frequency on the first
+    // few tries — some cards are flaky on the very first init right after
+    // power-up, especially with the LoRa radio mid-transmit on the same bus.
+    const uint32_t freqs[] = { 1000000, 4000000, 4000000 };
+    bool ok = false;
+    for (uint8_t i = 0; i < sizeof(freqs) / sizeof(freqs[0]); ++i) {
+        if (i > 0) {
+            SD.end();
+            delay(50);
+        }
+        if (SD.begin(BOARD_SD_CS, SPI, freqs[i])) {
+            ok = true;
+            Serial.printf("[SD CARD] mounted at %u Hz (attempt %u)\n",
+                          (unsigned)freqs[i], (unsigned)(i + 1));
+            break;
+        }
+        Serial.printf("[SD CARD] mount attempt %u @ %u Hz failed\n",
+                      (unsigned)(i + 1), (unsigned)freqs[i]);
+    }
+    if (!ok) {
         shared_spi_unlock();
         Serial.println("[SD CARD] Card Mount Failed");
         return false;
     }
+
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("[SD CARD] No card detected after mount");
+        shared_spi_unlock();
+        return false;
+    }
+    Serial.printf("[SD CARD] type=%s\n",
+                  cardType == CARD_MMC  ? "MMC"  :
+                  cardType == CARD_SD   ? "SDSC" :
+                  cardType == CARD_SDHC ? "SDHC" : "UNKNOWN");
 
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("SD Card Size: %lluMB\n", cardSize);
@@ -516,8 +629,14 @@ static void peripheral_init_task(void *param)
     peri_init_st[E_PERI_BQ25896]    = bq25896_init();
     peri_init_st[E_PERI_BQ27220]    = bq27220_init();
     peri_init_st[E_PERI_SD]         = sd_care_init();
-    peri_init_st[E_PERI_GPS]        = gps_init();
-    peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
+    // GPS disabled — the L76K/UBX baud-scan in gps_init walks 6 baud rates
+    // with multi-second delays per attempt before declaring "GPS Connect
+    // failed", which dominates boot time. Re-enable once GPS is needed.
+    peri_init_st[E_PERI_GPS]        = false;
+    // Gyro disabled — BHI260AP responds at the I2C scan but its chip-ID
+    // readback returns 0xFFFF on this V1.1 board, and the SensorLib init
+    // path retries with 1 s delays generating Wire.cpp:499 Error 263 spam.
+    peri_init_st[E_PERI_BHI260AP]   = false;
     peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
     peri_init_st[E_PERI_A7682E]     = A7682E_init();
 
@@ -632,7 +751,9 @@ void setup()
     // Critical Peripheral Init (Required for UI/Input)
     peri_init_st[E_PERI_INK_SCREEN] = ink_screen_init();
     peri_init_st[E_PERI_KYEPAD]     = keypad_init(BOARD_I2C_ADDR_KEYBOARD);
-    peri_init_st[E_PERI_TOUCH]      = hyn_touch_init();
+    // Touch driver disabled — the CST328 isn't responding on this V1.1 board
+    // and its init/probe was driving I2C error spam. Keypad input only.
+    peri_init_st[E_PERI_TOUCH]      = false;
 
     lvgl_init();
     ui_deckpro_entry();
@@ -646,14 +767,11 @@ void setup()
         keypad_task_create();
     }
 
-    // Power management
-    esp_pm_config_esp32s3_t pm_config = {
-        .max_freq_mhz = 80,
-        .min_freq_mhz = 10,
-        .light_sleep_enable = true
-    };
-    esp_pm_configure(&pm_config);
-    setCpuFrequencyMhz(80);
+    // CPU runs at the Arduino default (240 MHz) — earlier code capped it at
+    // 80 MHz with light sleep, which was the dominant cause of UI stutter
+    // (LVGL render and bitmap-pack loops are CPU-bound). Restore aggressive
+    // power management here only when the user explicitly trades perf for
+    // battery (e.g. lock screen / standby).
 }
 
 
@@ -733,11 +851,16 @@ void disp_white_clear(void)
     shared_spi_unlock();
 }
 
-// Switch the display+LVGL into landscape (320x240) or portrait (240x320).
-// Workaround for the LVGL 8.3 full_refresh+sw_rotate bug: instead of asking
-// LVGL to rotate the buffer (which silently no-ops), we swap LVGL's logical
-// resolution and let GxEPD2's setRotation handle the actual pixel rotation
-// when the bitmap is drawn to the panel.
+// Switch the display+LVGL into landscape (320x240 logical) or portrait
+// (240x320 logical). LVGL stays unaware of any rotation — we present a
+// display whose logical dimensions match the requested orientation, and the
+// disp_flush path rotates the rendered buffer to panel-native coordinates
+// during the bitmap pack. GxEPD2 stays pinned to setRotation(0) so writeImage
+// goes straight to controller memory without extra coordinate translation.
+//
+// This avoids LVGL's sw_rotate, which would slice a rotated full-screen flush
+// into ~6-8 strips (LV_DISP_ROT_MAX_BUF / area_w rows each, lv_refr.c:1201),
+// each strip costing its own ~700 ms EPD refresh cycle.
 void factory_set_landscape(bool landscape)
 {
     lv_disp_t *disp = lv_disp_get_default();
@@ -745,14 +868,17 @@ void factory_set_landscape(bool landscape)
 
     lv_coord_t want_w = landscape ? LCD_VER_SIZE : LCD_HOR_SIZE; // 320 vs 240
     lv_coord_t want_h = landscape ? LCD_HOR_SIZE : LCD_VER_SIZE; // 240 vs 320
-    if (disp->driver->hor_res == want_w && disp->driver->ver_res == want_h) return;
+    if (disp->driver->hor_res == want_w &&
+        disp->driver->ver_res == want_h &&
+        s_landscape == landscape) return;
 
     disp->driver->hor_res = want_w;
     disp->driver->ver_res = want_h;
+    s_landscape = landscape;
 
     shared_spi_lock();
     shared_spi_prepare_device(BOARD_EPD_CS);
-    display.setRotation(landscape ? 1 : 0);
+    display.setRotation(0);
     shared_spi_unlock();
 
     lv_disp_drv_update(disp, disp->driver);

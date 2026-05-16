@@ -75,6 +75,7 @@ enum {
     SCREEN13_2_ID,        // Reader font settings
     SCREEN_USB_MSC_ID,
     SCREEN_LOCK_ID,
+    SCREEN_DICT_ID,
 };
 
 typedef void (*ui_indev_read_cb)(int);
@@ -105,6 +106,7 @@ typedef struct _ui_setting
     void (*set_cb)(bool);
     bool (*get_cb)(void);
     int sub_id;
+    char shortcut;
     lv_obj_t *obj;
     lv_obj_t *st;
 } ui_setting_handle;

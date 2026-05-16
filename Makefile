@@ -31,8 +31,10 @@ CHIP          ?= esp32s3
 BAUD          ?= 921600
 MONITOR_BAUD  ?= 115200
 
-# Auto-detect port: prefer /dev/ttyACM0 then /dev/ttyUSB0
-PORT ?= $(firstword $(wildcard /dev/ttyACM0 /dev/ttyUSB0) /dev/ttyACM0)
+# Auto-detect port: prefer any /dev/ttyACM* (native USB-CDC), fall back to
+# /dev/ttyUSB* (UART bridge). Picks the first match, so multiple devices
+# attached will require an explicit PORT= override.
+PORT ?= $(firstword $(sort $(wildcard /dev/ttyACM*)) $(sort $(wildcard /dev/ttyUSB*)) /dev/ttyACM0)
 
 FIRMWARE_DIR := firmware
 

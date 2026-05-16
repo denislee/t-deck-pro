@@ -47,6 +47,16 @@ volatile bool default_touch_status = false;
 static int default_font_face[UI_FONT_SLOT_COUNT] = {0, 0, 0, 0};
 static int default_font_size[UI_FONT_SLOT_COUNT] = {1, 1, 2, 0};
 static int default_reader_rotation  = 0; // 0=portrait, 1=landscape
+static int default_reader_line_space = 4; // px between text lines in reader
+static bool default_topbar_show_battery = true; // show battery icon+% on topbar
+static bool default_reader_bars_hidden  = false; // reader view: hide top/bottom bars
+
+static int reader_line_space_clamp(int px)
+{
+    if (px < 0)  return 0;
+    if (px > 16) return 16;
+    return px;
+}
 
 static int font_slot_clamp(int slot)
 {
@@ -72,6 +82,28 @@ int  ui_font_size_get(int slot)         { return default_font_size[font_slot_cla
 void ui_font_size_set(int slot, int s)  { default_font_size[font_slot_clamp(slot)] = s; ui_settings_save(); }
 int  ui_reader_rotation_get(void)         { return default_reader_rotation; }
 void ui_reader_rotation_set(int r)        { default_reader_rotation = r ? 1 : 0; ui_settings_save(); }
+int  ui_reader_line_space_get(void)       { return default_reader_line_space; }
+void ui_reader_line_space_set(int px)     { default_reader_line_space = reader_line_space_clamp(px); ui_settings_save(); }
+bool ui_topbar_show_battery_get(void)     { return default_topbar_show_battery; }
+void ui_topbar_show_battery_set(bool on)  { default_topbar_show_battery = on; ui_settings_save(); }
+bool ui_reader_bars_hidden_get(void)         { return default_reader_bars_hidden; }
+void ui_reader_bars_hidden_set(bool hidden)  { default_reader_bars_hidden = hidden; ui_settings_save(); }
+
+// FNV-1a 32-bit hash of the filename, formatted as "b_xxxxxxxx" (10 chars).
+// Per-file bookmarks live under a per-filename NVS key derived this way
+// because NVS keys are capped at 15 chars but filenames can be up to 32.
+// Output buffer must be at least 11 bytes.
+static void reader_bookmark_key(const char *filename, char out[11])
+{
+    uint32_t h = 2166136261u;
+    if (filename) {
+        for (const unsigned char *p = (const unsigned char *)filename; *p; ++p) {
+            h ^= *p;
+            h *= 16777619u;
+        }
+    }
+    snprintf(out, 11, "b_%08x", (unsigned)h);
+}
 
 bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset)
 {
@@ -94,7 +126,27 @@ void ui_reader_resume_set(const char *filename, size_t offset)
     prefs.begin("t-deck-pro", false);
     prefs.putString("rd_last", filename ? filename : "");
     prefs.putUInt("rd_off", (uint32_t)offset);
+    if (filename && filename[0]) {
+        char key[11];
+        reader_bookmark_key(filename, key);
+        prefs.putUInt(key, (uint32_t)offset);
+    }
     prefs.end();
+}
+
+bool ui_reader_bookmark_get(const char *filename, size_t *offset)
+{
+    if (!filename || !filename[0]) return false;
+    char key[11];
+    reader_bookmark_key(filename, key);
+    Preferences prefs;
+    prefs.begin("t-deck-pro", true);
+    bool present = prefs.isKey(key);
+    uint32_t off = prefs.getUInt(key, 0);
+    prefs.end();
+    if (!present) return false;
+    if (offset) *offset = off;
+    return true;
 }
 
 void ui_settings_save(void)
@@ -122,6 +174,9 @@ void ui_settings_save(void)
     prefs.putInt("rdf_face",  default_font_face[UI_FONT_SLOT_READER_FOOTER]);
     prefs.putInt("rdf_size",  default_font_size[UI_FONT_SLOT_READER_FOOTER]);
     prefs.putInt("rd_rot",  default_reader_rotation);
+    prefs.putInt("rd_lsp",  default_reader_line_space);
+    prefs.putBool("tb_batt", default_topbar_show_battery);
+    prefs.putBool("rd_bars", default_reader_bars_hidden);
     prefs.putString("wifi_ssid", default_wifi_ssid);
     prefs.putString("wifi_pass", default_wifi_password);
     prefs.putString("wifi_tz",   default_wifi_tz);
@@ -155,6 +210,9 @@ void ui_settings_load(void)
     default_font_face[UI_FONT_SLOT_READER_FOOTER] = prefs.getInt("rdf_face", gen_face);
     default_font_size[UI_FONT_SLOT_READER_FOOTER] = prefs.getInt("rdf_size", 0);
     default_reader_rotation  = prefs.getInt("rd_rot",  0);
+    default_reader_line_space = reader_line_space_clamp(prefs.getInt("rd_lsp", 4));
+    default_topbar_show_battery = prefs.getBool("tb_batt", true);
+    default_reader_bars_hidden  = prefs.getBool("rd_bars", false);
 
     String s = prefs.getString("wifi_ssid", "");
     strncpy(default_wifi_ssid, s.c_str(), sizeof(default_wifi_ssid) - 1);
@@ -853,6 +911,12 @@ const char * ui_batt_25896_get_ntc_st(void)
 // All these helpers touch the primary I2C bus (BQ25896 PMU and BQ27220 fuel
 // gauge). They are called from LVGL UI tasks (battery indicator, etc.) which
 // race with the keypad drain task — guard each call with the bus mutex.
+//
+// They also gate on peri_init_st[E_PERI_BQ27220]: when bq27220.init() fails
+// (e.g. Unseal failed), the chip is on the bus but won't reply to register
+// reads, so every unconditional getter would generate a ~1 s Wire timeout
+// and a Wire.cpp:499 Error 263. With the gate, periodic taskbar/low-voltage
+// pollers short-circuit to a safe default and the LVGL task stops stalling.
 bool ui_battery_27220_is_vaild(void) {return peri_init_st[E_PERI_BQ27220]; }
 bool ui_battery_is_external_power_present(void)
 {
@@ -871,23 +935,66 @@ bool ui_battery_is_external_power_present(void)
     return false;
 }
 bool ui_battery_27220_get_input(void) { return ui_battery_is_external_power_present(); }
-bool ui_battery_27220_get_charge_finish(void) { i2c0_lock(); bool v = bq27220.getCharingFinish(); i2c0_unlock(); return v; }
+bool ui_battery_27220_get_charge_finish(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return false;
+    i2c0_lock(); bool v = bq27220.getCharingFinish(); i2c0_unlock(); return v;
+}
 uint16_t ui_battery_27220_get_status(void)
 {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
     BQ27220BatteryStatus batt;
     i2c0_lock();
     bq27220.getBatteryStatus(&batt);
     i2c0_unlock();
     return batt.full;
 }
-uint16_t ui_battery_27220_get_voltage(void) { i2c0_lock(); uint16_t v = bq27220.getVoltage(); i2c0_unlock(); return v; }
-int16_t ui_battery_27220_get_current(void) { i2c0_lock(); int16_t v = bq27220.getCurrent(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_temperature(void) { i2c0_lock(); uint16_t v = bq27220.getTemperature(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_full_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getFullChargeCapacity(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_design_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getDesignCapacity(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_remain_capacity(void) { i2c0_lock(); uint16_t v = bq27220.getRemainingCapacity(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_percent(void) { i2c0_lock(); uint16_t v = bq27220.getStateOfCharge(); i2c0_unlock(); return v; }
-uint16_t ui_battery_27220_get_health(void) { i2c0_lock(); uint16_t v = bq27220.getStateOfHealth(); i2c0_unlock(); return v; }
+uint16_t ui_battery_27220_get_voltage(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getVoltage(); i2c0_unlock(); return v;
+}
+int16_t ui_battery_27220_get_current(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); int16_t v = bq27220.getCurrent(); i2c0_unlock(); return v;
+}
+uint16_t ui_battery_27220_get_temperature(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getTemperature(); i2c0_unlock(); return v;
+}
+uint16_t ui_battery_27220_get_full_capacity(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getFullChargeCapacity(); i2c0_unlock(); return v;
+}
+uint16_t ui_battery_27220_get_design_capacity(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getDesignCapacity(); i2c0_unlock(); return v;
+}
+uint16_t ui_battery_27220_get_remain_capacity(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getRemainingCapacity(); i2c0_unlock(); return v;
+}
+// State of charge changes slowly; the UI refreshes it from multiple sites per
+// taskbar tick and several screens chain back-to-back calls. Cache for 500ms
+// to coalesce these into a single I2C transaction without changing any
+// callers' API.
+static uint16_t battery_percent_cache = 0;
+static uint32_t battery_percent_cache_ms = 0;
+#define BATTERY_PERCENT_CACHE_MS 500
+uint16_t ui_battery_27220_get_percent(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    uint32_t now = millis();
+    if (battery_percent_cache_ms != 0 && (now - battery_percent_cache_ms) < BATTERY_PERCENT_CACHE_MS) {
+        return battery_percent_cache;
+    }
+    i2c0_lock();
+    battery_percent_cache = bq27220.getStateOfCharge();
+    i2c0_unlock();
+    battery_percent_cache_ms = now;
+    return battery_percent_cache;
+}
+uint16_t ui_battery_27220_get_health(void) {
+    if (!peri_init_st[E_PERI_BQ27220]) return 0;
+    i2c0_lock(); uint16_t v = bq27220.getStateOfHealth(); i2c0_unlock(); return v;
+}
 bool ui_battery_27220_is_low_alarm(void)
 {
     if (!peri_init_st[E_PERI_BQ27220]) {
@@ -907,9 +1014,10 @@ bool ui_battery_27220_is_low_alarm(void)
 }
 const char * ui_battert_27220_get_percent_level(void)
 {
-    i2c0_lock();
-    int percent = bq27220.getStateOfCharge();
-    i2c0_unlock();
+    // Reuse the cached percent getter — callers consistently pair this with
+    // ui_battery_27220_get_percent(), so going direct would double the I2C
+    // traffic to the fuel gauge.
+    int percent = ui_battery_27220_get_percent();
     const char * str = NULL;
     if(percent < 20)      str =  LV_SYMBOL_BATTERY_EMPTY;
     else if(percent < 40) str =  LV_SYMBOL_BATTERY_1;
@@ -1280,7 +1388,205 @@ bool ui_notes_delete(bool is_sd, const char *filename)
     return ret;
 }
 
+//************************************[ dictionary ]***************************************** Dictionary
+//
+// Sorted-TSV binary search on SD. The file lives at /dict/eng-pob.tsv and is
+// expected to be sorted ASCII-case-insensitively by the headword column. We
+// keep this on SD (not SPIFFS) because real bilingual dictionaries are several
+// MB and would not fit in flash; the rest of the app's storage assumptions
+// (notes, books) already require SD anyway.
+//
+// Algorithm: classic byte-offset binary search.
+//   1. Pick mid = (lo+hi)/2, seek there, discard the partial line we landed
+//      in by reading until '\n' (unless mid==0). Note line_start.
+//   2. Read a line, parse out the headword (text before first '\t').
+//   3. If headword < query: lo = position after this line.
+//      Else:                hi = line_start.
+//   4. Stop once the window is small (<=512 bytes) and linear-scan the
+//      remainder. Linear scan also handles the case where multiple entries
+//      share a headword (we return the first match).
+
+static int dict_line_read(File &f, char *buf, size_t buf_size)
+{
+    // Returns bytes read (excluding '\n'), -1 on EOF before any data. The
+    // line is null-terminated. Lines longer than buf_size-1 are truncated;
+    // the file pointer is still advanced past the '\n'.
+    size_t n = 0;
+    bool any = false;
+    while (true) {
+        int c = f.read();
+        if (c < 0) break;
+        any = true;
+        if (c == '\n') break;
+        if (n + 1 < buf_size) buf[n++] = (char)c;
+    }
+    buf[n] = '\0';
+    return any ? (int)n : -1;
+}
+
+static int dict_strcasecmp_word(const char *line, const char *query)
+{
+    // Compare just the headword portion of `line` (up to '\t' or end) to
+    // `query`, case-insensitive. Returns <0 / 0 / >0 like strcasecmp.
+    const unsigned char *a = (const unsigned char *)line;
+    const unsigned char *b = (const unsigned char *)query;
+    while (*a && *a != '\t' && *b) {
+        int ca = tolower(*a);
+        int cb = tolower(*b);
+        if (ca != cb) return ca - cb;
+        a++; b++;
+    }
+    bool a_end = (*a == '\0' || *a == '\t');
+    bool b_end = (*b == '\0');
+    if (a_end && b_end) return 0;
+    if (a_end) return -1;
+    return 1;
+}
+
+static char* dict_decode_definition(const char *src)
+{
+    // Convert literal "\\n" (backslash + 'n') sequences to real newlines so
+    // multi-line definitions render correctly in the result label. Allocates
+    // a fresh buffer; caller frees.
+    size_t n = strlen(src);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (src[i] == '\\' && src[i + 1] == 'n') {
+            out[w++] = '\n';
+            i++;
+        } else {
+            out[w++] = src[i];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+char* ui_dict_lookup(const char *word)
+{
+    if (!word || !*word) return NULL;
+
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_SD_CS);
+
+    File f = SD.open("/dict/eng-pob.tsv", FILE_READ);
+    if (!f) {
+        shared_spi_unlock();
+        return NULL;
+    }
+
+    long lo = 0;
+    long hi = (long)f.size();
+    char line[512];
+
+    while (hi - lo > 512) {
+        long mid = lo + (hi - lo) / 2;
+        f.seek(mid);
+        if (mid != 0) {
+            // Discard partial line at the seek point.
+            while (true) {
+                int c = f.read();
+                if (c < 0 || c == '\n') break;
+            }
+        }
+        long line_start = f.position();
+        int len = dict_line_read(f, line, sizeof(line));
+        if (len < 0) { hi = line_start; continue; }
+        int cmp = dict_strcasecmp_word(line, word);
+        if (cmp < 0) lo = f.position();
+        else         hi = line_start;
+    }
+
+    // Linear scan of the remaining window.
+    f.seek(lo);
+    if (lo != 0) {
+        while (true) {
+            int c = f.read();
+            if (c < 0 || c == '\n') break;
+        }
+    }
+
+    char *result = NULL;
+    while ((long)f.position() < hi) {
+        int len = dict_line_read(f, line, sizeof(line));
+        if (len < 0) break;
+        int cmp = dict_strcasecmp_word(line, word);
+        if (cmp == 0) {
+            const char *tab = strchr(line, '\t');
+            const char *def = tab ? tab + 1 : "";
+            result = dict_decode_definition(def);
+            break;
+        }
+        if (cmp > 0) break; // sorted, so we've passed it
+    }
+
+    f.close();
+    shared_spi_unlock();
+    return result;
+}
+
+bool ui_dict_available(void)
+{
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_SD_CS);
+    bool ok = SD.exists("/dict/eng-pob.tsv");
+    shared_spi_unlock();
+    return ok;
+}
+
 //************************************[ screen 13 ]****************************************** Ebook Reader
+
+// Cached file handle for the active reader view. While open, every
+// ui_reader_read_range call that matches (is_sd, filename) reuses this handle
+// instead of reopening — opening a file on SD walks the directory over SPI,
+// which used to dominate cold-load and resume-seek time.
+static File   s_reader_file;
+static bool   s_reader_file_open = false;
+static bool   s_reader_file_is_sd = true;
+static char   s_reader_file_name[32] = {0};
+
+size_t ui_reader_open_view(bool is_sd, const char *filename)
+{
+    ui_reader_close_view();
+    if (!filename || !*filename) return 0;
+
+    fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
+    char path[64];
+    snprintf(path, sizeof(path), "/books/%s", filename);
+
+    if (is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+    s_reader_file = fs.open(path, FILE_READ);
+    size_t size = 0;
+    if (s_reader_file) {
+        size = s_reader_file.size();
+        s_reader_file_open = true;
+        s_reader_file_is_sd = is_sd;
+        strncpy(s_reader_file_name, filename, sizeof(s_reader_file_name) - 1);
+        s_reader_file_name[sizeof(s_reader_file_name) - 1] = '\0';
+    } else {
+        log_e("reader_open_view: open failed: %s", path);
+    }
+    if (is_sd) shared_spi_unlock();
+    return size;
+}
+
+void ui_reader_close_view(void)
+{
+    if (!s_reader_file_open) return;
+    if (s_reader_file_is_sd) {
+        shared_spi_lock();
+        shared_spi_prepare_device(BOARD_SD_CS);
+    }
+    s_reader_file.close();
+    if (s_reader_file_is_sd) shared_spi_unlock();
+    s_reader_file_open = false;
+    s_reader_file_name[0] = '\0';
+}
 
 void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *count)
 {
@@ -1363,8 +1669,30 @@ char* ui_reader_read(bool is_sd, const char *filename)
     return content;
 }
 
+// Returns true if the cached handle is open and matches the requested file —
+// in which case ui_reader_read_range / ui_reader_size short-circuit the
+// per-call open/close (the SD directory walk used to dominate read time).
+static bool reader_cached_handle_matches(bool is_sd, const char *filename)
+{
+    return s_reader_file_open &&
+           s_reader_file_is_sd == is_sd &&
+           filename != NULL &&
+           strncmp(s_reader_file_name, filename, sizeof(s_reader_file_name)) == 0;
+}
+
 size_t ui_reader_size(bool is_sd, const char *filename)
 {
+    if (reader_cached_handle_matches(is_sd, filename)) {
+        // The handle is already open from ui_reader_open_view; just read size.
+        if (is_sd) {
+            shared_spi_lock();
+            shared_spi_prepare_device(BOARD_SD_CS);
+        }
+        size_t size = s_reader_file.size();
+        if (is_sd) shared_spi_unlock();
+        return size;
+    }
+
     fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
     char path[64];
     snprintf(path, sizeof(path), "/books/%s", filename);
@@ -1385,6 +1713,19 @@ size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset,
 {
     if (!buf || buf_size == 0) return 0;
     buf[0] = '\0';
+
+    // Fast path: reader view is active and has the file already open.
+    if (reader_cached_handle_matches(is_sd, filename)) {
+        if (is_sd) {
+            shared_spi_lock();
+            shared_spi_prepare_device(BOARD_SD_CS);
+        }
+        s_reader_file.seek(offset);
+        size_t got = s_reader_file.readBytes(buf, buf_size - 1);
+        buf[got] = '\0';
+        if (is_sd) shared_spi_unlock();
+        return got;
+    }
 
     fs::FS &fs = is_sd ? (fs::FS &)SD : (fs::FS &)SPIFFS;
     char path[64];

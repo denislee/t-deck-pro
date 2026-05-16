@@ -242,9 +242,11 @@ void keypad_task_create(void)
         return;
     }
     // Priority above loopTask (1) so we preempt the e-paper SPI refresh, but
-    // below the time-critical GPS/LoRa tasks. Stack 2KB is plenty for the
-    // small Wire+TCA8418 transactions we do here.
-    xTaskCreate(keypad_task, "keypad", 2048, NULL, KEYPAD_PRIORITY, &keypad_task_handle);
+    // below the time-critical GPS/LoRa tasks. 4 KB stack: nominally a TCA8418
+    // poll is tiny, but when the I2C bus is unhealthy (Error 263 timeouts on
+    // shared peripherals) the Wire error-handling path eats hundreds of
+    // additional bytes — 2 KB tripped the stack canary in practice.
+    xTaskCreate(keypad_task, "keypad", 4096, NULL, KEYPAD_PRIORITY, &keypad_task_handle);
 }
 
 void keypad_regetser_cb(keypad_cb cb)

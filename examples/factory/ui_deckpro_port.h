@@ -210,6 +210,37 @@ size_t ui_reader_size(bool is_sd, const char *filename);
 // returns bytes actually read (0 on failure / EOF).
 size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset, char *buf, size_t buf_size);
 
+// Opens the named book file and caches the File handle so subsequent
+// ui_reader_read_range calls (with the same is_sd/filename) reuse it instead
+// of reopening the file from scratch each time. Returns the file size, or 0
+// on open failure. Call ui_reader_close_view() when leaving the reader.
+//
+// Why: opening a file on the SD card walks FAT directory entries over SPI;
+// for a long book the resume-seek and per-page-flip read paths used to do
+// that on every 1 KB page, making cold-load and big-book resumes slow.
+size_t ui_reader_open_view(bool is_sd, const char *filename);
+void   ui_reader_close_view(void);
+
+// [ screen dict ] --- Dictionary
+//
+// Looks up `word` (case-insensitively) in /dict/eng-pob.tsv on SD. The file
+// is a tab-separated, ASCII-sorted-by-headword list — one entry per line:
+//
+//   headword<TAB>definition\n
+//
+// Definitions may use the literal sequence "\\n" (backslash + 'n') to encode
+// line breaks since real newlines would break the line-per-entry format.
+//
+// Returns a malloc'd, null-terminated string with the definition (real
+// newlines decoded), or NULL if the word is not found / SD is unavailable.
+// Caller frees.
+char* ui_dict_lookup(const char *word);
+
+// Returns true if /dict/eng-pob.tsv exists and is readable on the SD card.
+// Used to distinguish "word not in dictionary" from "dictionary file missing"
+// when ui_dict_lookup returns NULL.
+bool ui_dict_available(void);
+
 // System font selection (persisted via Preferences).
 //
 // Each slot holds an independent (face, size) pair so the four broad font
@@ -231,11 +262,31 @@ void ui_font_size_set(int slot, int s);
 int  ui_reader_rotation_get(void);   // 0=portrait, 1=landscape
 void ui_reader_rotation_set(int r);
 
+// Vertical pixel gap between rendered text lines in the reader body label.
+// Persisted via Preferences. Clamped to a sensible range by the setter.
+int  ui_reader_line_space_get(void);
+void ui_reader_line_space_set(int px);
+
+// Toggle: show/hide the battery icon and percent labels on the top status bar.
+// Persisted via Preferences.
+bool ui_topbar_show_battery_get(void);
+void ui_topbar_show_battery_set(bool on);
+
+// Toggle: hide top/bottom bars in the reader view for distraction-free reading.
+// Persisted via Preferences so the user's last choice survives a reboot.
+bool ui_reader_bars_hidden_get(void);
+void ui_reader_bars_hidden_set(bool hidden);
+
 // Last-read bookmark: filename + byte offset of the page the reader was
 // showing when the user left the view. Returns true if a saved entry exists
 // and `filename` is non-empty.
 bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset);
 void ui_reader_resume_set(const char *filename, size_t offset);
+
+// Per-file bookmark: returns the saved page offset for `filename` (the byte
+// offset of the page the user was viewing when they last exited that book),
+// or false if no bookmark exists for it.
+bool ui_reader_bookmark_get(const char *filename, size_t *offset);
 
 // USB MSC
 void ui_usb_msc_begin(void);
