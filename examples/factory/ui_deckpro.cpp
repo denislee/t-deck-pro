@@ -241,6 +241,9 @@ static bool lock_saved_wifi_was_enabled = false;
 static int lock_last_minute = -1;
 static int lock_last_yday = -1;
 static bool lock_landscape = false;
+// Offset (in months) from today's month for the calendar grid. j/k cycle it
+// while the lock screen is up; reset to 0 on entry.
+static int lock_month_offset = 0;
 
 // Calendar grid geometry. Portrait uses tamzen_10x20 (3-char cells →
 // 30 wide × 20 tall). Landscape switches to spleen_12x24 (3-char cells
@@ -288,12 +291,17 @@ static void lock_render_calendar(const struct tm *tm_now)
     };
     static const int dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
-    int year  = tm_now->tm_year + 1900;
-    int mon   = tm_now->tm_mon;        // 0..11
-    int today = tm_now->tm_mday;       // 1..31
-    int wday  = tm_now->tm_wday;       // 0..6 (Sun..Sat)
-    if (mon < 0 || mon > 11) mon = 0;
-    if (wday < 0 || wday > 6) wday = 0;
+    int today_year = tm_now->tm_year + 1900;
+    int today_mon  = tm_now->tm_mon;        // 0..11
+    int today      = tm_now->tm_mday;       // 1..31
+    if (today_mon < 0 || today_mon > 11) today_mon = 0;
+
+    // Apply j/k month offset.
+    int year = today_year;
+    int mon  = today_mon + lock_month_offset;
+    while (mon < 0)   { mon += 12; year--; }
+    while (mon > 11)  { mon -= 12; year++; }
+    bool showing_today_month = (year == today_year) && (mon == today_mon);
 
     int days_in_month = dim[mon];
     if (mon == 1) {
@@ -301,8 +309,15 @@ static void lock_render_calendar(const struct tm *tm_now)
         if (leap) days_in_month = 29;
     }
 
-    // Weekday of day-1: walk back from today's known weekday.
-    int first_wday = ((wday - (today - 1)) % 7 + 7) % 7;
+    // Weekday of day-1 of the displayed month: mktime fills tm_wday.
+    struct tm first = {};
+    first.tm_year = year - 1900;
+    first.tm_mon  = mon;
+    first.tm_mday = 1;
+    first.tm_hour = 12;  // avoid DST edge cases at midnight
+    mktime(&first);
+    int first_wday = first.tm_wday;
+    if (first_wday < 0 || first_wday > 6) first_wday = 0;
 
     char header[24];
     lv_snprintf(header, sizeof(header), "%s %d", months_full[mon], year);
@@ -319,7 +334,7 @@ static void lock_render_calendar(const struct tm *tm_now)
         col++;
     }
     for (int d = 1; d <= days_in_month; d++) {
-        if (d == today) { today_col = col; today_row = row; }
+        if (showing_today_month && d == today) { today_col = col; today_row = row; }
         char tmp[8];
         lv_snprintf(tmp, sizeof(tmp), "%2d ", d);
         for (int j = 0; tmp[j]; j++) *p++ = tmp[j];
@@ -335,6 +350,10 @@ static void lock_render_calendar(const struct tm *tm_now)
     lv_label_set_text(lock_cal_label, buf);
 
     // Position today's inverse cell + white number on top of the grid.
+    if (today_col < 0) {
+        if (lock_today_box)   lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
+        if (lock_today_label) lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
+    }
     if (lock_today_box && lock_today_label && today_col >= 0) {
         int cw = lock_cal_cell_w();
         int ch = lock_cal_cell_h();
@@ -568,6 +587,7 @@ static void entry_lock(void)
     lock_unlock_progress = 0;
     lock_last_minute = -1;
     lock_last_yday = -1;
+    lock_month_offset = 0;
     // Restore the last orientation the user toggled to with 'r'. Persisted
     // via Preferences (lk_rot) so a reboot doesn't drop the user back to
     // portrait if they had explicitly switched to landscape.
@@ -657,6 +677,26 @@ static void lock_handle_key(char key)
         ui_lock_landscape_set(lock_landscape ? 1 : 0);
         // Force the calendar / today-box positions to be recomputed
         // against the new resolution on the next clock tick.
+        lock_last_yday = -1;
+        lock_update_clock(true);
+        ui_disp_full_refr();
+        return;
+    }
+    if (key == 'j' || key == 'J' || key == 'k' || key == 'K') {
+        // j = next month, k = previous month. Clamp to ±120 months so a held
+        // key can't run off into ridiculous years.
+        int delta = (key == 'j' || key == 'J') ? 1 : -1;
+        int next = lock_month_offset + delta;
+        if (next < -120) next = -120;
+        if (next >  120) next =  120;
+        if (next == lock_month_offset) return;
+        lock_month_offset = next;
+        // Any stray unlock progress is cleared — user is browsing, not unlocking.
+        if (lock_unlock_progress != 0) {
+            lock_unlock_progress = 0;
+            lock_render_dots();
+        }
+        // Force the renderer to redraw the grid even though tm_yday is unchanged.
         lock_last_yday = -1;
         lock_update_clock(true);
         ui_disp_full_refr();
