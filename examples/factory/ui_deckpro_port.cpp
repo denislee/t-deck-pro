@@ -50,6 +50,7 @@ static int default_reader_rotation  = 0; // 0=portrait, 1=landscape
 static int default_reader_line_space = 4; // px between text lines in reader
 static bool default_topbar_show_battery = true; // show battery icon+% on topbar
 static bool default_reader_bars_hidden  = false; // reader view: hide top/bottom bars
+static int default_lock_landscape   = 0; // lock screen: 0=portrait, 1=landscape
 
 static int reader_line_space_clamp(int px)
 {
@@ -70,6 +71,11 @@ static int font_slot_clamp(int slot)
 static char default_wifi_ssid[33] = {0};
 static char default_wifi_password[65] = {0};
 static char default_wifi_tz[48] = "UTC0";
+static bool default_wifi_enabled = false;
+// Live radio state: true while the WiFi stack is up (or coming up). Defined
+// up here (rather than next to the connect helpers) so ui_settings_load() can
+// seed it from the persisted intent during boot.
+static bool wifi_enabled = false;
 
 // Live WiFi state. Bumped from the connect/disconnect helpers and the
 // asynchronous WiFi event handler so the UI can poll without blocking.
@@ -88,6 +94,8 @@ bool ui_topbar_show_battery_get(void)     { return default_topbar_show_battery; 
 void ui_topbar_show_battery_set(bool on)  { default_topbar_show_battery = on; ui_settings_save(); }
 bool ui_reader_bars_hidden_get(void)         { return default_reader_bars_hidden; }
 void ui_reader_bars_hidden_set(bool hidden)  { default_reader_bars_hidden = hidden; ui_settings_save(); }
+int  ui_lock_landscape_get(void)             { return default_lock_landscape; }
+void ui_lock_landscape_set(int r)            { default_lock_landscape = r ? 1 : 0; ui_settings_save(); }
 
 // FNV-1a 32-bit hash of the filename, formatted as "b_xxxxxxxx" (10 chars).
 // Per-file bookmarks live under a per-filename NVS key derived this way
@@ -177,9 +185,11 @@ void ui_settings_save(void)
     prefs.putInt("rd_lsp",  default_reader_line_space);
     prefs.putBool("tb_batt", default_topbar_show_battery);
     prefs.putBool("rd_bars", default_reader_bars_hidden);
+    prefs.putInt("lk_rot",   default_lock_landscape);
     prefs.putString("wifi_ssid", default_wifi_ssid);
     prefs.putString("wifi_pass", default_wifi_password);
     prefs.putString("wifi_tz",   default_wifi_tz);
+    prefs.putBool("wifi_en",     default_wifi_enabled);
     prefs.end();
 }
 
@@ -213,6 +223,7 @@ void ui_settings_load(void)
     default_reader_line_space = reader_line_space_clamp(prefs.getInt("rd_lsp", 4));
     default_topbar_show_battery = prefs.getBool("tb_batt", true);
     default_reader_bars_hidden  = prefs.getBool("rd_bars", false);
+    default_lock_landscape      = prefs.getInt("lk_rot", 0) ? 1 : 0;
 
     String s = prefs.getString("wifi_ssid", "");
     strncpy(default_wifi_ssid, s.c_str(), sizeof(default_wifi_ssid) - 1);
@@ -222,9 +233,21 @@ void ui_settings_load(void)
     strncpy(default_wifi_password, s.c_str(), sizeof(default_wifi_password) - 1);
     default_wifi_password[sizeof(default_wifi_password) - 1] = '\0';
 
-    s = prefs.getString("wifi_tz", "UTC0");
+    // Default to America/Sao_Paulo (UTC-3, no DST since 2019) — this matches
+    // the TZ the GPS time-sync and NTP-sync paths hardcode elsewhere. Leaving
+    // this at "UTC0" caused the topbar to render UTC after every reboot
+    // because the GPS-sync setenv only lives in the env for that session and
+    // is never persisted. Also overwrite a stale "UTC0" left over from devices
+    // that booted on the old default — otherwise NVS pins them to UTC forever.
+    s = prefs.getString("wifi_tz", "<-03>3");
+    if (s.length() == 0 || s == "UTC0") s = "<-03>3";
     strncpy(default_wifi_tz, s.c_str(), sizeof(default_wifi_tz) - 1);
     default_wifi_tz[sizeof(default_wifi_tz) - 1] = '\0';
+
+    default_wifi_enabled = prefs.getBool("wifi_en", false);
+    // Seed the live state from the persisted intent so ui_wifi_get_enabled()
+    // returns the right value before factory_setup() actually brings WiFi up.
+    wifi_enabled = default_wifi_enabled;
 
     prefs.end();
 
@@ -566,7 +589,77 @@ void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len)
     WiFi.scanDelete();
 }
 
-static bool wifi_enabled = false;
+// Copy the results of an already-completed WiFi.scanNetworks() pass into the
+// caller's list. Shared between the sync ui_wifi_get_scan_info() above and
+// the async poll-style API below.
+static int wifi_scan_collect(int n, ui_wifi_scan_info_t *list, int list_len)
+{
+    memset(list, 0, (sizeof(*list) * list_len));
+    if (n < 0) n = 0;
+    if (n > list_len) n = list_len;
+
+    int dst = 0;
+    for (int i = 0; i < n && dst < list_len; i++) {
+        String s = WiFi.SSID(i);
+        const char *str = s.c_str();
+        if (!str) continue;
+        if (str[0] == '\0') {
+            strncpy(list[dst].name, "<hidden>", sizeof(list[dst].name) - 1);
+        } else if (is_chinese_utf8(str)) {
+            Serial.printf("[wifi] skipping non-latin SSID '%s'\n", str);
+            continue;
+        } else {
+            strncpy(list[dst].name, str, sizeof(list[dst].name) - 1);
+        }
+        list[dst].name[sizeof(list[dst].name) - 1] = '\0';
+        list[dst].rssi = WiFi.RSSI(i);
+        list[dst].open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        dst++;
+    }
+    WiFi.scanDelete();
+    return dst;
+}
+
+void ui_wifi_scan_start_async(void)
+{
+    WiFi.mode(WIFI_STA);
+    if (WiFi.status() == WL_CONNECTED || WiFi.status() == WL_IDLE_STATUS) {
+        WiFi.disconnect(false, false);
+    }
+    int prev = WiFi.scanComplete();
+    if (prev == WIFI_SCAN_RUNNING) {
+        // Don't kick off a second one — wifi_scan_poll will pick up the
+        // existing scan when it finishes.
+        return;
+    }
+    if (prev >= 0) {
+        WiFi.scanDelete();
+    }
+    WiFi.scanNetworks(/*async*/ true, /*show_hidden*/ true);
+}
+
+int ui_wifi_scan_poll(ui_wifi_scan_info_t *list, int list_len)
+{
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return -1;
+    if (n == WIFI_SCAN_FAILED || n < 0) {
+        WiFi.scanDelete();
+        return -2;
+    }
+    return wifi_scan_collect(n, list, list_len);
+}
+
+void ui_wifi_scan_cancel(void)
+{
+    if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+        // ESP32 Arduino has no "abort scan" call; the cheap way to drop the
+        // running scan is to flip the radio mode, which the driver
+        // implements by tearing down the WiFi task. The deletion call
+        // afterwards frees any partial result buffer.
+        WiFi.disconnect(true, true);
+    }
+    WiFi.scanDelete();
+}
 
 void ui_wifi_get_ssid(char *out, int out_len)
 {
@@ -656,6 +749,78 @@ void ui_ntp_resync(void)
     // configTzTime applies the TZ string and starts SNTP polling. Multiple
     // servers give us a fallback if pool.ntp.org is unreachable.
     configTzTime(default_wifi_tz, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+void ui_time_persist_save(void)
+{
+    time_t now = time(NULL);
+    // Only stamp once the clock holds a plausible year — otherwise we'd
+    // overwrite a previously-saved good time with a fresh-boot 1970 epoch.
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    if ((tm_now.tm_year + 1900) < 2024) return;
+
+    Preferences prefs;
+    prefs.begin("t-deck-pro", false);
+    prefs.putULong("tlast", (uint32_t)now);
+    prefs.end();
+}
+
+// Compile-time epoch derived from __DATE__/__TIME__. Acts as a floor for the
+// system clock on a virgin device that has never seen GPS or NTP: real-world
+// time is always >= compile time, so even an uncorrected clock seeded here is
+// a better starting point than the 1970 epoch (the topbar gate requires year
+// >= 2024, so 1970 means "--:--" forever).
+//
+// __DATE__/__TIME__ give the build host's LOCAL time. We assume the build
+// host runs in the same TZ as the device (true for the typical dev setup
+// here) and let mktime() interpret the struct in the current TZ — which
+// ui_settings_load() has already pinned to the target TZ before this runs.
+// Forcing TZ=UTC0 for the mktime call (the previous approach) made the saved
+// epoch off by the build-host TZ offset, which the topbar then rendered as a
+// constant-offset error.
+static time_t compile_time_epoch(void)
+{
+    const char *d = __DATE__; // "Mmm dd yyyy"
+    const char *t = __TIME__; // "HH:MM:SS"
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char m[4] = { d[0], d[1], d[2], 0 };
+    const char *p = strstr(months, m);
+    int month = p ? (int)((p - months) / 3) : 0;
+
+    struct tm tm = {};
+    tm.tm_year = atoi(d + 7) - 1900;
+    tm.tm_mon  = month;
+    tm.tm_mday = atoi(d + 4);
+    tm.tm_hour = atoi(t);
+    tm.tm_min  = atoi(t + 3);
+    tm.tm_sec  = atoi(t + 6);
+    tm.tm_isdst = -1; // let mktime resolve DST under the current TZ
+
+    return mktime(&tm);
+}
+
+void ui_time_persist_restore(void)
+{
+    Preferences prefs;
+    prefs.begin("t-deck-pro", true);
+    uint32_t saved = prefs.getULong("tlast", 0);
+    prefs.end();
+
+    time_t floor_t = compile_time_epoch();
+    // Pick the more recent of (NVS stamp) and (compile time). Compile time
+    // covers the first-ever boot before anything has been persisted; NVS wins
+    // on every subsequent boot. Either way we never regress the clock.
+    time_t target = ((time_t)saved > floor_t) ? (time_t)saved : floor_t;
+    if (target <= 0) return;
+
+    struct timeval tv = { .tv_sec = target, .tv_usec = 0 };
+    if (settimeofday(&tv, NULL) != 0) return;
+    // Mark synced so the topbar paints immediately instead of waiting for the
+    // first GPS/NTP refresh.
+    ntp_synced = true;
+    Serial.printf("[time] restored: epoch=%u (nvs=%u, compile=%u)\n",
+                  (unsigned)target, (unsigned)saved, (unsigned)floor_t);
 }
 
 // ----- ICMP ping -----
@@ -819,6 +984,16 @@ void ui_wifi_set_enabled(bool en)
         }
     } else {
         ui_wifi_disconnect();
+    }
+    // Persist the user's on/off intent so it survives reboot. We only write
+    // here (the explicit toggle path) — a transient disconnect from
+    // wifi_connect_task should not flip the saved intent to off.
+    if (default_wifi_enabled != en) {
+        default_wifi_enabled = en;
+        Preferences prefs;
+        prefs.begin("t-deck-pro", false);
+        prefs.putBool("wifi_en", en);
+        prefs.end();
     }
 }
 

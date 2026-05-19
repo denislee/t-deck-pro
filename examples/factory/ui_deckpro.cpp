@@ -217,57 +217,9 @@ static lv_obj_t *scr_back_btn_create(lv_obj_t *parent, const char *text, lv_even
     return label;
 }
 
-// ******************************** [ screen USB MSC ] ********************************
-#if 1
-static lv_obj_t *usb_msc_label;
-
-static void usb_msc_btn_event_cb(lv_event_t * e)
-{
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
-
-static void create_usb_msc(lv_obj_t *parent)
-{
-    lv_obj_t *info = lv_label_create(parent);
-    lv_obj_set_width(info, LV_HOR_RES * 0.9);
-    lv_obj_set_style_text_color(info, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(info, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(info, "\n\nUSB Mass Storage Mode\n\nSD Card is now mounted\non your computer.\n\nDO NOT unplug while\ntransferring files!");
-    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 40);
-
-    usb_msc_label = lv_label_create(parent);
-    lv_obj_set_style_text_font(usb_msc_label, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-    lv_obj_align(usb_msc_label, LV_ALIGN_CENTER, 0, 40);
-    lv_label_set_text(usb_msc_label, "Status: Active");
-
-    scr_back_btn_create(parent, "USB SD Mount", usb_msc_btn_event_cb);
-}
-
-static void entry_usb_msc(void)
-{
-    ui_usb_msc_begin();
-    ui_disp_full_refr();
-}
-
-static void exit_usb_msc(void)
-{
-    ui_usb_msc_end();
-    ui_disp_full_refr();
-}
-
-static void destroy_usb_msc(void) {}
-
-static scr_lifecycle_t screen_usb_msc = {
-    .create = create_usb_msc,
-    .entry = entry_usb_msc,
-    .exit  = exit_usb_msc,
-    .destroy = destroy_usb_msc,
-};
-#endif
+// USB MSC screen is defined further down (after the taskbar globals) so its
+// entry function can populate menu_taskbar_battery on enter — otherwise the
+// top bar shows blank glyphs until a battery-percent change happens to fire.
 
 // ******************************** [ screen LOCK ] ********************************
 #if 1
@@ -281,17 +233,35 @@ static lv_obj_t *lock_today_box = NULL;
 static lv_obj_t *lock_today_label = NULL;
 static lv_obj_t *lock_dots_label = NULL;
 static lv_obj_t *lock_hint_label = NULL;
+static lv_obj_t *lock_wk_label = NULL;
+static lv_obj_t *lock_rule = NULL;
 static lv_timer_t *lock_clock_timer = NULL;
 static int lock_unlock_progress = 0;
 static bool lock_saved_wifi_was_enabled = false;
 static int lock_last_minute = -1;
 static int lock_last_yday = -1;
+static bool lock_landscape = false;
 
-// Calendar grid geometry — must match positions used in create_lock().
-#define LOCK_CAL_X     36   // left edge of grid (7 cols × 24 = 168, centered in 240)
-#define LOCK_CAL_Y    184   // top edge of grid
-#define LOCK_CAL_CELL_W 24
-#define LOCK_CAL_CELL_H 16
+// Calendar grid geometry. Portrait uses tamzen_10x20 (3-char cells →
+// 30 wide × 20 tall). Landscape switches to spleen_12x24 (3-char cells
+// → 36 wide × 24 tall) so the grid is noticeably bigger while still
+// fitting 7 cols × 6 rows on the 320×240 panel.
+#define LOCK_CAL_CELL_W_P 30
+#define LOCK_CAL_CELL_H_P 20
+#define LOCK_CAL_Y_P     174   // grid top edge in portrait
+#define LOCK_CAL_CELL_W_L 36
+#define LOCK_CAL_CELL_H_L 24
+#define LOCK_CAL_Y_L      82   // grid top edge in landscape (~12 px bottom margin)
+#define LOCK_CAL_X_NUDGE_L 6   // shift the whole calendar block right of true center
+
+static inline int lock_cal_cell_w(void) { return lock_landscape ? LOCK_CAL_CELL_W_L : LOCK_CAL_CELL_W_P; }
+static inline int lock_cal_cell_h(void) { return lock_landscape ? LOCK_CAL_CELL_H_L : LOCK_CAL_CELL_H_P; }
+static inline int lock_cal_y(void)      { return lock_landscape ? LOCK_CAL_Y_L     : LOCK_CAL_Y_P;     }
+static inline int lock_cal_x(void)
+{
+    int centered = (LV_HOR_RES - 7 * lock_cal_cell_w()) / 2;
+    return centered + (lock_landscape ? LOCK_CAL_X_NUDGE_L : 0);
+}
 
 static void lock_render_dots(void)
 {
@@ -366,8 +336,11 @@ static void lock_render_calendar(const struct tm *tm_now)
 
     // Position today's inverse cell + white number on top of the grid.
     if (lock_today_box && lock_today_label && today_col >= 0) {
-        int x = LOCK_CAL_X + today_col * LOCK_CAL_CELL_W;
-        int y = LOCK_CAL_Y + today_row * LOCK_CAL_CELL_H;
+        int cw = lock_cal_cell_w();
+        int ch = lock_cal_cell_h();
+        int x = lock_cal_x() + today_col * cw;
+        int y = lock_cal_y() + today_row * ch;
+        lv_obj_set_size(lock_today_box, cw - 4, ch);
         lv_obj_set_pos(lock_today_box, x, y);
         lv_obj_clear_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
 
@@ -432,43 +405,27 @@ static void create_lock(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ── Top inverse banner ──
-    lv_obj_t *band = lv_obj_create(parent);
-    lv_obj_remove_style_all(band);
-    lv_obj_set_size(band, LV_HOR_RES, 24);
-    lv_obj_align(band, LV_ALIGN_TOP_MID, 0, 6);
-    lv_obj_set_style_bg_color(band, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(band, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_clear_flag(band, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *banner = lv_label_create(band);
-    lv_label_set_text(banner, "L  O  C  K  E  D");
-    lv_obj_set_style_text_color(banner, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(banner, FONT_BOLD_MONO_SIZE_15, LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(banner, 1, LV_PART_MAIN);
-    lv_obj_center(banner);
-
     // ── Huge clock (32×64 pixel font) ──
     lock_time_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_time_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
     lv_label_set_text(lock_time_label, "--:--");
-    lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
 
     // ── Date subtitle ──
     lock_date_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_date_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_date_label, &lv_font_tamzen_8x16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lock_date_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_date_label, " ");
-    lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 112);
+    lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
 
     // ── Divider above the calendar ──
-    lv_obj_t *rule = lv_obj_create(parent);
-    lv_obj_remove_style_all(rule);
-    lv_obj_set_size(rule, 200, 1);
-    lv_obj_align(rule, LV_ALIGN_TOP_MID, 0, 138);
-    lv_obj_set_style_bg_color(rule, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, LV_PART_MAIN);
+    lock_rule = lv_obj_create(parent);
+    lv_obj_remove_style_all(lock_rule);
+    lv_obj_set_size(lock_rule, 200, 1);
+    lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
+    lv_obj_set_style_bg_color(lock_rule, DECKPRO_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lock_rule, LV_OPA_COVER, LV_PART_MAIN);
 
     // ── Calendar: month name ──
     lock_month_label = lv_label_create(parent);
@@ -476,19 +433,19 @@ static void create_lock(lv_obj_t *parent)
     lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lock_month_label, 1, LV_PART_MAIN);
     lv_label_set_text(lock_month_label, "");
-    lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 144);
+    lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
 
     // ── Calendar: weekday header (Su Mo Tu We Th Fr Sa) ──
-    lv_obj_t *wk = lv_label_create(parent);
-    lv_obj_set_style_text_color(wk, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(wk, &lv_font_tamzen_8x16, LV_PART_MAIN);
-    lv_label_set_text(wk, "Su Mo Tu We Th Fr Sa");
-    lv_obj_set_pos(wk, LOCK_CAL_X, LOCK_CAL_Y - 18);
+    lock_wk_label = lv_label_create(parent);
+    lv_obj_set_style_text_color(lock_wk_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+    lv_label_set_text(lock_wk_label, "Su Mo Tu We Th Fr Sa");
+    lv_obj_set_pos(lock_wk_label, lock_cal_x(), lock_cal_y() - 22);
 
     // ── Today highlight: black box (drawn before label so label sits above) ──
     lock_today_box = lv_obj_create(parent);
     lv_obj_remove_style_all(lock_today_box);
-    lv_obj_set_size(lock_today_box, LOCK_CAL_CELL_W - 4, LOCK_CAL_CELL_H);
+    lv_obj_set_size(lock_today_box, lock_cal_cell_w() - 4, lock_cal_cell_h());
     lv_obj_set_style_bg_color(lock_today_box, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(lock_today_box, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
@@ -496,23 +453,114 @@ static void create_lock(lv_obj_t *parent)
     // ── Calendar: date grid ──
     lock_cal_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_cal_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_8x16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_cal_label, "");
-    lv_obj_set_pos(lock_cal_label, LOCK_CAL_X, LOCK_CAL_Y);
+    lv_obj_set_pos(lock_cal_label, lock_cal_x(), lock_cal_y());
 
     // White today number (drawn above the grid + box)
     lock_today_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_today_label, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_8x16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_today_label, "");
     lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
 
-    // ── Progress dots ──
+    // ── Progress dots (intentionally tiny — just a subtle hint) ──
     lock_dots_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_dots_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_dots_label, &lv_font_tamzen_6x12, LV_PART_MAIN);
-    lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_text_font(lock_dots_label, &lv_font_spleen_5x8, LV_PART_MAIN);
+    lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
     lock_render_dots();
+}
+
+// Lay out the lock screen for the current orientation.
+//
+// Portrait (240×320): original stacked layout — huge 32×64 clock on top,
+//   date subtitle, divider, then the calendar in tamzen_10x20 with 30×20
+//   cells.
+//
+// Landscape (320×240): smaller spleen_16x32 clock at top-left, date
+//   right of it on the same row, and a *bigger* spleen_12x24 calendar
+//   filling the rest of the panel with 36×24 cells. The divider is
+//   dropped and the unlock-progress dots move to the top-right so the
+//   6-row grid can extend almost to the panel bottom without overlap.
+static void lock_apply_orientation(bool landscape)
+{
+    if (landscape) {
+        if (lock_time_label) {
+            lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+            lv_obj_align(lock_time_label, LV_ALIGN_TOP_LEFT, 12, 8);
+        }
+        if (lock_date_label) lv_obj_add_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
+        if (lock_rule) lv_obj_add_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
+
+        if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_TOP_RIGHT, -12, 12);
+
+        int x = lock_cal_x();
+        int grid_w = 7 * lock_cal_cell_w();
+        if (lock_month_label) {
+            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_month_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+            // Center the month name over the (nudged) calendar grid, not the
+            // panel, so the whole block shifts as one. Fixed-width label +
+            // center text alignment is stable across varying month names.
+            lv_obj_set_width(lock_month_label, grid_w);
+            lv_obj_set_style_text_align(lock_month_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+            lv_obj_align(lock_month_label, LV_ALIGN_TOP_LEFT, x, 36);
+        }
+        if (lock_wk_label) {
+            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_wk_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+            lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 24);
+        }
+        if (lock_cal_label) {
+            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_cal_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+            lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
+        }
+        if (lock_today_label) {
+            lv_obj_set_style_text_font(lock_today_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+        }
+        // today_box size + today_box/today_label positions are reset by
+        // lock_render_calendar on the next clock tick (caller invalidates
+        // lock_last_yday).
+    } else {
+        if (lock_time_label) {
+            lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
+            lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
+        }
+        if (lock_date_label) {
+            lv_obj_clear_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
+        }
+        if (lock_rule) {
+            lv_obj_clear_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
+        }
+        if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+        int x = lock_cal_x();
+        if (lock_month_label) {
+            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+            // Undo the fixed-width / centered-text styling landscape applies.
+            lv_obj_set_width(lock_month_label, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_align(lock_month_label, LV_TEXT_ALIGN_AUTO, LV_PART_MAIN);
+            lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
+        }
+        if (lock_wk_label) {
+            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+            lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 22);
+        }
+        if (lock_cal_label) {
+            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+            lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
+        }
+        if (lock_today_label) {
+            lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+        }
+    }
 }
 
 static void entry_lock(void)
@@ -520,6 +568,12 @@ static void entry_lock(void)
     lock_unlock_progress = 0;
     lock_last_minute = -1;
     lock_last_yday = -1;
+    // Restore the last orientation the user toggled to with 'r'. Persisted
+    // via Preferences (lk_rot) so a reboot doesn't drop the user back to
+    // portrait if they had explicitly switched to landscape.
+    lock_landscape = (ui_lock_landscape_get() != 0);
+    factory_set_landscape(lock_landscape);
+    lock_apply_orientation(lock_landscape);
     lock_render_dots();
     lock_update_clock(true);
     if (!lock_clock_timer) {
@@ -549,6 +603,13 @@ static void exit_lock(void)
     }
     ui_setting_apply_keypad_light(ui_setting_get_keypad_light());
 
+    // Other screens assume portrait — undo any rotation toggled while
+    // the lock screen was active before popping back.
+    if (lock_landscape) {
+        factory_set_landscape(false);
+        lock_landscape = false;
+    }
+
     ui_disp_full_refr();
 }
 
@@ -566,6 +627,8 @@ static void destroy_lock(void)
     lock_today_label = NULL;
     lock_dots_label = NULL;
     lock_hint_label = NULL;
+    lock_wk_label = NULL;
+    lock_rule = NULL;
 }
 
 static scr_lifecycle_t screen_lock = {
@@ -578,6 +641,27 @@ static scr_lifecycle_t screen_lock = {
 // Called by the home-screen keypad timer while the lock screen is active.
 static void lock_handle_key(char key)
 {
+    if (key == 'r' || key == 'R') {
+        // TCA8418 occasionally emits two press events for one physical
+        // tap (see reader-screen 'r' handler) — debounce so a single
+        // press doesn't toggle rotation twice.
+        static uint32_t last_rot_ms = 0;
+        uint32_t now = lv_tick_get();
+        if (now - last_rot_ms < 300) return;
+        last_rot_ms = now;
+
+        lock_landscape = !lock_landscape;
+        factory_set_landscape(lock_landscape);
+        lock_apply_orientation(lock_landscape);
+        // Persist so the choice survives reboot.
+        ui_lock_landscape_set(lock_landscape ? 1 : 0);
+        // Force the calendar / today-box positions to be recomputed
+        // against the new resolution on the next clock tick.
+        lock_last_yday = -1;
+        lock_update_clock(true);
+        ui_disp_full_refr();
+        return;
+    }
     if (key == 'u' || key == 'U') {
         lock_unlock_progress++;
         if (lock_unlock_progress >= LOCK_UNLOCK_REQUIRED) {
@@ -832,6 +916,61 @@ static void ui_taskbar_apply_battery_visibility(void)
     }
 }
 
+// ******************************** [ screen USB MSC ] ********************************
+#if 1
+static lv_obj_t *usb_msc_label;
+
+static void create_usb_msc(lv_obj_t *parent)
+{
+    // Home-screen clock/battery bar instead of the "USB SD Mount <" title.
+    // ESC on the keypad pops back to home (see SCREEN_USB_MSC_ID branch in
+    // the global keypad handler).
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
+
+    lv_obj_t *info = lv_label_create(parent);
+    lv_obj_set_width(info, LV_HOR_RES * 0.9);
+    lv_obj_set_style_text_color(info, DECKPRO_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_text_font(info, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(info, "\n\nUSB Mass Storage Mode\n\nSD Card is now mounted\non your computer.\n\nDO NOT unplug while\ntransferring files!");
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, status_bar_height + 15);
+
+    usb_msc_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(usb_msc_label, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+    lv_obj_align(usb_msc_label, LV_ALIGN_CENTER, 0, 40);
+    lv_label_set_text(usb_msc_label, "Status: Active");
+}
+
+static void entry_usb_msc(void)
+{
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    ui_usb_msc_begin();
+    ui_disp_full_refr();
+}
+
+static void exit_usb_msc(void)
+{
+    lv_timer_pause(taskbar_update_timer);
+    ui_usb_msc_end();
+    ui_disp_full_refr();
+}
+
+static void destroy_usb_msc(void) {}
+
+static scr_lifecycle_t screen_usb_msc = {
+    .create = create_usb_msc,
+    .entry = entry_usb_msc,
+    .exit  = exit_usb_msc,
+    .destroy = destroy_usb_msc,
+};
+#endif
+
 static void create0(lv_obj_t *parent)
 {
     ui_taskbar_create(parent);
@@ -969,11 +1108,11 @@ static void scr1_list_event(lv_event_t *e)
         if(lv_obj_check_type(child, &lv_label_class)) {
             char *str = lv_label_get_text(child);
 
-            if(strcmp("- Auto Test", str) == 0)
+            if(strcmp("a  Auto Test", str) == 0)
             {
                 scr_mgr_push(SCREEN1_1_ID, false);
             }
-            if(strcmp("- Lora Setting", str) == 0)
+            if(strcmp("s  Lora Setting", str) == 0)
             {
                 scr_mgr_push(SCREEN1_2_ID, false);
             }
@@ -1005,40 +1144,61 @@ static void scr1_item_create(const char *name, lv_event_cb_t cb)
     lv_obj_add_event_cb(obj, cb, LV_EVENT_CLICKED, NULL); 
 }
 
-static void scr1_btn_event_cb(lv_event_t * e)
+static void create1(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        // ui_full_refresh();
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Lora <" title bar. ESC on the keypad pops back to
+    // Settings via scr1_kb_timer_cb.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
 
-static void create1(lv_obj_t *parent) 
-{
     scr1_list = lv_list_create(parent);
-    lv_obj_set_size(scr1_list, lv_pct(93), lv_pct(91));
-    lv_obj_align(scr1_list, LV_ALIGN_BOTTOM_MID, 0, 0);
-    // lv_obj_set_style_bg_color(scr1_list, lv_color_hex(EPD_COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_size(scr1_list, lv_pct(93), LV_VER_RES - status_bar_height - 8);
+    lv_obj_align(scr1_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_pad_top(scr1_list, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_row(scr1_list, 15, LV_PART_MAIN);
     lv_obj_set_style_radius(scr1_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_outline_pad(scr1_list, 1, LV_PART_MAIN);
     lv_obj_set_style_border_width(scr1_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_border_color(scr1_list, lv_color_hex(EPD_COLOR_FG), LV_PART_MAIN);
     lv_obj_set_style_shadow_width(scr1_list, 0, LV_PART_MAIN);
 
-    scr1_item_create("- Auto Test", scr1_list_event);
-    scr1_item_create("- Lora Setting", scr1_list_event);
-
-    // back
-    scr_back_btn_create(parent, "Lora", scr1_btn_event_cb);
+    scr1_item_create("a  Auto Test", scr1_list_event);
+    scr1_item_create("s  Lora Setting", scr1_list_event);
 }
 
-static void entry1(void) 
+static lv_timer_t *scr1_kb_timer = NULL;
+static void scr1_kb_timer_cb(lv_timer_t *t)
 {
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Settings
+            scr_mgr_pop(false);
+            return;
+        }
+        if (key == 'a') { // Auto Test
+            scr_mgr_push(SCREEN1_1_ID, false);
+            return;
+        }
+        if (key == 's') { // Lora Setting
+            scr_mgr_push(SCREEN1_2_ID, false);
+            return;
+        }
+    }
+}
+
+static void entry1(void)
+{
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
     ui_disp_full_refr();
+    if (!scr1_kb_timer) scr1_kb_timer = lv_timer_create(scr1_kb_timer_cb, 20, NULL);
 }
 static void exit1(void) {
+    lv_timer_pause(taskbar_update_timer);
+    if (scr1_kb_timer) { lv_timer_del(scr1_kb_timer); scr1_kb_timer = NULL; }
     ui_disp_full_refr();
 }
 static void destroy1(void) { }
@@ -1059,13 +1219,6 @@ static lv_obj_t *lora_sw_btn_info;
 static lv_timer_t *lora_RT_timer = NULL;
 static lv_timer_t *lora_recv_timer = NULL;
 static int lora_cnt = 0;
-
-static void scr1_1_btn_event_cb(lv_event_t * e)
-{
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
 
 static void lora_mode_sw_event(lv_event_t * e)
 {
@@ -1136,8 +1289,13 @@ static lv_obj_t * scr2_create_label(lv_obj_t *parent)
     lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
     return label;
 }
-static void create1_1(lv_obj_t *parent) 
+static void create1_1(lv_obj_t *parent)
 {
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Lora <" title bar. ESC on the keypad pops back to the
+    // Lora menu via scr1_1_kb_timer_cb.
+    ui_taskbar_create(parent);
+
     scr1_1_cont = lv_obj_create(parent);
     lv_obj_set_size(scr1_1_cont, lv_pct(100), lv_pct(85));
     lv_obj_set_style_bg_color(scr1_1_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
@@ -1165,27 +1323,47 @@ static void create1_1(lv_obj_t *parent)
     lv_obj_set_style_text_align(lora_sw_btn_info, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(lora_sw_btn_info, "Send");
     lv_obj_center(lora_sw_btn_info);
-    lv_obj_align(lora_sw_btn, LV_ALIGN_TOP_MID, 0, 5);
+    // Sit below the 25-px taskbar so we don't cover the clock / battery.
+    lv_obj_align(lora_sw_btn, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_add_event_cb(lora_sw_btn, lora_mode_sw_event, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *lab = lv_label_create(parent);
     lv_obj_set_style_text_font(lab, FONT_BOLD_SIZE_15, LV_PART_MAIN);
     lv_label_set_text_fmt(lab, "%.1fM", ui_lora_get_freq());
-    lv_obj_align(lab, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_obj_align(lab, LV_ALIGN_TOP_RIGHT, -10, 33);
 
     ui_lora_set_mode(LORA_MODE_SEND);
     lora_cnt = 0;
-
-    // back
-    scr_back_btn_create(parent, ("Lora"), scr1_1_btn_event_cb);
 }
-static void entry1_1(void) 
+
+static lv_timer_t *scr1_1_kb_timer = NULL;
+static void scr1_1_kb_timer_cb(lv_timer_t *t)
 {
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Lora menu
+            scr_mgr_pop(false);
+            return;
+        }
+    }
+}
+
+static void entry1_1(void)
+{
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr1_1_kb_timer) scr1_1_kb_timer = lv_timer_create(scr1_1_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
     lora_RT_timer = lv_timer_create(lora_RT_timer_event, 2000, NULL);
     lora_recv_timer = lv_timer_create(lora_recv_loop_event, 400, NULL);
 }
 static void exit1_1(void) {
+    if (scr1_1_kb_timer) { lv_timer_del(scr1_1_kb_timer); scr1_1_kb_timer = NULL; }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
     if(lora_RT_timer) {
         lv_timer_del(lora_RT_timer);
@@ -1221,10 +1399,95 @@ static lv_obj_t *dropdown_freq;
 static lv_obj_t *dropdown_band;
 static lv_obj_t *dropdown_power;
 
-static void scr1_2_btn_event_cb(lv_event_t * e)
+// Keyboard nav mirrors the System Font screen (screen13_2): j/k moves
+// focus between the dropdowns, Enter toggles edit mode, in edit mode j/k
+// cycles the focused dropdown's selection, Esc exits edit mode (or pops
+// the screen back to Settings when not editing).
+typedef enum {
+    LS_FOCUS_FREQ  = 0,
+    LS_FOCUS_BAND  = 1,
+    LS_FOCUS_POWER = 2,
+    LS_FOCUS_COUNT = 3,
+} scr1_2_focus_t;
+static scr1_2_focus_t scr1_2_focus = LS_FOCUS_FREQ;
+static bool scr1_2_editing = false;
+static lv_timer_t *scr1_2_kb_timer = NULL;
+
+static lv_obj_t *scr1_2_focused_dropdown(void)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
+    if (scr1_2_focus == LS_FOCUS_FREQ)  return dropdown_freq;
+    if (scr1_2_focus == LS_FOCUS_BAND)  return dropdown_band;
+    return dropdown_power;
+}
+
+static void scr1_2_apply_focus_style(void)
+{
+    lv_obj_t *dds[LS_FOCUS_COUNT] = { dropdown_freq, dropdown_band, dropdown_power };
+    for (int i = 0; i < LS_FOCUS_COUNT; i++) {
+        if (!dds[i]) continue;
+        bool focused = (i == (int)scr1_2_focus);
+        bool editing = focused && scr1_2_editing;
+        if (editing) {
+            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
+            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
+            lv_obj_set_style_border_width(dds[i], 3, LV_PART_MAIN);
+        } else if (focused) {
+            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
+            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
+            lv_obj_set_style_border_width(dds[i], 3, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
+            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
+            lv_obj_set_style_border_width(dds[i], 1, LV_PART_MAIN);
+        }
+    }
+}
+
+static void scr1_2_step_focused(int dir)
+{
+    lv_obj_t *dd = scr1_2_focused_dropdown();
+    if (!dd) return;
+    uint16_t cnt = lv_dropdown_get_option_cnt(dd);
+    if (cnt == 0) return;
+    int sel = (int)lv_dropdown_get_selected(dd) + dir;
+    if (sel < 0)            sel = cnt - 1;
+    if (sel >= (int)cnt)    sel = 0;
+    lv_dropdown_set_selected(dd, sel);
+    // Reuse the existing change handler so the radio actually gets updated.
+    lv_event_send(dd, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+static void scr1_2_kb_timer_cb(lv_timer_t *t)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc
+            if (scr1_2_editing) {
+                scr1_2_editing = false;
+                scr1_2_apply_focus_style();
+            } else {
+                scr_mgr_pop(false);
+                return;
+            }
+        } else if (key == 'E') { // Enter -> toggle edit mode
+            scr1_2_editing = !scr1_2_editing;
+            scr1_2_apply_focus_style();
+        } else if (key == 'j') {
+            if (scr1_2_editing) {
+                scr1_2_step_focused(+1);
+            } else if ((int)scr1_2_focus < LS_FOCUS_COUNT - 1) {
+                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus + 1);
+                scr1_2_apply_focus_style();
+            }
+        } else if (key == 'k') {
+            if (scr1_2_editing) {
+                scr1_2_step_focused(-1);
+            } else if ((int)scr1_2_focus > 0) {
+                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus - 1);
+                scr1_2_apply_focus_style();
+            }
+        }
     }
 }
 
@@ -1307,8 +1570,13 @@ static lv_obj_t * scr1_2_lora_setting_create(lv_obj_t *parent, const char *text)
     return ui_Dropdown1;
 }
 
-static void create1_2(lv_obj_t *parent) 
+static void create1_2(lv_obj_t *parent)
 {
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Lora Setting <" title bar. ESC pops to Settings via
+    // scr1_2_kb_timer_cb; j/k + Enter mirror System Font's navigation.
+    ui_taskbar_create(parent);
+
     scr1_2_cont = lv_obj_create(parent);
     lv_obj_remove_style_all(scr1_2_cont);
     lv_obj_set_width(scr1_2_cont, lv_pct(100));
@@ -1350,15 +1618,24 @@ static void create1_2(lv_obj_t *parent)
     static const char power_flag = 'p';
     lv_obj_add_event_cb(dropdown_freq, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&freq_flag);
     lv_obj_add_event_cb(dropdown_band, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&band_flag);
-    lv_obj_add_event_cb(dropdown_power,   lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&power_flag);
-    // back
-    scr_back_btn_create(parent, ("Lora Setting"), scr1_2_btn_event_cb);
+    lv_obj_add_event_cb(dropdown_power, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&power_flag);
 }
-static void entry1_2(void) 
+static void entry1_2(void)
 {
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    scr1_2_focus = LS_FOCUS_FREQ;
+    scr1_2_editing = false;
+    scr1_2_apply_focus_style();
+    if (!scr1_2_kb_timer) scr1_2_kb_timer = lv_timer_create(scr1_2_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit1_2(void) {
+    if (scr1_2_kb_timer) { lv_timer_del(scr1_2_kb_timer); scr1_2_kb_timer = NULL; }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
     ui_lora_param_set();
 }
@@ -1376,15 +1653,13 @@ static scr_lifecycle_t screen1_2 = {
 #if 1
 static lv_obj_t *scr2_1_cont;
 
-static void scr2_1_btn_event_cb(lv_event_t * e)
+static void create2_1(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "About System <" title bar. ESC on the keypad pops back
+    // to Settings via scr2_1_kb_timer_cb.
+    ui_taskbar_create(parent);
 
-static void create2_1(lv_obj_t *parent) 
-{
     lv_obj_t *info = lv_label_create(parent);
     lv_obj_set_width(info, LV_HOR_RES * 0.9);
     lv_obj_set_style_text_color(info, DECKPRO_COLOR_FG, LV_PART_MAIN);
@@ -1419,14 +1694,34 @@ static void create2_1(lv_obj_t *parent)
     lv_label_set_text_fmt(info, "%s", str);
     
     lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 35);
-    
-    lv_obj_t *back2_1_label = scr_back_btn_create(parent, ("About System"), scr2_1_btn_event_cb);
 }
-static void entry2_1(void) 
+
+static lv_timer_t *scr2_1_kb_timer = NULL;
+static void scr2_1_kb_timer_cb(lv_timer_t *t)
 {
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Settings
+            scr_mgr_pop(false);
+            return;
+        }
+    }
+}
+
+static void entry2_1(void)
+{
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr2_1_kb_timer) scr2_1_kb_timer = lv_timer_create(scr2_1_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit2_1(void) {
+    lv_timer_pause(taskbar_update_timer);
+    if (scr2_1_kb_timer) { lv_timer_del(scr2_1_kb_timer); scr2_1_kb_timer = NULL; }
     ui_disp_full_refr();
 }
 static void destroy2_1(void) { }
@@ -1506,27 +1801,27 @@ static int setting_num = 0;
 static int setting_page_num = 0;
 static int setting_curr_page = 0;
 static ui_setting_handle setting_handle_list[] = {
-    {.name = "- WIFI Setup",     .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN4_ID, .shortcut = 'w'},
-    {.name = "- System Font",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN13_2_ID, .shortcut = 'f'},
-    {.name = "Red LED",          .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_red_led,      .get_cb = ui_setting_get_red_led, .shortcut = 'r'},
-    {.name = "Keypad Backlight", .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_keypad_light, .get_cb = ui_setting_get_keypad_light, .shortcut = 'b'},
-    {.name = "Motor Status",     .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_motor_status, .get_cb = ui_setting_get_motor_status, .shortcut = 'm'},
-    {.name = "Power GPS",        .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gps_status,   .get_cb = ui_setting_get_gps_status, .shortcut = 'g'},
-    {.name = "Power Lora",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_lora_status,  .get_cb = ui_setting_get_lora_status, .shortcut = 'l'},
-    {.name = "Power Gyro",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gyro_status,  .get_cb = ui_setting_get_gyro_status, .shortcut = 'y'},
-    {.name = "Power A7682",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_a7682_status, .get_cb = ui_setting_get_a7682_status, .shortcut = 'a'},
-    {.name = "Touchscreen",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_touch_status, .get_cb = ui_setting_get_touch_status, .shortcut = 't'},
-    {.name = "- Lora",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN1_ID, .shortcut = 's'},
-    {.name = "- GPS",            .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN3_ID, .shortcut = 'p'},
-    {.name = "- Test",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN5_ID, .shortcut = 'x'},
-    {.name = "- Battery",        .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN6_ID, .shortcut = 'u'},
-    {.name = "- Input",          .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN7_ID, .shortcut = 'i'},
-    {.name = "- A7682E",         .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN8_ID, .shortcut = 'e'},
-    {.name = "- PCM5102",        .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN10_ID, .shortcut = 'c'},
-    {.name = "- USB SD Mount",   .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN_USB_MSC_ID, .shortcut = 'v'},
-    {.name = "- Shutdown",       .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN9_ID, .shortcut = 'h'},
-    {.name = "- Sleep",          .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN11_ID, .shortcut = 'd'},
-    {.name = "- About System",   .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN2_1_ID, .shortcut = 'z'},
+    {.name = "WIFI Setup",      .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN4_ID, .shortcut = 'w'},
+    {.name = "System Font",     .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN13_2_ID, .shortcut = 'f'},
+    {.name = "Red LED",         .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_red_led,      .get_cb = ui_setting_get_red_led, .shortcut = 'r'},
+    {.name = "Keypad Backlight",.type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_keypad_light, .get_cb = ui_setting_get_keypad_light, .shortcut = 'b'},
+    {.name = "Motor Status",    .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_motor_status, .get_cb = ui_setting_get_motor_status, .shortcut = 'm'},
+    {.name = "Power GPS",       .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gps_status,   .get_cb = ui_setting_get_gps_status, .shortcut = 'g'},
+    {.name = "Power Lora",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_lora_status,  .get_cb = ui_setting_get_lora_status, .shortcut = 'l'},
+    {.name = "Power Gyro",      .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_gyro_status,  .get_cb = ui_setting_get_gyro_status, .shortcut = 'y'},
+    {.name = "Power A7682",     .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_a7682_status, .get_cb = ui_setting_get_a7682_status, .shortcut = 'a'},
+    {.name = "Touchscreen",     .type=UI_SETTING_TYPE_SW,  .set_cb = ui_setting_set_touch_status, .get_cb = ui_setting_get_touch_status, .shortcut = 't'},
+    {.name = "Lora",            .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN1_ID, .shortcut = 's'},
+    {.name = "GPS",             .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN3_ID, .shortcut = 'p'},
+    {.name = "Test",            .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN5_ID, .shortcut = 'x'},
+    {.name = "Battery",         .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN6_ID, .shortcut = 'u'},
+    {.name = "Input",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN7_ID, .shortcut = 'i'},
+    {.name = "A7682E",          .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN8_ID, .shortcut = 'e'},
+    {.name = "PCM5102",         .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN10_ID, .shortcut = 'c'},
+    {.name = "USB SD Mount",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN_USB_MSC_ID, .shortcut = 'v'},
+    {.name = "Shutdown",        .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN9_ID, .shortcut = 'h'},
+    {.name = "Sleep",           .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN11_ID, .shortcut = 'd'},
+    {.name = "About System",    .type=UI_SETTING_TYPE_SUB, .sub_id = SCREEN2_1_ID, .shortcut = 'z'},
 };
 
 static void setting_item_create(int curr_apge);
@@ -1875,15 +2170,14 @@ static void GPS_loop_timer_event(lv_timer_t * t)
     scr3_GPS_updata();
 }
 
-static void scr3_btn_event_cb(lv_event_t * e)
+static void create3(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "GPS <" title bar. ESC on the keypad pops back to
+    // Settings via scr3_kb_timer_cb.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
 
-static void create3(lv_obj_t *parent) 
-{   
     scr3_cont = lv_obj_create(parent);
     lv_obj_set_size(scr3_cont, lv_pct(100), lv_pct(88));
     lv_obj_set_style_bg_color(scr3_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
@@ -1903,32 +2197,55 @@ static void create3(lv_obj_t *parent)
         lv_label_set_text(label_list[i], " ");
     }
 
+    // Tick counter — kept on this screen but pushed below the taskbar so it
+    // doesn't collide with the battery indicator on the right.
     scr3_cnt_lab = lv_label_create(parent);
     lv_obj_set_style_text_font(scr3_cnt_lab, FONT_BOLD_MONO_SIZE_15, LV_PART_MAIN);
     lv_obj_set_style_radius(scr3_cnt_lab, 5, LV_PART_MAIN);
     lv_obj_set_style_border_width(scr3_cnt_lab, 2, LV_PART_MAIN);
     lv_obj_set_style_text_align(scr3_cnt_lab, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text_fmt(scr3_cnt_lab, " %05d ", 0);
-    lv_obj_center(scr3_cnt_lab);
-    lv_obj_align(scr3_cnt_lab, LV_ALIGN_TOP_RIGHT, -10, 10);
-
-    lv_obj_t *back3_label = scr_back_btn_create(parent, ("GPS"), scr3_btn_event_cb);
+    lv_obj_align(scr3_cnt_lab, LV_ALIGN_TOP_RIGHT, -10, status_bar_height + 4);
 }
-static void entry3(void) 
+static lv_timer_t *scr3_kb_timer = NULL;
+static void scr3_kb_timer_cb(lv_timer_t *t)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to settings
+            scr_mgr_pop(false);
+            return;
+        }
+    }
+}
+
+static void entry3(void)
 {
     scr3_GPS_updata();
 
     ui_gps_task_resume();
 
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+
     GPS_loop_timer = lv_timer_create(GPS_loop_timer_event, 3000, NULL);
+    if (!scr3_kb_timer) scr3_kb_timer = lv_timer_create(scr3_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit3(void) {
-    ui_gps_task_suspend();
+    // Keep GPS running in the background so the topbar clock stays sourced
+    // from satellite time after the user leaves this screen — suspending it
+    // here defeats the no-WiFi time fallback.
     if(GPS_loop_timer) {
         lv_timer_del(GPS_loop_timer);
         GPS_loop_timer = NULL;
     }
+    if (scr3_kb_timer) { lv_timer_del(scr3_kb_timer); scr3_kb_timer = NULL; }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy3(void) { }
@@ -2053,9 +2370,10 @@ static void scr4_start_scan(void)
     scr4_count = 0;
     scr4_focus = 0;
     scr4_render_list();
-    scr4_set_status("Scanning...");
+    scr4_set_status("Scanning... (esc to cancel)");
     ui_disp_full_refr();
-    if (!scr4_scan_timer) scr4_scan_timer = lv_timer_create(scr4_scan_timer_cb, 50, NULL);
+    ui_wifi_scan_start_async();
+    if (!scr4_scan_timer) scr4_scan_timer = lv_timer_create(scr4_scan_timer_cb, 200, NULL);
 }
 
 static void scr4_kb_timer_cb(lv_timer_t *t)
@@ -2063,7 +2381,14 @@ static void scr4_kb_timer_cb(lv_timer_t *t)
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == 0x1B) { scr_mgr_pop(false); return; }
+        if (key == 0x1B) {
+            // Cancel the in-flight scan if any so the radio doesn't keep
+            // chewing CPU after we've left the screen.
+            if (scr4_scan_timer) { lv_timer_del(scr4_scan_timer); scr4_scan_timer = NULL; }
+            ui_wifi_scan_cancel();
+            scr_mgr_pop(false);
+            return;
+        }
         if (key == 'r') {
             scr4_start_scan();
             return; // list rebuilt async; abandon this tick
@@ -2082,21 +2407,27 @@ static void scr4_kb_timer_cb(lv_timer_t *t)
     }
 }
 
-// Run the (blocking) scan one tick after entry so the "Scanning..." label
-// actually paints first.
+// Poll the async WiFi scan started in scr4_start_scan(). We tick on a 200 ms
+// cadence so the kb timer keeps running alongside us — that's what lets Esc
+// interrupt mid-scan, which a sync WiFi.scanNetworks() can't do.
 static void scr4_scan_timer_cb(lv_timer_t *t)
 {
+    int n = ui_wifi_scan_poll(scr4_results, UI_WIFI_SCAN_ITEM_MAX);
+    if (n == -1) return; // still scanning
+
     lv_timer_del(scr4_scan_timer);
     scr4_scan_timer = NULL;
 
-    memset(scr4_results, 0, sizeof(scr4_results));
-    ui_wifi_get_scan_info(scr4_results, UI_WIFI_SCAN_ITEM_MAX);
-
-    scr4_count = 0;
-    for (int i = 0; i < UI_WIFI_SCAN_ITEM_MAX; i++) {
-        if (scr4_results[i].name[0] != '\0') scr4_count++;
-        else break;
+    if (n == -2) {
+        scr4_count = 0;
+        scr4_set_status("Scan failed (r retry, esc back)");
+        scr4_focus = 0;
+        scr4_render_list();
+        ui_disp_full_refr();
+        return;
     }
+
+    scr4_count = n;
 
     char status[64];
     lv_snprintf(status, sizeof(status), "%d nets  j/k move  E pick  r rescan", scr4_count);
@@ -2110,9 +2441,15 @@ static void scr4_scan_timer_cb(lv_timer_t *t)
 
 static void create4(lv_obj_t *parent)
 {
+    // Use the standard home-screen taskbar (clock + battery + wifi icon)
+    // instead of the per-screen "WiFi <" title bar. ESC on the keypad still
+    // pops back to settings via scr4_kb_timer_cb.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
+
     scr4_list = lv_list_create(parent);
     lv_obj_set_size(scr4_list, lv_pct(100), lv_pct(80));
-    lv_obj_align(scr4_list, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_align(scr4_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_pad_top(scr4_list, 4, LV_PART_MAIN);
     lv_obj_set_style_pad_row(scr4_list, 4, LV_PART_MAIN);
     lv_obj_set_style_radius(scr4_list, 0, LV_PART_MAIN);
@@ -2124,25 +2461,27 @@ static void create4(lv_obj_t *parent)
     lv_obj_set_style_text_font(scr4_status_lab, FONT_BOLD_SIZE_14, LV_PART_MAIN);
     lv_obj_align(scr4_status_lab, LV_ALIGN_BOTTOM_LEFT, 6, -4);
     lv_label_set_text(scr4_status_lab, "Scanning...");
-
-    scr_back_btn_create(parent, "WiFi", scr4_btn_event_cb);
 }
 
 static void entry4(void)
 {
-    scr4_count = 0;
-    scr4_focus = 0;
-    scr4_render_list();
-    scr4_set_status("Scanning...");
-    ui_disp_full_refr();
-    if (!scr4_kb_timer)   scr4_kb_timer   = lv_timer_create(scr4_kb_timer_cb, 30, NULL);
-    if (!scr4_scan_timer) scr4_scan_timer = lv_timer_create(scr4_scan_timer_cb, 50, NULL);
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr4_kb_timer) scr4_kb_timer = lv_timer_create(scr4_kb_timer_cb, 30, NULL);
+    scr4_start_scan();
 }
 
 static void exit4(void)
 {
     if (scr4_kb_timer)   { lv_timer_del(scr4_kb_timer);   scr4_kb_timer = NULL; }
     if (scr4_scan_timer) { lv_timer_del(scr4_scan_timer); scr4_scan_timer = NULL; }
+    // If we're leaving mid-scan (e.g. via Esc), make sure the radio is
+    // actually idle and the result buffer is freed.
+    ui_wifi_scan_cancel();
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 
@@ -2493,34 +2832,26 @@ static scr_lifecycle_t screen4_2 = {
 //************************************[ screen 5 ]****************************************** Test
 #if 1
 static lv_obj_t *test_list;
-static lv_obj_t *test_page;
 static int test_num = 0;
 static int test_page_num = 0;
 static int test_curr_page = 0;
 
 static ui_test_handle test_handle_list[] = {
-    { .name="Lora",       .peri_id=E_PERI_LORA       , .cb=ui_test_get },
-    { .name="Touch",      .peri_id=E_PERI_TOUCH      , .cb=ui_test_get },
-    { .name="BQ25896",    .peri_id=E_PERI_BQ25896    , .cb=ui_test_get },
-    { .name="BQ27220",    .peri_id=E_PERI_BQ27220    , .cb=ui_test_get },
-    { .name="SD Card",    .peri_id=E_PERI_SD         , .cb=ui_test_get },
-    { .name="A7682E",     .peri_id=E_PERI_A7682E     , .cb=ui_test_get },
-    { .name="PCM5102A",   .peri_id=E_PERI_PCM5102A   , .cb=ui_test_get },
-    { .name="Keypad",     .peri_id=E_PERI_KYEPAD     , .cb=ui_test_get },
-    { .name="GPS",        .peri_id=E_PERI_GPS        , .cb=ui_test_get },
-    { .name="BHI260AP",   .peri_id=E_PERI_BHI260AP   , .cb=ui_test_get },
-    { .name="LTR_553ALS", .peri_id=E_PERI_LTR_553ALS , .cb=ui_test_get },
-    { .name="INK_SCREEN", .peri_id=E_PERI_INK_SCREEN , .cb=ui_test_get },
+    { .name="Lora",       .peri_id=E_PERI_LORA       , .cb=ui_test_get, .shortcut='l' },
+    { .name="Touch",      .peri_id=E_PERI_TOUCH      , .cb=ui_test_get, .shortcut='t' },
+    { .name="BQ25896",    .peri_id=E_PERI_BQ25896    , .cb=ui_test_get, .shortcut='5' },
+    { .name="BQ27220",    .peri_id=E_PERI_BQ27220    , .cb=ui_test_get, .shortcut='7' },
+    { .name="SD Card",    .peri_id=E_PERI_SD         , .cb=ui_test_get, .shortcut='d' },
+    { .name="A7682E",     .peri_id=E_PERI_A7682E     , .cb=ui_test_get, .shortcut='a' },
+    { .name="PCM5102A",   .peri_id=E_PERI_PCM5102A   , .cb=ui_test_get, .shortcut='p' },
+    { .name="Keypad",     .peri_id=E_PERI_KYEPAD     , .cb=ui_test_get, .shortcut='y' },
+    { .name="GPS",        .peri_id=E_PERI_GPS        , .cb=ui_test_get, .shortcut='g' },
+    { .name="BHI260AP",   .peri_id=E_PERI_BHI260AP   , .cb=ui_test_get, .shortcut='b' },
+    { .name="LTR_553ALS", .peri_id=E_PERI_LTR_553ALS , .cb=ui_test_get, .shortcut='r' },
+    { .name="INK_SCREEN", .peri_id=E_PERI_INK_SCREEN , .cb=ui_test_get, .shortcut='i' },
 };
 
 static void test_item_create(int curr_apge);
-
-static void scr5_btn_event_cb(lv_event_t * e)
-{
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
 
 static lv_group_t *test_group = NULL;
 static lv_timer_t *test_kb_timer = NULL;
@@ -2550,13 +2881,6 @@ static void test_page_switch_internal(char opt)
     }
 
     test_item_create(test_curr_page);
-    lv_label_set_text_fmt(test_page, "%d / %d", test_curr_page + 1, test_page_num + 1);
-}
-
-static void test_page_switch_cb(lv_event_t *e)
-{
-    char opt = (int)e->user_data;
-    test_page_switch_internal(opt);
 }
 
 static void test_item_create(int curr_apge)
@@ -2596,15 +2920,22 @@ static void test_item_create(int curr_apge)
     }
 }
 
-static void create5(lv_obj_t *parent) 
+static void create5(lv_obj_t *parent)
 {
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Test <" title bar. ESC on the keypad pops back to
+    // Settings via test_kb_timer_cb; per-item letter shortcuts focus the
+    // matching test row.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
+
     if (!test_group) {
         test_group = lv_group_create();
         lv_group_set_wrap(test_group, false);
     }
     test_list = lv_list_create(parent);
-    lv_obj_set_size(test_list, LV_HOR_RES, lv_pct(88));
-    lv_obj_align(test_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(test_list, LV_HOR_RES, LV_VER_RES - status_bar_height - 8);
+    lv_obj_align(test_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_bg_color(test_list, DECKPRO_COLOR_BG, LV_PART_MAIN);
     lv_obj_set_style_pad_top(test_list, 1, LV_PART_MAIN);
     lv_obj_set_style_pad_row(test_list, 1, LV_PART_MAIN);
@@ -2616,71 +2947,6 @@ static void create5(lv_obj_t *parent)
     test_num = sizeof(test_handle_list) / sizeof(test_handle_list[0]);
     test_page_num = test_num / SETTING_PAGE_MAX_ITEM;
     test_item_create(test_curr_page);
-
-    lv_obj_t * ui_Button2 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button2, 71);
-    lv_obj_set_height(ui_Button2, 40);
-    lv_obj_set_x(ui_Button2, -70);
-    lv_obj_set_y(ui_Button2, 130);
-    lv_obj_set_align(ui_Button2, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button2, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button2, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button2, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button2, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label1 = lv_label_create(ui_Button2);
-    lv_obj_set_width(ui_Label1, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label1, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label1, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label1, "Back");
-    lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Button14 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button14, 71);
-    lv_obj_set_height(ui_Button14, 40);
-    lv_obj_set_x(ui_Button14, 70);
-    lv_obj_set_y(ui_Button14, 130);
-    lv_obj_set_align(ui_Button14, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button14, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button14, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button14, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button14, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button14, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label15 = lv_label_create(ui_Button14);
-    lv_obj_set_width(ui_Label15, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label15, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label15, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label15, "Next");
-    lv_obj_set_style_text_color(ui_Label15, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label15, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_add_event_cb(ui_Button2, test_page_switch_cb, LV_EVENT_CLICKED, (void*)'n');
-    lv_obj_add_event_cb(ui_Button14, test_page_switch_cb, LV_EVENT_CLICKED, (void*)'p');
-
-    test_page = lv_label_create(parent);
-    lv_obj_set_width(test_page, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(test_page, LV_SIZE_CONTENT);    /// 1
-    lv_obj_align(test_page, LV_ALIGN_BOTTOM_MID, 0, -23);
-    lv_label_set_text_fmt(test_page, "%d / %d", test_curr_page + 1, test_page_num + 1);
-    lv_obj_set_style_text_color(test_page, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(test_page, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t *back5_label = scr_back_btn_create(parent, ("Test"), scr5_btn_event_cb);
 }
 static void test_kb_timer_cb(lv_timer_t *t) {
     char key;
@@ -2720,11 +2986,36 @@ static void test_kb_timer_cb(lv_timer_t *t) {
                 lv_obj_t *f = lv_group_get_focused(test_group);
                 if (f) lv_event_send(f, LV_EVENT_CLICKED, NULL);
             }
+        } else {
+            // Per-item shortcut: jump focus to the matching test row.
+            for (int i = 0; i < test_num; i++) {
+                if (test_handle_list[i].shortcut == key) {
+                    int target_page = i / SETTING_PAGE_MAX_ITEM;
+                    if (target_page != test_curr_page) {
+                        // page navigation expects 'n' = decrement, 'p' = increment
+                        while (test_curr_page != target_page) {
+                            test_page_switch_internal(test_curr_page < target_page ? 'p' : 'n');
+                        }
+                    }
+                    int idx_on_page = i % SETTING_PAGE_MAX_ITEM;
+                    lv_obj_t *obj = lv_obj_get_child(test_list, idx_on_page);
+                    if (obj) {
+                        lv_group_focus_obj(obj);
+                        lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
+                    }
+                    return;
+                }
+            }
         }
     }
 }
 static void entry5(void)
 {
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
     if (!test_kb_timer) test_kb_timer = lv_timer_create(test_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
@@ -2733,6 +3024,7 @@ static void exit5(void) {
         lv_timer_del(test_kb_timer);
         test_kb_timer = NULL;
     }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy5(void) {
@@ -2759,17 +3051,17 @@ static void scr6_list_event(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * obj = lv_event_get_target(e);
-    for(int i = 0; i < lv_obj_get_child_cnt(obj); i++) 
+    for(int i = 0; i < lv_obj_get_child_cnt(obj); i++)
     {
         lv_obj_t * child = lv_obj_get_child(obj, i);
         if(lv_obj_check_type(child, &lv_label_class)) {
             char *str = lv_label_get_text(child);
 
-            if(strcmp("- BQ25896", str) == 0)
+            if(strcmp("c  BQ25896", str) == 0)
             {
                 scr_mgr_push(SCREEN6_1_ID, false);
             }
-            if(strcmp("- BQ27220", str) == 0)
+            if(strcmp("g  BQ27220", str) == 0)
             {
                 scr_mgr_push(SCREEN6_2_ID, false);
             }
@@ -2801,40 +3093,62 @@ static void scr6_item_create(const char *name, lv_event_cb_t cb)
     lv_obj_add_event_cb(obj, cb, LV_EVENT_CLICKED, NULL); 
 }
 
-static void scr6_btn_event_cb(lv_event_t * e)
+static void create6(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        // ui_full_refresh();
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Battery <" title bar. ESC on the keypad pops back to
+    // Settings via scr6_kb_timer_cb. Letter prefixes on the items double as
+    // keypad shortcuts handled by the same kb timer.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
 
-static void create6(lv_obj_t *parent) 
-{
     scr6_list = lv_list_create(parent);
-    lv_obj_set_size(scr6_list, lv_pct(93), lv_pct(91));
-    lv_obj_align(scr6_list, LV_ALIGN_BOTTOM_MID, 0, 0);
-    // lv_obj_set_style_bg_color(scr6_list, lv_color_hex(EPD_COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_size(scr6_list, lv_pct(93), LV_VER_RES - status_bar_height - 8);
+    lv_obj_align(scr6_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_pad_top(scr6_list, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_row(scr6_list, 15, LV_PART_MAIN);
     lv_obj_set_style_radius(scr6_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_outline_pad(scr6_list, 1, LV_PART_MAIN);
     lv_obj_set_style_border_width(scr6_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_border_color(scr6_list, lv_color_hex(EPD_COLOR_FG), LV_PART_MAIN);
     lv_obj_set_style_shadow_width(scr6_list, 0, LV_PART_MAIN);
 
-    scr6_item_create("- BQ25896", scr6_list_event);
-    scr6_item_create("- BQ27220", scr6_list_event);
-
-    // back
-    scr_back_btn_create(parent, "Battery", scr6_btn_event_cb);
+    scr6_item_create("c  BQ25896", scr6_list_event);
+    scr6_item_create("g  BQ27220", scr6_list_event);
 }
 
-static void entry6(void) 
+static lv_timer_t *scr6_kb_timer = NULL;
+static void scr6_kb_timer_cb(lv_timer_t *t)
 {
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Settings
+            scr_mgr_pop(false);
+            return;
+        }
+        if (key == 'c') { // Charger IC
+            scr_mgr_push(SCREEN6_1_ID, false);
+            return;
+        }
+        if (key == 'g') { // Fuel gauge IC
+            scr_mgr_push(SCREEN6_2_ID, false);
+            return;
+        }
+    }
+}
+
+static void entry6(void)
+{
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr6_kb_timer) scr6_kb_timer = lv_timer_create(scr6_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit6(void) {
+    lv_timer_pause(taskbar_update_timer);
+    if (scr6_kb_timer) { lv_timer_del(scr6_kb_timer); scr6_kb_timer = NULL; }
     ui_disp_full_refr();
 }
 static void destroy6(void) { }
@@ -2909,15 +3223,13 @@ static void batt_6_1_updata_timer_event(lv_timer_t *t)
     scr6_1_battert_updata();
 }
 
-static void scr6_1_btn_event_cb(lv_event_t * e)
+static void create6_1(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "BQ25896 <" title bar. ESC on the keypad pops back to
+    // the Battery menu via scr6_1_kb_timer_cb.
+    ui_taskbar_create(parent);
 
-static void create6_1(lv_obj_t *parent) 
-{
     lv_obj_t *scr6_1_cont = lv_obj_create(parent);
     lv_obj_set_size(scr6_1_cont, lv_pct(100), lv_pct(88));
     lv_obj_set_style_bg_color(scr6_1_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
@@ -2935,12 +3247,30 @@ static void create6_1(lv_obj_t *parent)
     for(int i = 0; i < sizeof(label_list) / sizeof(label_list[0]); i++) {
         label_list[i] = scr6_1_create_label(scr6_1_cont);
     }
-
-    scr_back_btn_create(parent, ("BQ25896"), scr6_1_btn_event_cb);
 }
-static void entry6_1(void) 
+
+static lv_timer_t *scr6_1_kb_timer = NULL;
+static void scr6_1_kb_timer_cb(lv_timer_t *t)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Battery menu
+            scr_mgr_pop(false);
+            return;
+        }
+    }
+}
+
+static void entry6_1(void)
 {
     scr6_1_battert_updata();
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr6_1_kb_timer) scr6_1_kb_timer = lv_timer_create(scr6_1_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
     batt_6_1_timer = lv_timer_create(batt_6_1_updata_timer_event, 5000, NULL);
 }
@@ -2949,6 +3279,8 @@ static void exit6_1(void) {
         lv_timer_del(batt_6_1_timer);
         batt_6_1_timer = NULL;
     }
+    if (scr6_1_kb_timer) { lv_timer_del(scr6_1_kb_timer); scr6_1_kb_timer = NULL; }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy6_1(void) { }
@@ -3023,15 +3355,13 @@ static void batt_6_2_updata_timer_event(lv_timer_t *t)
     scr6_2_battert_updata();
 }
 
-static void scr6_2_btn_event_cb(lv_event_t * e)
+static void create6_2(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "BQ27220 <" title bar. ESC on the keypad pops back to
+    // the Battery menu via scr6_2_kb_timer_cb.
+    ui_taskbar_create(parent);
 
-static void create6_2(lv_obj_t *parent) 
-{   
     lv_obj_t *scr6_2_cont = lv_obj_create(parent);
     lv_obj_set_size(scr6_2_cont, lv_pct(100), lv_pct(88));
     lv_obj_set_style_bg_color(scr6_2_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
@@ -3049,13 +3379,30 @@ static void create6_2(lv_obj_t *parent)
     for(int i = 0; i < sizeof(label_list) / sizeof(label_list[0]); i++) {
         label_list[i] = scr6_2_create_label(scr6_2_cont);
     }
-    // back
-    scr_back_btn_create(parent, ("BQ27220"), scr6_btn_event_cb);
 }
 
-static void entry6_2(void) 
+static lv_timer_t *scr6_2_kb_timer = NULL;
+static void scr6_2_kb_timer_cb(lv_timer_t *t)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) { // Esc -> back to Battery menu
+            scr_mgr_pop(false);
+            return;
+        }
+    }
+}
+
+static void entry6_2(void)
 {
     scr6_2_battert_updata();
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
+    if (!scr6_2_kb_timer) scr6_2_kb_timer = lv_timer_create(scr6_2_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
     batt_6_2_timer = lv_timer_create(batt_6_2_updata_timer_event, 5000, NULL);
 }
@@ -3064,6 +3411,8 @@ static void exit6_2(void) {
         lv_timer_del(batt_6_2_timer);
         batt_6_2_timer = NULL;
     }
+    if (scr6_2_kb_timer) { lv_timer_del(scr6_2_kb_timer); scr6_2_kb_timer = NULL; }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 
@@ -3091,13 +3440,6 @@ static lv_timer_t *input_timer;
 static char keypad_str[KEYPAD_STR_CAP] = "Keypad: \n";
 static size_t keypad_str_len = 9; // strlen("Keypad: \n")
 
-static void scr7_btn_event_cb(lv_event_t * e)
-{
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
-
 static void input_timer_event(lv_timer_t *t)
 {
     int touch_x, touch_y;
@@ -3118,6 +3460,13 @@ static void input_timer_event(lv_timer_t *t)
     if(ret == 1)
     {
         ui_input_set_keypad_flag();
+        // Esc still owns its usual "pop back" role even on the input visualizer,
+        // since this screen owns the keypad queue and a separate kb timer would
+        // race us for it.
+        if (keypay_v == 0x1B) {
+            scr_mgr_pop(false);
+            return;
+        }
         if (keypad_str_len + 1 >= KEYPAD_STR_CAP) {
             // Roll back to just the header to avoid an unbounded label.
             memcpy(keypad_str, "Keypad: \n", 9);
@@ -3150,8 +3499,14 @@ static void input_timer_event(lv_timer_t *t)
     }
 }
 
-static void create7(lv_obj_t *parent) 
+static void create7(lv_obj_t *parent)
 {
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "Other <" title bar. ESC on the keypad pops back to
+    // Settings — handled inside input_timer_event so we don't fight the
+    // visualizer for the keypad queue.
+    ui_taskbar_create(parent);
+
     scr7_cont = lv_obj_create(parent);
     lv_obj_set_size(scr7_cont, lv_pct(100), lv_pct(88));
     lv_obj_set_style_bg_color(scr7_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
@@ -3198,13 +3553,17 @@ static void create7(lv_obj_t *parent)
                                         "   gyros_y: 000\n"
                                         "   gyros_z: 000");
 
-    lv_obj_t *back7_label = scr_back_btn_create(parent, ("Other"), scr7_btn_event_cb);
 }
 static void entry7(void)
 {
     memcpy(keypad_str, "Keypad: \n", 9);
     keypad_str[9] = '\0';
     keypad_str_len = 9;
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
     ui_disp_full_refr();
     input_timer = lv_timer_create(input_timer_event, 50, NULL);
 }
@@ -3214,6 +3573,7 @@ static void exit7(void) {
         lv_timer_del(input_timer);
         input_timer = NULL;
     }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy7(void) { }
@@ -3246,11 +3606,11 @@ bool ui_a7682_at_test(const char *param)
     return true;
 }
 
-static ui_a7682_handle a7682_handle_list[] = 
+static ui_a7682_handle a7682_handle_list[] =
 {
-    {"A7682 Audio", NULL, NULL, ui_a7682_at_cb},
-    {"Call test", NULL, NULL, ui_a7682_call_test},
-    {"AT test", NULL, NULL, ui_a7682_at_test},
+    {"A7682 Audio", NULL, NULL, ui_a7682_at_cb,        'u'},
+    {"Call test",   NULL, NULL, ui_a7682_call_test,    'c'},
+    {"AT test",     NULL, NULL, ui_a7682_at_test,      't'},
 };
 
 static void a7682_item_create(int curr_apge);
@@ -3373,10 +3733,32 @@ static void a7682_kb_timer_cb(lv_timer_t *t) {
                 lv_obj_t *f = lv_group_get_focused(a7682_group);
                 if (f) lv_event_send(f, LV_EVENT_CLICKED, NULL);
             }
+        } else {
+            // Per-item shortcut: focus + click the matching row.
+            for (int i = 0; i < a7682_num; i++) {
+                if (a7682_handle_list[i].shortcut == key) {
+                    int target_page = i / SETTING_PAGE_MAX_ITEM;
+                    if (target_page != a7682_curr_page) {
+                        while (a7682_curr_page != target_page) {
+                            a7682_page_switch_internal(a7682_curr_page < target_page ? 'p' : 'n');
+                        }
+                    }
+                    int idx_on_page = i % SETTING_PAGE_MAX_ITEM;
+                    lv_obj_t *obj = lv_obj_get_child(a7682_list, idx_on_page);
+                    if (obj) {
+                        lv_group_focus_obj(obj);
+                        lv_event_send(obj, LV_EVENT_CLICKED, NULL);
+                        lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
+                    }
+                    return;
+                }
+            }
         }
     }
 }
 
+// scr8_btn_event_cb is kept for the Shutdown/Sleep sub-screens that still
+// use the per-screen back button.
 static void scr8_btn_event_cb(lv_event_t * e)
 {
     if(e->code == LV_EVENT_CLICKED){
@@ -3384,20 +3766,25 @@ static void scr8_btn_event_cb(lv_event_t * e)
     }
 }
 
-static void create8(lv_obj_t *parent) 
+static void create8(lv_obj_t *parent)
 {
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "A7682E <" title bar. ESC on the keypad pops back to
+    // Settings via a7682_kb_timer_cb; letter shortcuts pick a row.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
+
     if (!a7682_group) {
         a7682_group = lv_group_create();
         lv_group_set_wrap(a7682_group, false);
     }
     a7682_list = lv_list_create(parent);
-    lv_obj_set_size(a7682_list, LV_HOR_RES, lv_pct(88));
-    lv_obj_align(a7682_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(a7682_list, LV_HOR_RES, LV_VER_RES - status_bar_height - 8);
+    lv_obj_align(a7682_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_bg_color(a7682_list, DECKPRO_COLOR_BG, LV_PART_MAIN);
     lv_obj_set_style_pad_top(a7682_list, 1, LV_PART_MAIN);
     lv_obj_set_style_pad_row(a7682_list, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(a7682_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_outline_pad(a7682_list, 2, LV_PART_MAIN);
     lv_obj_set_style_border_width(a7682_list, 0, LV_PART_MAIN);
     lv_obj_set_style_border_color(a7682_list, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(a7682_list, 0, LV_PART_MAIN);
@@ -3405,74 +3792,14 @@ static void create8(lv_obj_t *parent)
     a7682_num = sizeof(a7682_handle_list) / sizeof(a7682_handle_list[0]);
     a7682_page_num = a7682_num / SETTING_PAGE_MAX_ITEM;
     a7682_item_create(a7682_curr_page);
-
-    lv_obj_t * ui_Button2 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button2, 71);
-    lv_obj_set_height(ui_Button2, 40);
-    lv_obj_set_x(ui_Button2, -70);
-    lv_obj_set_y(ui_Button2, 130);
-    lv_obj_set_align(ui_Button2, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button2, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button2, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button2, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button2, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label1 = lv_label_create(ui_Button2);
-    lv_obj_set_width(ui_Label1, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label1, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label1, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label1, "Back");
-    lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Button14 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button14, 71);
-    lv_obj_set_height(ui_Button14, 40);
-    lv_obj_set_x(ui_Button14, 70);
-    lv_obj_set_y(ui_Button14, 130);
-    lv_obj_set_align(ui_Button14, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button14, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button14, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button14, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button14, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button14, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label15 = lv_label_create(ui_Button14);
-    lv_obj_set_width(ui_Label15, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label15, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label15, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label15, "Next");
-    lv_obj_set_style_text_color(ui_Label15, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label15, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_add_event_cb(ui_Button2, a7682_page_switch_cb, LV_EVENT_CLICKED, (void*)'n');
-    lv_obj_add_event_cb(ui_Button14, a7682_page_switch_cb, LV_EVENT_CLICKED, (void*)'p');
-
-    a7682_page = lv_label_create(parent);
-    lv_obj_set_width(a7682_page, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(a7682_page, LV_SIZE_CONTENT);    /// 1
-    lv_obj_align(a7682_page, LV_ALIGN_BOTTOM_MID, 0, -23);
-    lv_label_set_text_fmt(a7682_page, "%d / %d", a7682_curr_page + 1, a7682_page_num + 1);
-    lv_obj_set_style_text_color(a7682_page, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(a7682_page, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t *back8_label = scr_back_btn_create(parent, ("A7682E"), scr8_btn_event_cb);
 }
 static void entry8(void)
 {
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
     if (!a7682_kb_timer) a7682_kb_timer = lv_timer_create(a7682_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
@@ -3481,6 +3808,7 @@ static void exit8(void) {
         lv_timer_del(a7682_kb_timer);
         a7682_kb_timer = NULL;
     }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy8(void) {
@@ -3683,9 +4011,9 @@ static int pcm5102_num = 0;
 static int pcm5102_page_num = 0;
 static int pcm5102_curr_page = 0;
 
-static ui_pcm5102_handle pcm5102_handle_list[] = 
+static ui_pcm5102_handle pcm5102_handle_list[] =
 {
-    {"PCM5102 Audio", NULL, NULL, ui_pcm5102_cb},
+    {"PCM5102 Audio", NULL, NULL, ui_pcm5102_cb, 'u'},
 };
 
 static void pcm5102_item_create(int curr_apge);
@@ -3808,32 +4136,49 @@ static void pcm5102_kb_timer_cb(lv_timer_t *t) {
                 lv_obj_t *f = lv_group_get_focused(pcm5102_group);
                 if (f) lv_event_send(f, LV_EVENT_CLICKED, NULL);
             }
+        } else {
+            // Per-item shortcut: focus + click the matching row.
+            for (int i = 0; i < pcm5102_num; i++) {
+                if (pcm5102_handle_list[i].shortcut == key) {
+                    int target_page = i / SETTING_PAGE_MAX_ITEM;
+                    if (target_page != pcm5102_curr_page) {
+                        while (pcm5102_curr_page != target_page) {
+                            pcm5102_page_switch_internal(pcm5102_curr_page < target_page ? 'p' : 'n');
+                        }
+                    }
+                    int idx_on_page = i % SETTING_PAGE_MAX_ITEM;
+                    lv_obj_t *obj = lv_obj_get_child(pcm5102_list, idx_on_page);
+                    if (obj) {
+                        lv_group_focus_obj(obj);
+                        lv_event_send(obj, LV_EVENT_CLICKED, NULL);
+                        lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
+                    }
+                    return;
+                }
+            }
         }
     }
 }
 
-
-static void scr10_btn_event_cb(lv_event_t * e)
+static void create10(lv_obj_t *parent)
 {
-    if(e->code == LV_EVENT_CLICKED){
-        scr_mgr_pop(false);
-    }
-}
+    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
+    // the per-screen "PCM5102 <" title bar. ESC on the keypad pops back to
+    // Settings via pcm5102_kb_timer_cb; letter shortcuts pick a row.
+    ui_taskbar_create(parent);
+    const int status_bar_height = 25;
 
-static void create10(lv_obj_t *parent) 
-{
     if (!pcm5102_group) {
         pcm5102_group = lv_group_create();
         lv_group_set_wrap(pcm5102_group, false);
     }
     pcm5102_list = lv_list_create(parent);
-    lv_obj_set_size(pcm5102_list, LV_HOR_RES, lv_pct(88));
-    lv_obj_align(pcm5102_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(pcm5102_list, LV_HOR_RES, LV_VER_RES - status_bar_height - 8);
+    lv_obj_align(pcm5102_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
     lv_obj_set_style_bg_color(pcm5102_list, DECKPRO_COLOR_BG, LV_PART_MAIN);
     lv_obj_set_style_pad_top(pcm5102_list, 1, LV_PART_MAIN);
     lv_obj_set_style_pad_row(pcm5102_list, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(pcm5102_list, 0, LV_PART_MAIN);
-    // lv_obj_set_style_outline_pad(pcm5102_list, 2, LV_PART_MAIN);
     lv_obj_set_style_border_width(pcm5102_list, 0, LV_PART_MAIN);
     lv_obj_set_style_border_color(pcm5102_list, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(pcm5102_list, 0, LV_PART_MAIN);
@@ -3841,84 +4186,25 @@ static void create10(lv_obj_t *parent)
     pcm5102_num = sizeof(pcm5102_handle_list) / sizeof(pcm5102_handle_list[0]);
     pcm5102_page_num = pcm5102_num / SETTING_PAGE_MAX_ITEM;
     pcm5102_item_create(pcm5102_curr_page);
-
-    lv_obj_t * ui_Button2 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button2, 71);
-    lv_obj_set_height(ui_Button2, 40);
-    lv_obj_set_x(ui_Button2, -70);
-    lv_obj_set_y(ui_Button2, 130);
-    lv_obj_set_align(ui_Button2, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button2, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button2, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button2, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button2, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button2, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label1 = lv_label_create(ui_Button2);
-    lv_obj_set_width(ui_Label1, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label1, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label1, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label1, "Back");
-    lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Button14 = lv_btn_create(parent);
-    lv_obj_set_width(ui_Button14, 71);
-    lv_obj_set_height(ui_Button14, 40);
-    lv_obj_set_x(ui_Button14, 70);
-    lv_obj_set_y(ui_Button14, 130);
-    lv_obj_set_align(ui_Button14, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Button14, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-    lv_obj_clear_flag(ui_Button14, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(ui_Button14, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Button14, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_spread(ui_Button14, 0, LV_PART_MAIN | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ui_Button14, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t * ui_Label15 = lv_label_create(ui_Button14);
-    lv_obj_set_width(ui_Label15, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label15, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_align(ui_Label15, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label15, "Next");
-    lv_obj_set_style_text_color(ui_Label15, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_Label15, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_add_event_cb(ui_Button2, pcm5102_page_switch_cb, LV_EVENT_CLICKED, (void*)'n');
-    lv_obj_add_event_cb(ui_Button14, pcm5102_page_switch_cb, LV_EVENT_CLICKED, (void*)'p');
-
-    pcm5102_page = lv_label_create(parent);
-    lv_obj_set_width(pcm5102_page, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(pcm5102_page, LV_SIZE_CONTENT);    /// 1
-    lv_obj_align(pcm5102_page, LV_ALIGN_BOTTOM_MID, 0, -23);
-    lv_label_set_text_fmt(pcm5102_page, "%d / %d", pcm5102_curr_page + 1, pcm5102_page_num + 1);
-    lv_obj_set_style_text_color(pcm5102_page, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(pcm5102_page, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t *back10_label = scr_back_btn_create(parent, ("PCM5102"), scr10_btn_event_cb);
 }
-static void entry10(void) 
+static void entry10(void)
 {
+    lv_timer_resume(taskbar_update_timer);
+    if (menu_taskbar) {
+        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
+    }
     if (!pcm5102_kb_timer) pcm5102_kb_timer = lv_timer_create(pcm5102_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
-static void exit10(void) 
+static void exit10(void)
 {
     ui_pcm5102_stop();
     if (pcm5102_kb_timer) {
         lv_timer_del(pcm5102_kb_timer);
         pcm5102_kb_timer = NULL;
     }
+    lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
 static void destroy10(void) {
@@ -4129,6 +4415,10 @@ static void menu_taskbar_update_timer_cb(lv_timer_t *t)
                     first_time_update_done = true;
                     ui_disp_full_refr();
                 }
+                // Stamp every minute-tick so the next cold boot has something
+                // recent to restore. NVS writes are wear-level safe at this
+                // cadence (~1440/day vs. ~100k cycle endurance).
+                ui_time_persist_save();
             }
         }
     }

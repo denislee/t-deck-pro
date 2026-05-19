@@ -91,6 +91,12 @@
 // GPS
 #define BOARD_GPS_RXD 44
 #define BOARD_GPS_TXD 43
+// GPIO 1 is one net shared between the GPS module's PPS (time pulse) output
+// and the back-cover red LED. Whoever drives the line first wins; if PPS is
+// left enabled, the GPS pulses it ~1 Hz and the "Red LED" UI setting has no
+// effect. peri_gps.cpp sends UBX-CFG-VALSET to disable TP1 after init so the
+// ESP32 has sole control. Do not register a PPS ISR on this pin without
+// re-thinking the LED toggle.
 #define BOARD_GPS_PPS 1
 #define BOARD_RED_LED 1
 

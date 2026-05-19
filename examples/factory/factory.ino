@@ -629,10 +629,27 @@ static void peripheral_init_task(void *param)
     peri_init_st[E_PERI_BQ25896]    = bq25896_init();
     peri_init_st[E_PERI_BQ27220]    = bq27220_init();
     peri_init_st[E_PERI_SD]         = sd_care_init();
-    // GPS disabled — the L76K/UBX baud-scan in gps_init walks 6 baud rates
-    // with multi-second delays per attempt before declaring "GPS Connect
-    // failed", which dominates boot time. Re-enable once GPS is needed.
-    peri_init_st[E_PERI_GPS]        = false;
+    // Honour the persisted GPS on/off preference. We need GPS up at boot so
+    // the topbar clock can be set from satellite time when WiFi is off —
+    // otherwise the clock would stay at "--:--" until the user manually
+    // toggles GPS in settings. The baud-scan in gps_init walks several baud
+    // rates with delays, but we're already on a background FreeRTOS task so
+    // boot UX is not blocked. gps_task starts itself suspended; resume it
+    // explicitly here so NMEA sentences actually flow.
+    if (ui_setting_get_gps_status()) {
+        peri_init_st[E_PERI_GPS] = gps_init();
+        if (peri_init_st[E_PERI_GPS]) {
+            gps_task_resume();
+            // GPS shares GPIO 1 with BOARD_RED_LED. gps_init() disables the
+            // GPS time pulse (PPS) so it stops driving the line, but during
+            // baud-scan the module was free to pulse the pin — re-assert the
+            // saved LED state now that we own the line again.
+            pinMode(BOARD_RED_LED, OUTPUT);
+            digitalWrite(BOARD_RED_LED, ui_setting_get_red_led());
+        }
+    } else {
+        peri_init_st[E_PERI_GPS] = false;
+    }
     // Gyro disabled — BHI260AP responds at the I2C scan but its chip-ID
     // readback returns 0xFFFF on this V1.1 board, and the SensorLib init
     // path retries with 1 s delays generating Wire.cpp:499 Error 263 spam.
@@ -663,13 +680,16 @@ void setup()
 
     ui_settings_load();
 
-    // If a WiFi SSID is configured, kick off an asynchronous connect now
-    {
-        char saved_ssid[33] = {0};
-        ui_wifi_get_ssid(saved_ssid, sizeof(saved_ssid));
-        if (saved_ssid[0] != '\0') {
-            ui_wifi_set_enabled(true);
-        }
+    // No battery-backed RTC: every power cycle resets the clock to 1970. Pull
+    // the last persisted epoch out of NVS so the topbar shows a sensible time
+    // straight away; GPS or NTP will correct any drift once they're up.
+    ui_time_persist_restore();
+
+    // Restore the user's last WiFi on/off choice. We honour the persisted
+    // intent (wifi_en pref) rather than just "SSID present" — otherwise
+    // toggling WiFi off in the UI would silently come back on after reboot.
+    if (ui_wifi_get_enabled()) {
+        ui_wifi_set_enabled(true);
     }
 
     // IO

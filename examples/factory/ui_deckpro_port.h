@@ -82,6 +82,15 @@ void ui_gps_get_speed(double *speed);
 
 // [ screen 4 ] --- Wifi Scan
 void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len);
+// Async variants used by screen4 so an Esc press can interrupt without
+// having to wait for the (multi-second) WiFi.scanNetworks() to return.
+// _start_async kicks off WiFi.scanNetworks(async=true, hidden=true).
+// _poll returns -1 if still running, -2 if the scan failed, otherwise the
+// number of results copied into `list` (0..list_len).
+// _cancel aborts a running scan and frees the result buffer.
+void ui_wifi_scan_start_async(void);
+int  ui_wifi_scan_poll(ui_wifi_scan_info_t *list, int list_len);
+void ui_wifi_scan_cancel(void);
 void ui_wifi_set_enabled(bool en);
 bool ui_wifi_get_enabled(void);
 
@@ -115,6 +124,15 @@ bool ui_time_is_synced(void);
 bool ui_time_get_local(struct tm *out);
 // Triggers a manual NTP refresh (no-op if WiFi is not connected).
 void ui_ntp_resync(void);
+
+// Persisted-clock fallback. This board has no battery-backed RTC, so on every
+// power cycle the system clock resets to 1970. ui_time_persist_save() stamps
+// the current time into NVS; ui_time_persist_restore() reads it back at boot.
+// Restored time is wrong by however long the device was off, but it's good
+// enough to render a sensible "HH:MM" on the topbar — and gets corrected the
+// moment GPS gets a fix or WiFi runs NTP.
+void ui_time_persist_save(void);
+void ui_time_persist_restore(void);
 
 // ICMP ping. Blocks for up to (timeout_ms + ~500ms) on the calling task.
 // Returns true on reply; rtt_ms_out (if non-NULL) gets the RTT in ms on
@@ -261,6 +279,12 @@ int  ui_font_size_get(int slot);
 void ui_font_size_set(int slot, int s);
 int  ui_reader_rotation_get(void);   // 0=portrait, 1=landscape
 void ui_reader_rotation_set(int r);
+
+// Lock screen orientation: persisted across reboots so the lock screen
+// comes back up in whichever orientation the user last toggled it to
+// (via 'r' on the lock screen). 0=portrait, 1=landscape.
+int  ui_lock_landscape_get(void);
+void ui_lock_landscape_set(int r);
 
 // Vertical pixel gap between rendered text lines in the reader body label.
 // Persisted via Preferences. Clamped to a sensible range by the setter.

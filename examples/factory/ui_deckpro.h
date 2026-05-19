@@ -117,6 +117,7 @@ typedef struct _ui_test {
     lv_obj_t *obj;
     lv_obj_t *st;
     bool (*cb)(int);
+    char shortcut;
 } ui_test_handle;
 
 typedef struct _ui_a7682 {
@@ -124,6 +125,7 @@ typedef struct _ui_a7682 {
     lv_obj_t *obj;
     lv_obj_t *st;
     bool (*cb)(const char *at_cmd);
+    char shortcut;
 } ui_a7682_handle;
 
 typedef struct _ui_pcm5102 {
@@ -131,6 +133,7 @@ typedef struct _ui_pcm5102 {
     lv_obj_t *obj;
     lv_obj_t *st;
     bool (*cb)(const char *at_cmd);
+    char shortcut;
 } ui_pcm5102_handle;
 
 
