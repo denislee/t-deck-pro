@@ -31,10 +31,75 @@ CHIP          ?= esp32s3
 BAUD          ?= 921600
 MONITOR_BAUD  ?= 115200
 
-# Auto-detect port: prefer any /dev/ttyACM* (native USB-CDC), fall back to
-# /dev/ttyUSB* (UART bridge). Picks the first match, so multiple devices
-# attached will require an explicit PORT= override.
-PORT ?= $(firstword $(sort $(wildcard /dev/ttyACM*)) $(sort $(wildcard /dev/ttyUSB*)) /dev/ttyACM0)
+# Auto-detect port by:
+#   1) preferring /dev/serial/by-id/* (udev-stable symlinks keyed by USB
+#      serial number, so the path resolves to whichever ttyACMx the device
+#      currently holds and survives disconnect/reconnect cycles), and
+#   2) falling back to walking /sys/class/tty/<name>/device for any
+#      /dev/ttyACM*/ttyUSB* whose USB vendor matches an ESP32-class chip.
+#
+# Matched vendors:
+#   303a -- Espressif (ESP32-S3 native USB-CDC -- the T-Deck-Pro's default)
+#   10c4 -- Silicon Labs (CP210x UART bridges)
+#   1a86 -- WCH (CH340/CH341 UART bridges)
+#   0403 -- FTDI (FT232 UART bridges)
+#
+# Resolution order:
+#   1. explicit PORT= override (always wins)
+#   2. /dev/serial/by-id/* matching an ESP32-class vendor (stable path)
+#   3. first ttyACM*/ttyUSB* whose USB vendor matches an ESP32-class chip
+#   4. first ttyACM*/ttyUSB* that exists (legacy fallback)
+#   5. empty (the upload recipe waits + re-detects in this case)
+#
+# Snippet is defined once and used both at make-parse time (for `make help`
+# display) and re-evaluated at recipe time in `upload` (so a device that
+# moves to a different node mid-upload is picked up).
+#
+# NOTE: avoid unbalanced parens inside $(shell ...) -- make's parser pairs
+# them naively, so a shell `case .. in foo) ..` would close the function
+# prematurely. We use grep -E with anchored alternations (no parens) instead.
+define DETECT_PORT_SH
+match=""; \
+for s in /dev/serial/by-id/*; do \
+    [ -L "$$s" ] || continue; \
+    target=$$(readlink -f "$$s"); \
+    [ -e "$$target" ] || continue; \
+    name=$$(basename "$$target"); \
+    cur=$$(readlink -f "/sys/class/tty/$$name/device" 2>/dev/null); \
+    [ -n "$$cur" ] || continue; \
+    vid=""; \
+    for _ in 1 2 3 4 5 6; do \
+        [ -f "$$cur/idVendor" ] && { vid=$$(cat "$$cur/idVendor"); break; }; \
+        p=$$(dirname "$$cur"); [ "$$p" = "$$cur" ] && break; cur="$$p"; \
+    done; \
+    if echo "$$vid" | grep -qE '^303a$$|^10c4$$|^1a86$$|^0403$$'; then match="$$s"; break; fi; \
+done; \
+if [ -z "$$match" ]; then \
+    for d in /dev/ttyACM* /dev/ttyUSB*; do \
+        [ -e "$$d" ] || continue; \
+        name=$$(basename "$$d"); \
+        cur=$$(readlink -f "/sys/class/tty/$$name/device" 2>/dev/null); \
+        [ -n "$$cur" ] || continue; \
+        vid=""; \
+        for _ in 1 2 3 4 5 6; do \
+            [ -f "$$cur/idVendor" ] && { vid=$$(cat "$$cur/idVendor"); break; }; \
+            p=$$(dirname "$$cur"); [ "$$p" = "$$cur" ] && break; cur="$$p"; \
+        done; \
+        if echo "$$vid" | grep -qE '^303a$$|^10c4$$|^1a86$$|^0403$$'; then match="$$d"; break; fi; \
+    done; \
+fi; \
+if [ -z "$$match" ]; then \
+    for d in /dev/ttyACM* /dev/ttyUSB*; do [ -e "$$d" ] && { match="$$d"; break; }; done; \
+fi; \
+echo "$$match"
+endef
+
+ifndef PORT
+PORT := $(shell $(DETECT_PORT_SH))
+ifeq ($(PORT),)
+PORT := /dev/ttyACM0
+endif
+endif
 
 FIRMWARE_DIR := firmware
 
@@ -67,7 +132,25 @@ build: ## Compile current src_dir for $(ENV)
 	$(PIO) run -e $(ENV)
 
 upload: build ## Compile and flash to device
-	$(PIO) run -e $(ENV) -t upload --upload-port $(PORT)
+	@port="$(PORT)"; \
+	if [ ! -e "$$port" ]; then \
+	    port=$$($(DETECT_PORT_SH)); \
+	fi; \
+	if [ -z "$$port" ] || [ ! -e "$$port" ]; then \
+	    echo ">>> Waiting up to 10s for T-Deck-Pro to appear..."; \
+	    for i in $$(seq 1 20); do \
+	        sleep 0.5; \
+	        np=$$($(DETECT_PORT_SH)); \
+	        if [ -n "$$np" ] && [ -e "$$np" ]; then port="$$np"; break; fi; \
+	    done; \
+	fi; \
+	if [ -z "$$port" ] || [ ! -e "$$port" ]; then \
+	    echo "ERROR: no T-Deck-Pro detected on any /dev/ttyACM* or /dev/ttyUSB*"; \
+	    echo "       (check USB cable / try replugging; override with PORT=/dev/...)"; \
+	    exit 1; \
+	fi; \
+	echo ">>> Uploading to $$port"; \
+	$(PIO) run -e $(ENV) -t upload --upload-port "$$port"
 
 clean: ## Clean build artifacts
 	$(PIO) run -e $(ENV) -t clean
