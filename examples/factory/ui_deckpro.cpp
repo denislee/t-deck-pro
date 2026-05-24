@@ -457,7 +457,7 @@ static void create_lock(lv_obj_t *parent)
     // ── Calendar: weekday header (Su Mo Tu We Th Fr Sa) ──
     lock_wk_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_wk_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
     lv_label_set_text(lock_wk_label, "Su Mo Tu We Th Fr Sa");
     lv_obj_set_pos(lock_wk_label, lock_cal_x(), lock_cal_y() - 22);
 
@@ -528,7 +528,7 @@ static void lock_apply_orientation(bool landscape)
         }
         if (lock_wk_label) {
             lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_wk_label, &lv_font_spleen_12x24, LV_PART_MAIN);
+            lv_obj_set_style_text_font(lock_wk_label, &lv_font_terminus_12x24_bold, LV_PART_MAIN);
             lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 24);
         }
         if (lock_cal_label) {
@@ -568,7 +568,7 @@ static void lock_apply_orientation(bool landscape)
         }
         if (lock_wk_label) {
             lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
+            lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
             lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 22);
         }
         if (lock_cal_label) {

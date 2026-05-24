@@ -41,6 +41,8 @@ LV_FONT_DECLARE(lv_font_spleen_32x64)
 LV_FONT_DECLARE(lv_font_tamzen_6x12)
 LV_FONT_DECLARE(lv_font_tamzen_8x16)
 LV_FONT_DECLARE(lv_font_tamzen_10x20)
+LV_FONT_DECLARE(lv_font_tamzen_10x20_bold)
+LV_FONT_DECLARE(lv_font_terminus_12x24_bold)
 LV_FONT_DECLARE(lv_font_tom_thumb)
 
 #ifdef __cplusplus
