@@ -109,9 +109,12 @@ SPIFFS     ?= $(FIRMWARE_DIR)/spiffs.bin
 # Default to base T-Deck-Pro builds; pass MESHTASTIC=...v1.1-*.bin for v1.1 hw.
 MESHTASTIC ?= $(lastword $(sort $(wildcard $(FIRMWARE_DIR)/meshtastic/firmware-t-deck-pro-2.*.bin)))
 
-# Flash offsets (default_16MB.csv partition table)
+# Flash offsets. SPIFFS_OFFSET is derived from the partition CSV so a
+# repartition can never leave this hard-coded at a stale address; it falls back
+# to the stock default_16MB.csv offset if the CSV is missing.
+PARTITIONS        ?= partitions_tdeckpro.csv
 FACTORY_OFFSET    := 0x0
-SPIFFS_OFFSET     := 0xc90000
+SPIFFS_OFFSET     := $(or $(shell awk -F, '/^[^#]/ && $$1 ~ /^[[:space:]]*spiffs/ {gsub(/ /,"",$$4); print $$4}' $(PARTITIONS) 2>/dev/null),0xc90000)
 MESHTASTIC_OFFSET := 0x0
 
 ESPTOOL_FLAGS := --chip $(CHIP) --port $(PORT) --baud $(BAUD)

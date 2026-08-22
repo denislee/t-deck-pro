@@ -12,3 +12,9 @@ firmware/\[H693\] T-Deck-Pro test/
 docs/image_source/img_start - 副本.xcf
 examples/test_factory/
 other/
+
+# Dictionary corpora (multi-GB, generated / downloaded, not versioned).
+# kaikki.org-dictionary-English.jsonl is the upstream Wiktionary dump;
+# eng-pob.tsv is the sorted TSV the firmware reads from /dict/ on SD.
+kaikki.org-dictionary-English.jsonl
+eng-pob.tsv

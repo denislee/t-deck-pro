@@ -1,0 +1,16 @@
+# T-Deck-Pro single-app partition table (16 MB flash).
+#
+# Replaces default_16MB.csv, which reserved two 6.5 MB OTA slots. This repo has
+# no OTA path (no Update.h, no esp_ota_*; the Makefile flashes over USB at 0x0),
+# so app1 was 6.5 MB of dead flash and app0 had a ~4.7 MB unused tail.
+#
+# One 2.5 MB app slot leaves ~13.4 MB for SPIFFS content (books, eng-pob.tsv,
+# audio). Adding OTA later means repartitioning and reflashing SPIFFS.
+#
+# Makefile derives SPIFFS_OFFSET from this file - keep the column layout.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x5000
+otadata,    data, ota,      0xe000,   0x2000
+app0,       app,  factory,  0x10000,  0x280000
+spiffs,     data, spiffs,   0x290000, 0xD60000
+coredump,   data, coredump, 0xFF0000, 0x10000

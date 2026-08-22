@@ -7,7 +7,7 @@
     },
     "core": "esp32",
     "extra_flags": [
-      "-DARDUINO_TWATCH_S3_M10Q",
+      "-DARDUINO_T_DECK_PRO",
       "-DARDUINO_USB_MODE=1",
       "-DARDUINO_RUNNING_CORE=1",
       "-DARDUINO_EVENT_RUNNING_CORE=1"
@@ -26,7 +26,7 @@
     "openocd_target": "esp32s3.cfg"
   },
   "frameworks": ["arduino", "espidf"],
-  "name": "LilyGo T-Watch S3 M10Q (16M Flash 8M QSPI PSRAM )",
+  "name": "LilyGo T-Deck-Pro (16M Flash 8M QSPI PSRAM)",
   "upload": {
     "flash_size": "16MB",
     "maximum_ram_size": 327680,
