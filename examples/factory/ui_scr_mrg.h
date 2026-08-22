@@ -25,6 +25,12 @@ typedef struct scr_lifecycle {
     void (*entry)(void);
     void (*exit)(void);
     void (*destroy)(void);
+    /* Called by the global 20 ms keypad-dispatch timer (§5.1).
+     * The function drains the keypad ring-buffer itself (same while/
+     * get/set loop as the old per-screen timer callback it replaces).
+     * NULL means this screen has no keyboard handling via the global
+     * timer; SCREEN0 is handled separately by menu_keypay_get_event. */
+    void (*on_key)(void);
 } scr_lifecycle_t;
 
 typedef struct scr_card {
@@ -46,6 +52,7 @@ bool scr_mgr_push(int id, bool anim);
 bool scr_mgr_pop(bool anim);
 
 int scr_mgr_get_curr_scr_id(void);
+scr_lifecycle_t *scr_mgr_get_curr_life(void);
 
 // set anim
 void scr_mgr_set_anim(lv_scr_load_anim_t sw, lv_scr_load_anim_t push, lv_scr_load_anim_t pop);

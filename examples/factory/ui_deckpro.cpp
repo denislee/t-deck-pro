@@ -1,35 +1,15 @@
 
-#include "ui_deckpro.h"
-#include "src/assets.h"
-#include "stdio.h"
-#include "ui_deckpro_port.h"
-#include "Arduino.h"
-#include <time.h>
+/* ui_deckpro_int.h brings in common includes, FONT_BOLD_* macros, and
+ * extern declarations for cross-TU state (taskbar objects, reader/notes
+ * selection state, ui_get_font / topbar_font_get declarations). */
+#include "ui_deckpro_int.h"
 
 #define SETTING_PAGE_MAX_ITEM 15
-#define GET_BUFF_LEN(a) sizeof(a)/sizeof(a[0])
+/* GET_BUFF_LEN comes from ui_deckpro_int.h. */
 
-#define FONT_BOLD_SIZE_14 ui_get_font(14, false)
-#define FONT_BOLD_SIZE_15 ui_get_font(15, false)
-#define FONT_BOLD_SIZE_16 ui_get_font(16, false)
-#define FONT_BOLD_SIZE_17 ui_get_font(17, false)
-#define FONT_BOLD_SIZE_18 ui_get_font(18, false)
-#define FONT_BOLD_SIZE_19 ui_get_font(19, false)
-
-#define FONT_BOLD_MONO_SIZE_14 ui_get_font(14, true)
-#define FONT_BOLD_MONO_SIZE_15 ui_get_font(15, true)
-#define FONT_BOLD_MONO_SIZE_16 ui_get_font(16, true)
-#define FONT_BOLD_MONO_SIZE_17 ui_get_font(17, true)
-#define FONT_BOLD_MONO_SIZE_18 ui_get_font(18, true)
-#define FONT_BOLD_MONO_SIZE_19 ui_get_font(19, true)
-
-// Forward declarations for the font helpers (defined alongside the reader
-// font catalog further down). The taskbar/menu code that references the
-// per-slot accessors lives above the catalog, so we need these visible early.
-static const lv_font_t* ui_get_font(int pt, bool force_mono);
-static const lv_font_t* topbar_font_get(void);
-static const lv_font_t* reader_body_font_get(void);
-static const lv_font_t* reader_footer_font_get(void);
+/* Forward declarations for per-screen on_key() handlers still in this TU. */
+static void on_key_usb_msc(void);
+static void global_kb_timer_cb(lv_timer_t *t);
 
 #define GLOBAL_BUF_LEN 30
 #define LOW_VOLTAGE_THRESHOLD_MV 3300
@@ -38,12 +18,16 @@ static const lv_font_t* reader_footer_font_get(void);
 #define LOW_VOLTAGE_POLL_MS 2000
 static char global_buf[GLOBAL_BUF_LEN];
 
-static lv_obj_t *notes_list_obj;
-static bool notes_use_sd = true;
-static char notes_selected_file[32] = {0};
+/* notes_list_obj and notes_use_sd are defined in ui_notes.cpp (the only TU
+ * that uses them).  notes_selected_file is shared with the home-screen
+ * handler here, so it has external linkage (declared extern in
+ * ui_deckpro_int.h). */
+char notes_selected_file[32] = {0};
 
 static lv_timer_t *touch_chk_timer = NULL;
-static lv_timer_t *taskbar_update_timer = NULL;
+/* taskbar_update_timer has external linkage: all split screen TUs pause /
+ * resume it on entry/exit (declared extern in ui_deckpro_int.h). */
+lv_timer_t *taskbar_update_timer = NULL;
 static lv_timer_t *low_voltage_timer = NULL;
 static lv_obj_t *label_list[10] = {0};
 uint16_t taskbar_statue[TASKBAR_ID_MAX] = {0};
@@ -221,501 +205,6 @@ static lv_obj_t *scr_back_btn_create(lv_obj_t *parent, const char *text, lv_even
 // entry function can populate menu_taskbar_battery on enter — otherwise the
 // top bar shows blank glyphs until a battery-percent change happens to fire.
 
-// ******************************** [ screen LOCK ] ********************************
-#if 1
-#define LOCK_UNLOCK_REQUIRED 3
-
-static lv_obj_t *lock_time_label = NULL;
-static lv_obj_t *lock_date_label = NULL;
-static lv_obj_t *lock_month_label = NULL;
-static lv_obj_t *lock_cal_label = NULL;
-static lv_obj_t *lock_today_box = NULL;
-static lv_obj_t *lock_today_label = NULL;
-static lv_obj_t *lock_dots_label = NULL;
-static lv_obj_t *lock_hint_label = NULL;
-static lv_obj_t *lock_wk_label = NULL;
-static lv_obj_t *lock_rule = NULL;
-static lv_timer_t *lock_clock_timer = NULL;
-static int lock_unlock_progress = 0;
-static bool lock_saved_wifi_was_enabled = false;
-static int lock_last_minute = -1;
-static int lock_last_yday = -1;
-static bool lock_landscape = false;
-// Offset (in months) from today's month for the calendar grid. j/k cycle it
-// while the lock screen is up; reset to 0 on entry.
-static int lock_month_offset = 0;
-
-// Calendar grid geometry. Portrait uses tamzen_10x20 (3-char cells →
-// 30 wide × 20 tall). Landscape switches to spleen_12x24 (3-char cells
-// → 36 wide × 24 tall) so the grid is noticeably bigger while still
-// fitting 7 cols × 6 rows on the 320×240 panel.
-#define LOCK_CAL_CELL_W_P 30
-#define LOCK_CAL_CELL_H_P 20
-#define LOCK_CAL_Y_P     174   // grid top edge in portrait
-#define LOCK_CAL_CELL_W_L 36
-#define LOCK_CAL_CELL_H_L 24
-#define LOCK_CAL_Y_L      82   // grid top edge in landscape (~12 px bottom margin)
-#define LOCK_CAL_X_NUDGE_L 6   // shift the whole calendar block right of true center
-
-static inline int lock_cal_cell_w(void) { return lock_landscape ? LOCK_CAL_CELL_W_L : LOCK_CAL_CELL_W_P; }
-static inline int lock_cal_cell_h(void) { return lock_landscape ? LOCK_CAL_CELL_H_L : LOCK_CAL_CELL_H_P; }
-static inline int lock_cal_y(void)      { return lock_landscape ? LOCK_CAL_Y_L     : LOCK_CAL_Y_P;     }
-static inline int lock_cal_x(void)
-{
-    int centered = (LV_HOR_RES - 7 * lock_cal_cell_w()) / 2;
-    return centered + (lock_landscape ? LOCK_CAL_X_NUDGE_L : 0);
-}
-
-static void lock_render_dots(void)
-{
-    if (!lock_dots_label) return;
-    char buf[32];
-    char *p = buf;
-    for (int i = 0; i < LOCK_UNLOCK_REQUIRED; i++) {
-        if (i) *p++ = ' ';
-        *p++ = '[';
-        *p++ = (i < lock_unlock_progress) ? '#' : ' ';
-        *p++ = ']';
-    }
-    *p = '\0';
-    lv_label_set_text(lock_dots_label, buf);
-}
-
-static void lock_render_calendar(const struct tm *tm_now)
-{
-    if (!lock_cal_label || !lock_month_label) return;
-
-    static const char *months_full[] = {
-        "JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE",
-        "JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"
-    };
-    static const int dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-
-    int today_year = tm_now->tm_year + 1900;
-    int today_mon  = tm_now->tm_mon;        // 0..11
-    int today      = tm_now->tm_mday;       // 1..31
-    if (today_mon < 0 || today_mon > 11) today_mon = 0;
-
-    // Apply j/k month offset.
-    int year = today_year;
-    int mon  = today_mon + lock_month_offset;
-    while (mon < 0)   { mon += 12; year--; }
-    while (mon > 11)  { mon -= 12; year++; }
-    bool showing_today_month = (year == today_year) && (mon == today_mon);
-
-    int days_in_month = dim[mon];
-    if (mon == 1) {
-        bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-        if (leap) days_in_month = 29;
-    }
-
-    // Weekday of day-1 of the displayed month: mktime fills tm_wday.
-    struct tm first = {};
-    first.tm_year = year - 1900;
-    first.tm_mon  = mon;
-    first.tm_mday = 1;
-    first.tm_hour = 12;  // avoid DST edge cases at midnight
-    mktime(&first);
-    int first_wday = first.tm_wday;
-    if (first_wday < 0 || first_wday > 6) first_wday = 0;
-
-    char header[24];
-    lv_snprintf(header, sizeof(header), "%s %d", months_full[mon], year);
-    lv_label_set_text(lock_month_label, header);
-
-    // Build the grid as a single multi-line label, %2d + space per cell so
-    // each cell is exactly 3 chars wide (24 px in 8x16 font).
-    char buf[7 * 6 * 4 + 8] = {0};
-    char *p = buf;
-    int col = 0, row = 0;
-    int today_col = -1, today_row = -1;
-    for (int i = 0; i < first_wday; i++) {
-        *p++ = ' '; *p++ = ' '; *p++ = ' ';
-        col++;
-    }
-    for (int d = 1; d <= days_in_month; d++) {
-        if (showing_today_month && d == today) { today_col = col; today_row = row; }
-        char tmp[8];
-        lv_snprintf(tmp, sizeof(tmp), "%2d ", d);
-        for (int j = 0; tmp[j]; j++) *p++ = tmp[j];
-        col++;
-        if (col == 7) {
-            col = 0;
-            row++;
-            if (d != days_in_month) *p++ = '\n';
-        }
-    }
-    *p = '\0';
-
-    lv_label_set_text(lock_cal_label, buf);
-
-    // Position today's inverse cell + white number on top of the grid.
-    if (today_col < 0) {
-        if (lock_today_box)   lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
-        if (lock_today_label) lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (lock_today_box && lock_today_label && today_col >= 0) {
-        int cw = lock_cal_cell_w();
-        int ch = lock_cal_cell_h();
-        int x = lock_cal_x() + today_col * cw;
-        int y = lock_cal_y() + today_row * ch;
-        lv_obj_set_size(lock_today_box, cw - 4, ch);
-        lv_obj_set_pos(lock_today_box, x, y);
-        lv_obj_clear_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
-
-        char tnum[8];
-        lv_snprintf(tnum, sizeof(tnum), "%2d", today);
-        lv_label_set_text(lock_today_label, tnum);
-        lv_obj_set_pos(lock_today_label, x, y);
-        lv_obj_clear_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void lock_update_clock(bool force_full)
-{
-    struct tm tm_now;
-    if (!ui_time_get_local(&tm_now)) {
-        if (lock_time_label) lv_label_set_text(lock_time_label, "--:--");
-        if (lock_date_label) lv_label_set_text(lock_date_label, "no time sync");
-        if (lock_month_label) lv_label_set_text(lock_month_label, "");
-        if (lock_cal_label)  lv_label_set_text(lock_cal_label, "");
-        if (lock_today_box)  lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
-        if (lock_today_label) lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    bool minute_changed = force_full || tm_now.tm_min != lock_last_minute;
-    bool day_changed    = force_full || tm_now.tm_yday != lock_last_yday;
-    if (!minute_changed && !day_changed) return;
-    lock_last_minute = tm_now.tm_min;
-    lock_last_yday   = tm_now.tm_yday;
-
-    static const char *days[]   = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-    static const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                   "Jul","Aug","Sep","Oct","Nov","Dec"};
-    int wday = tm_now.tm_wday;
-    int mon  = tm_now.tm_mon;
-    if (wday < 0 || wday > 6) wday = 0;
-    if (mon  < 0 || mon  > 11) mon = 0;
-
-    if (minute_changed && lock_time_label) {
-        char tbuf[8];
-        lv_snprintf(tbuf, sizeof(tbuf), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
-        lv_label_set_text(lock_time_label, tbuf);
-    }
-    if (day_changed) {
-        char dbuf[32];
-        lv_snprintf(dbuf, sizeof(dbuf), "%s, %s %d",
-                    days[wday], months[mon], tm_now.tm_mday);
-        if (lock_date_label) lv_label_set_text(lock_date_label, dbuf);
-        lock_render_calendar(&tm_now);
-    }
-}
-
-static void lock_clock_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    lock_update_clock(false);
-}
-
-static void create_lock(lv_obj_t *parent)
-{
-    lv_obj_set_style_bg_color(parent, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
-
-    // ── Huge clock (32×64 pixel font) ──
-    lock_time_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_time_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
-    lv_label_set_text(lock_time_label, "--:--");
-    lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
-
-    // ── Date subtitle ──
-    lock_date_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_date_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_date_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-    lv_label_set_text(lock_date_label, " ");
-    lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
-
-    // ── Divider above the calendar ──
-    lock_rule = lv_obj_create(parent);
-    lv_obj_remove_style_all(lock_rule);
-    lv_obj_set_size(lock_rule, 200, 1);
-    lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
-    lv_obj_set_style_bg_color(lock_rule, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lock_rule, LV_OPA_COVER, LV_PART_MAIN);
-
-    // ── Calendar: month name ──
-    lock_month_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_month_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(lock_month_label, 1, LV_PART_MAIN);
-    lv_label_set_text(lock_month_label, "");
-    lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
-
-    // ── Calendar: weekday header (Su Mo Tu We Th Fr Sa) ──
-    lock_wk_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_wk_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
-    lv_label_set_text(lock_wk_label, "Su Mo Tu We Th Fr Sa");
-    lv_obj_set_pos(lock_wk_label, lock_cal_x(), lock_cal_y() - 22);
-
-    // ── Today highlight: black box (drawn before label so label sits above) ──
-    lock_today_box = lv_obj_create(parent);
-    lv_obj_remove_style_all(lock_today_box);
-    lv_obj_set_size(lock_today_box, lock_cal_cell_w() - 4, lock_cal_cell_h());
-    lv_obj_set_style_bg_color(lock_today_box, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lock_today_box, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
-
-    // ── Calendar: date grid ──
-    lock_cal_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_cal_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-    lv_label_set_text(lock_cal_label, "");
-    lv_obj_set_pos(lock_cal_label, lock_cal_x(), lock_cal_y());
-
-    // White today number (drawn above the grid + box)
-    lock_today_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_today_label, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-    lv_label_set_text(lock_today_label, "");
-    lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
-
-    // ── Progress dots (intentionally tiny — just a subtle hint) ──
-    lock_dots_label = lv_label_create(parent);
-    lv_obj_set_style_text_color(lock_dots_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_dots_label, &lv_font_spleen_5x8, LV_PART_MAIN);
-    lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lock_render_dots();
-}
-
-// Lay out the lock screen for the current orientation.
-//
-// Portrait (240×320): original stacked layout — huge 32×64 clock on top,
-//   date subtitle, divider, then the calendar in tamzen_10x20 with 30×20
-//   cells.
-//
-// Landscape (320×240): smaller spleen_16x32 clock at top-left, date
-//   right of it on the same row, and a *bigger* spleen_12x24 calendar
-//   filling the rest of the panel with 36×24 cells. The divider is
-//   dropped and the unlock-progress dots move to the top-right so the
-//   6-row grid can extend almost to the panel bottom without overlap.
-static void lock_apply_orientation(bool landscape)
-{
-    if (landscape) {
-        if (lock_time_label) {
-            lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_12x24, LV_PART_MAIN);
-            lv_obj_align(lock_time_label, LV_ALIGN_TOP_LEFT, 12, 8);
-        }
-        if (lock_date_label) lv_obj_add_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
-        if (lock_rule) lv_obj_add_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
-
-        if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_TOP_RIGHT, -12, 12);
-
-        int x = lock_cal_x();
-        int grid_w = 7 * lock_cal_cell_w();
-        if (lock_month_label) {
-            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_month_label, &lv_font_spleen_12x24, LV_PART_MAIN);
-            // Center the month name over the (nudged) calendar grid, not the
-            // panel, so the whole block shifts as one. Fixed-width label +
-            // center text alignment is stable across varying month names.
-            lv_obj_set_width(lock_month_label, grid_w);
-            lv_obj_set_style_text_align(lock_month_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-            lv_obj_align(lock_month_label, LV_ALIGN_TOP_LEFT, x, 36);
-        }
-        if (lock_wk_label) {
-            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_wk_label, &lv_font_terminus_12x24_bold, LV_PART_MAIN);
-            lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 24);
-        }
-        if (lock_cal_label) {
-            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_cal_label, &lv_font_spleen_12x24, LV_PART_MAIN);
-            lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
-        }
-        if (lock_today_label) {
-            lv_obj_set_style_text_font(lock_today_label, &lv_font_spleen_12x24, LV_PART_MAIN);
-        }
-        // today_box size + today_box/today_label positions are reset by
-        // lock_render_calendar on the next clock tick (caller invalidates
-        // lock_last_yday).
-    } else {
-        if (lock_time_label) {
-            lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
-            lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
-        }
-        if (lock_date_label) {
-            lv_obj_clear_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
-        }
-        if (lock_rule) {
-            lv_obj_clear_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
-        }
-        if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
-
-        int x = lock_cal_x();
-        if (lock_month_label) {
-            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-            // Undo the fixed-width / centered-text styling landscape applies.
-            lv_obj_set_width(lock_month_label, LV_SIZE_CONTENT);
-            lv_obj_set_style_text_align(lock_month_label, LV_TEXT_ALIGN_AUTO, LV_PART_MAIN);
-            lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
-        }
-        if (lock_wk_label) {
-            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
-            lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 22);
-        }
-        if (lock_cal_label) {
-            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-            lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
-        }
-        if (lock_today_label) {
-            lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
-        }
-    }
-}
-
-static void entry_lock(void)
-{
-    lock_unlock_progress = 0;
-    lock_last_minute = -1;
-    lock_last_yday = -1;
-    lock_month_offset = 0;
-    // Restore the last orientation the user toggled to with 'r'. Persisted
-    // via Preferences (lk_rot) so a reboot doesn't drop the user back to
-    // portrait if they had explicitly switched to landscape.
-    lock_landscape = (ui_lock_landscape_get() != 0);
-    factory_set_landscape(lock_landscape);
-    lock_apply_orientation(lock_landscape);
-    lock_render_dots();
-    lock_update_clock(true);
-    if (!lock_clock_timer) {
-        lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 15000, NULL);
-    } else {
-        lv_timer_resume(lock_clock_timer);
-    }
-
-    lock_saved_wifi_was_enabled = ui_wifi_get_enabled();
-    if (lock_saved_wifi_was_enabled) {
-        ui_wifi_set_enabled(false);
-    }
-    ui_setting_apply_keypad_light(false);
-
-    ui_disp_full_refr();
-}
-
-static void exit_lock(void)
-{
-    if (lock_clock_timer) {
-        lv_timer_pause(lock_clock_timer);
-    }
-
-    if (lock_saved_wifi_was_enabled) {
-        ui_wifi_set_enabled(true);
-        lock_saved_wifi_was_enabled = false;
-    }
-    ui_setting_apply_keypad_light(ui_setting_get_keypad_light());
-
-    // Other screens assume portrait — undo any rotation toggled while
-    // the lock screen was active before popping back.
-    if (lock_landscape) {
-        factory_set_landscape(false);
-        lock_landscape = false;
-    }
-
-    ui_disp_full_refr();
-}
-
-static void destroy_lock(void)
-{
-    if (lock_clock_timer) {
-        lv_timer_del(lock_clock_timer);
-        lock_clock_timer = NULL;
-    }
-    lock_time_label = NULL;
-    lock_date_label = NULL;
-    lock_month_label = NULL;
-    lock_cal_label = NULL;
-    lock_today_box = NULL;
-    lock_today_label = NULL;
-    lock_dots_label = NULL;
-    lock_hint_label = NULL;
-    lock_wk_label = NULL;
-    lock_rule = NULL;
-}
-
-static scr_lifecycle_t screen_lock = {
-    .create = create_lock,
-    .entry = entry_lock,
-    .exit = exit_lock,
-    .destroy = destroy_lock,
-};
-
-// Called by the home-screen keypad timer while the lock screen is active.
-static void lock_handle_key(char key)
-{
-    if (key == 'r' || key == 'R') {
-        // TCA8418 occasionally emits two press events for one physical
-        // tap (see reader-screen 'r' handler) — debounce so a single
-        // press doesn't toggle rotation twice.
-        static uint32_t last_rot_ms = 0;
-        uint32_t now = lv_tick_get();
-        if (now - last_rot_ms < 300) return;
-        last_rot_ms = now;
-
-        lock_landscape = !lock_landscape;
-        factory_set_landscape(lock_landscape);
-        lock_apply_orientation(lock_landscape);
-        // Persist so the choice survives reboot.
-        ui_lock_landscape_set(lock_landscape ? 1 : 0);
-        // Force the calendar / today-box positions to be recomputed
-        // against the new resolution on the next clock tick.
-        lock_last_yday = -1;
-        lock_update_clock(true);
-        ui_disp_full_refr();
-        return;
-    }
-    if (key == 'j' || key == 'J' || key == 'k' || key == 'K') {
-        // j = next month, k = previous month. Clamp to ±120 months so a held
-        // key can't run off into ridiculous years.
-        int delta = (key == 'j' || key == 'J') ? 1 : -1;
-        int next = lock_month_offset + delta;
-        if (next < -120) next = -120;
-        if (next >  120) next =  120;
-        if (next == lock_month_offset) return;
-        lock_month_offset = next;
-        // Any stray unlock progress is cleared — user is browsing, not unlocking.
-        if (lock_unlock_progress != 0) {
-            lock_unlock_progress = 0;
-            lock_render_dots();
-        }
-        // Force the renderer to redraw the grid even though tm_yday is unchanged.
-        lock_last_yday = -1;
-        lock_update_clock(true);
-        ui_disp_full_refr();
-        return;
-    }
-    if (key == 'u' || key == 'U') {
-        lock_unlock_progress++;
-        if (lock_unlock_progress >= LOCK_UNLOCK_REQUIRED) {
-            lock_unlock_progress = 0;
-            scr_mgr_pop(false);
-            return;
-        }
-        lock_render_dots();
-    } else if (lock_unlock_progress != 0) {
-        lock_unlock_progress = 0;
-        lock_render_dots();
-    }
-}
-#endif
 
 static const char *line_full_format(int max_c, const char *str1, const char *str2)
 {
@@ -751,11 +240,16 @@ static lv_obj_t *menu_screen1;
 static lv_obj_t *menu_screen2;
 static lv_obj_t *ui_Panel4;
 
-static lv_obj_t * menu_taskbar = NULL;
+/* menu_taskbar, menu_taskbar_battery, menu_taskbar_battery_percent have
+ * external linkage: split screen TUs use them to populate battery labels on
+ * entry and to destroy the taskbar on exit (declared extern in
+ * ui_deckpro_int.h).  menu_taskbar_time, _charge, _wifi stay static since
+ * no split TU references them directly. */
+lv_obj_t * menu_taskbar = NULL;
 static lv_obj_t * menu_taskbar_time = NULL;
 static lv_obj_t * menu_taskbar_charge = NULL;
-static lv_obj_t * menu_taskbar_battery = NULL;
-static lv_obj_t * menu_taskbar_battery_percent = NULL;
+lv_obj_t * menu_taskbar_battery = NULL;
+lv_obj_t * menu_taskbar_battery_percent = NULL;
 static lv_obj_t * menu_taskbar_wifi = NULL;
 
 // Each screen's create() calls ui_taskbar_create() which clobbers the globals
@@ -863,9 +357,12 @@ static void menu_btn_create(lv_obj_t *parent, struct menu_btn *info, int x, int 
     lv_obj_add_event_cb(btn, menu_btn_event_cb, LV_EVENT_CLICKED, (void *)info);
 }
 
-static void ui_taskbar_apply_battery_visibility(void);
+/* ui_taskbar_apply_battery_visibility and ui_taskbar_create have external
+ * linkage: every split screen TU that creates a taskbar needs them
+ * (declared in ui_deckpro_int.h). */
+void ui_taskbar_apply_battery_visibility(void);
 
-static void ui_taskbar_create(lv_obj_t *parent)
+void ui_taskbar_create(lv_obj_t *parent)
 {
     int status_bar_height = 25;
     menu_taskbar = lv_obj_create(parent);
@@ -943,7 +440,7 @@ static void ui_taskbar_create(lv_obj_t *parent)
     ui_taskbar_apply_battery_visibility();
 }
 
-static void ui_taskbar_apply_battery_visibility(void)
+void ui_taskbar_apply_battery_visibility(void)
 {
     bool show = ui_topbar_show_battery_get();
     if (menu_taskbar_battery) {
@@ -1003,11 +500,26 @@ static void exit_usb_msc(void)
 
 static void destroy_usb_msc(void) {}
 
+
+/* USB MSC screen: only ESC is handled — switch back to home. */
+static void on_key_usb_msc(void)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == 0x1B) {
+            scr_mgr_switch(SCREEN0_ID, false);
+            return;
+        }
+    }
+}
+
 static scr_lifecycle_t screen_usb_msc = {
     .create = create_usb_msc,
     .entry = entry_usb_msc,
     .exit  = exit_usb_msc,
     .destroy = destroy_usb_msc,
+    .on_key    = on_key_usb_msc,
 };
 #endif
 
@@ -1094,7 +606,13 @@ static void entry0(void) {
     menu_taskbar_battery_percent = scr0_taskbar_battery_percent;
     menu_taskbar_wifi = scr0_taskbar_wifi;
 
-    lv_timer_resume(touch_chk_timer);
+    // Only run the gesture-direction timer when the touch controller is actually
+    // enabled.  On this board (CST328 hard-disabled at boot) touch_status is
+    // false, so the timer would otherwise fire 100×/s reading a gesture that
+    // can never be set.
+    if (ui_setting_get_touch_status()) {
+        lv_timer_resume(touch_chk_timer);
+    }
     lv_timer_resume(taskbar_update_timer);
 
     if (menu_taskbar_battery) {
@@ -1132,562 +650,6 @@ static scr_lifecycle_t screen0 = {
     .destroy = destroy0,
 };
 #endif
-//************************************[ screen 1 ]****************************************** lora
-// --------------------- screen 1 --------------------- lora
-#if 1
-lv_obj_t * scr1_list;
-static lv_obj_t *scr1_lab_buf[20];
-
-static void scr1_list_event(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * obj = lv_event_get_target(e);
-    for(int i = 0; i < lv_obj_get_child_cnt(obj); i++) 
-    {
-        lv_obj_t * child = lv_obj_get_child(obj, i);
-        if(lv_obj_check_type(child, &lv_label_class)) {
-            char *str = lv_label_get_text(child);
-
-            if(strcmp("a  Auto Test", str) == 0)
-            {
-                scr_mgr_push(SCREEN1_1_ID, false);
-            }
-            if(strcmp("s  Lora Setting", str) == 0)
-            {
-                scr_mgr_push(SCREEN1_2_ID, false);
-            }
-            printf("%s\n", str);
-        }
-    }
-}
-
-static void scr1_item_create(const char *name, lv_event_cb_t cb)
-{
-    lv_obj_t * obj = lv_obj_class_create_obj(&lv_list_btn_class, scr1_list);
-    lv_obj_class_init_obj(obj);
-    lv_obj_set_size(obj, LV_PCT(100), LV_SIZE_CONTENT);
-
-    lv_obj_t *label = lv_label_create(obj);
-    lv_label_set_text(label, name);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 10, 0);
-
-    lv_obj_set_height(obj, LV_VER_RES / 6);
-    lv_obj_set_style_text_font(obj, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    // lv_obj_set_style_bg_color(obj, lv_color_hex(EPD_COLOR_BG), LV_PART_MAIN);
-    // lv_obj_set_style_text_color(obj, lv_color_hex(EPD_COLOR_FG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_outline_width(obj, 1, LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_add_event_cb(obj, cb, LV_EVENT_CLICKED, NULL); 
-}
-
-static void create1(lv_obj_t *parent)
-{
-    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
-    // the per-screen "Lora <" title bar. ESC on the keypad pops back to
-    // Settings via scr1_kb_timer_cb.
-    ui_taskbar_create(parent);
-    const int status_bar_height = 25;
-
-    scr1_list = lv_list_create(parent);
-    lv_obj_set_size(scr1_list, lv_pct(93), LV_VER_RES - status_bar_height - 8);
-    lv_obj_align(scr1_list, LV_ALIGN_TOP_MID, 0, status_bar_height + 4);
-    lv_obj_set_style_pad_top(scr1_list, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(scr1_list, 15, LV_PART_MAIN);
-    lv_obj_set_style_radius(scr1_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scr1_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(scr1_list, 0, LV_PART_MAIN);
-
-    scr1_item_create("a  Auto Test", scr1_list_event);
-    scr1_item_create("s  Lora Setting", scr1_list_event);
-}
-
-static lv_timer_t *scr1_kb_timer = NULL;
-static void scr1_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc -> back to Settings
-            scr_mgr_pop(false);
-            return;
-        }
-        if (key == 'a') { // Auto Test
-            scr_mgr_push(SCREEN1_1_ID, false);
-            return;
-        }
-        if (key == 's') { // Lora Setting
-            scr_mgr_push(SCREEN1_2_ID, false);
-            return;
-        }
-    }
-}
-
-static void entry1(void)
-{
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    ui_disp_full_refr();
-    if (!scr1_kb_timer) scr1_kb_timer = lv_timer_create(scr1_kb_timer_cb, 20, NULL);
-}
-static void exit1(void) {
-    lv_timer_pause(taskbar_update_timer);
-    if (scr1_kb_timer) { lv_timer_del(scr1_kb_timer); scr1_kb_timer = NULL; }
-    ui_disp_full_refr();
-}
-static void destroy1(void) { }
-
-static scr_lifecycle_t screen1 = {
-    .create = create1,
-    .entry = entry1,
-    .exit  = exit1,
-    .destroy = destroy1,
-};
-#endif
-// --------------------- screen 1.1 --------------------- Auto Send
-#if 1
-static lv_obj_t *scr1_1_cont;
-static lv_obj_t *lora_lab_buf[11] = {0};
-static lv_obj_t *lora_sw_btn;
-static lv_obj_t *lora_sw_btn_info;
-static lv_timer_t *lora_RT_timer = NULL;
-static lv_timer_t *lora_recv_timer = NULL;
-static int lora_cnt = 0;
-
-static void lora_mode_sw_event(lv_event_t * e)
-{
-    if(e->code == LV_EVENT_CLICKED){
-        if(ui_lora_get_mode() == LORA_MODE_SEND) {
-            ui_lora_set_mode(LORA_MODE_RECV);
-            lv_label_set_text(lora_sw_btn_info, "Recv");
-            for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
-                lv_label_set_text(lora_lab_buf[i], " ");
-            }
-            lora_cnt = 0;
-        } else if(ui_lora_get_mode() == LORA_MODE_RECV) {
-            ui_lora_set_mode(LORA_MODE_SEND);
-            lv_label_set_text(lora_sw_btn_info, "Send");
-            for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
-                lv_label_set_text(lora_lab_buf[i], " ");
-            }
-            lora_cnt = 0;
-        }
-    }
-}
-
-static void lora_recv_loop_event(lv_timer_t *t)
-{
-    ui_lora_recv_loop();
-}
-
-static void lora_RT_timer_event(lv_timer_t *t)
-{
-    static int data = 0;
-    char buf[32];
-    const char *recv_info = NULL;
-    int recv_rssi = 0;
-    
-    if(ui_lora_get_mode() == LORA_MODE_SEND) 
-
-    {
-        lv_snprintf(buf, 32, "DeckPro #%d", data++);
-        lv_label_set_text_fmt(lora_lab_buf[lora_cnt], "send-> %s", buf);
-        ui_lora_send(buf);
-
-        lora_cnt++;
-        if(lora_cnt >= GET_BUFF_LEN(lora_lab_buf)) {
-            lora_cnt = 0;
-        }
-    }
-    else if(ui_lora_get_mode() == LORA_MODE_RECV)
-    {
-        if(ui_lora_get_recv(&recv_info, &recv_rssi))
-        {
-            ui_lora_set_recv_flag();
-            lv_label_set_text_fmt(lora_lab_buf[lora_cnt], "recv-> %s [%d]", recv_info, recv_rssi);
-
-            lora_cnt++;
-            if(lora_cnt >= GET_BUFF_LEN(lora_lab_buf)) {
-                lora_cnt = 0;
-            }
-        }
-    }
-}
-
-static lv_obj_t * scr2_create_label(lv_obj_t *parent)
-{
-    lv_obj_t *label = lv_label_create(parent);
-    lv_obj_set_width(label, LV_HOR_RES - 26);
-    lv_obj_set_style_text_font(label, FONT_BOLD_SIZE_15, LV_PART_MAIN);   
-    lv_obj_set_style_border_width(label, 0, LV_PART_MAIN);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
-    return label;
-}
-static void create1_1(lv_obj_t *parent)
-{
-    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
-    // the per-screen "Lora <" title bar. ESC on the keypad pops back to the
-    // Lora menu via scr1_1_kb_timer_cb.
-    ui_taskbar_create(parent);
-
-    scr1_1_cont = lv_obj_create(parent);
-    lv_obj_set_size(scr1_1_cont, lv_pct(100), lv_pct(85));
-    lv_obj_set_style_bg_color(scr1_1_cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_scrollbar_mode(scr1_1_cont, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(scr1_1_cont, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_border_width(scr1_1_cont, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(scr1_1_cont, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(scr1_1_cont, 13, LV_PART_MAIN);
-    lv_obj_set_flex_flow(scr1_1_cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(scr1_1_cont, 5, LV_PART_MAIN);
-    lv_obj_set_style_pad_column(scr1_1_cont, 5, LV_PART_MAIN);
-    lv_obj_set_align(scr1_1_cont, LV_ALIGN_BOTTOM_MID);
-
-    for(int i = 0; i < GET_BUFF_LEN(lora_lab_buf); i++){
-        lora_lab_buf[i] = scr2_create_label(scr1_1_cont);
-        lv_label_set_text(lora_lab_buf[i], " ");
-    }
-
-    lora_sw_btn = lv_btn_create(parent);
-    lv_obj_set_size(lora_sw_btn, 70, 25);
-    lv_obj_set_style_radius(lora_sw_btn, 5, LV_PART_MAIN);
-    lv_obj_set_style_border_width(lora_sw_btn, 2, LV_PART_MAIN);
-    lora_sw_btn_info = lv_label_create(lora_sw_btn);
-    lv_obj_set_style_text_font(lora_sw_btn_info, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_set_style_text_align(lora_sw_btn_info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(lora_sw_btn_info, "Send");
-    lv_obj_center(lora_sw_btn_info);
-    // Sit below the 25-px taskbar so we don't cover the clock / battery.
-    lv_obj_align(lora_sw_btn, LV_ALIGN_TOP_MID, 0, 30);
-    lv_obj_add_event_cb(lora_sw_btn, lora_mode_sw_event, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *lab = lv_label_create(parent);
-    lv_obj_set_style_text_font(lab, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_label_set_text_fmt(lab, "%.1fM", ui_lora_get_freq());
-    lv_obj_align(lab, LV_ALIGN_TOP_RIGHT, -10, 33);
-
-    ui_lora_set_mode(LORA_MODE_SEND);
-    lora_cnt = 0;
-}
-
-static lv_timer_t *scr1_1_kb_timer = NULL;
-static void scr1_1_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc -> back to Lora menu
-            scr_mgr_pop(false);
-            return;
-        }
-    }
-}
-
-static void entry1_1(void)
-{
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    if (!scr1_1_kb_timer) scr1_1_kb_timer = lv_timer_create(scr1_1_kb_timer_cb, 20, NULL);
-    ui_disp_full_refr();
-    lora_RT_timer = lv_timer_create(lora_RT_timer_event, 2000, NULL);
-    lora_recv_timer = lv_timer_create(lora_recv_loop_event, 400, NULL);
-}
-static void exit1_1(void) {
-    if (scr1_1_kb_timer) { lv_timer_del(scr1_1_kb_timer); scr1_1_kb_timer = NULL; }
-    lv_timer_pause(taskbar_update_timer);
-    ui_disp_full_refr();
-    if(lora_RT_timer) {
-        lv_timer_del(lora_RT_timer);
-        lora_RT_timer = NULL;
-    }
-    if(lora_recv_timer) {
-        lv_timer_del(lora_recv_timer);
-        lora_recv_timer = NULL;
-    }
-}
-static void destroy1_1(void) { }
-
-static scr_lifecycle_t screen1_1 = {
-    .create = create1_1,
-    .entry = entry1_1,
-    .exit  = exit1_1,
-    .destroy = destroy1_1,
-};
-#endif
-// --------------------- screen 1.2 --------------------- Lora Setting
-#if 1
-
-#define RADIO_FREQUENCY_LIST "433MHz\n 850MHz\n 868MHz\n 915MHz\n 920MHz"
-#define RADIO_BANDWIDTH "125KHz\n 250KHz\n 500KHz"
-#define RADIO_TX_POWER "10dBm\n 22dBm"
-
-static float lora_freq_list[] = {433.0, 850.0, 868.0, 915.0, 920.0};
-static int lora_band_list[] = {125, 250, 500};
-static int lora_power_list[] = {10, 22};
-
-static lv_obj_t *scr1_2_cont;
-static lv_obj_t *dropdown_freq;
-static lv_obj_t *dropdown_band;
-static lv_obj_t *dropdown_power;
-
-// Keyboard nav mirrors the System Font screen (screen13_2): j/k moves
-// focus between the dropdowns, Enter toggles edit mode, in edit mode j/k
-// cycles the focused dropdown's selection, Esc exits edit mode (or pops
-// the screen back to Settings when not editing).
-typedef enum {
-    LS_FOCUS_FREQ  = 0,
-    LS_FOCUS_BAND  = 1,
-    LS_FOCUS_POWER = 2,
-    LS_FOCUS_COUNT = 3,
-} scr1_2_focus_t;
-static scr1_2_focus_t scr1_2_focus = LS_FOCUS_FREQ;
-static bool scr1_2_editing = false;
-static lv_timer_t *scr1_2_kb_timer = NULL;
-
-static lv_obj_t *scr1_2_focused_dropdown(void)
-{
-    if (scr1_2_focus == LS_FOCUS_FREQ)  return dropdown_freq;
-    if (scr1_2_focus == LS_FOCUS_BAND)  return dropdown_band;
-    return dropdown_power;
-}
-
-static void scr1_2_apply_focus_style(void)
-{
-    lv_obj_t *dds[LS_FOCUS_COUNT] = { dropdown_freq, dropdown_band, dropdown_power };
-    for (int i = 0; i < LS_FOCUS_COUNT; i++) {
-        if (!dds[i]) continue;
-        bool focused = (i == (int)scr1_2_focus);
-        bool editing = focused && scr1_2_editing;
-        if (editing) {
-            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(dds[i], 3, LV_PART_MAIN);
-        } else if (focused) {
-            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(dds[i], 3, LV_PART_MAIN);
-        } else {
-            lv_obj_set_style_bg_color(dds[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(dds[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(dds[i], 1, LV_PART_MAIN);
-        }
-    }
-}
-
-static void scr1_2_step_focused(int dir)
-{
-    lv_obj_t *dd = scr1_2_focused_dropdown();
-    if (!dd) return;
-    uint16_t cnt = lv_dropdown_get_option_cnt(dd);
-    if (cnt == 0) return;
-    int sel = (int)lv_dropdown_get_selected(dd) + dir;
-    if (sel < 0)            sel = cnt - 1;
-    if (sel >= (int)cnt)    sel = 0;
-    lv_dropdown_set_selected(dd, sel);
-    // Reuse the existing change handler so the radio actually gets updated.
-    lv_event_send(dd, LV_EVENT_VALUE_CHANGED, NULL);
-}
-
-static void scr1_2_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc
-            if (scr1_2_editing) {
-                scr1_2_editing = false;
-                scr1_2_apply_focus_style();
-            } else {
-                scr_mgr_pop(false);
-                return;
-            }
-        } else if (key == 'E') { // Enter -> toggle edit mode
-            scr1_2_editing = !scr1_2_editing;
-            scr1_2_apply_focus_style();
-        } else if (key == 'j') {
-            if (scr1_2_editing) {
-                scr1_2_step_focused(+1);
-            } else if ((int)scr1_2_focus < LS_FOCUS_COUNT - 1) {
-                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus + 1);
-                scr1_2_apply_focus_style();
-            }
-        } else if (key == 'k') {
-            if (scr1_2_editing) {
-                scr1_2_step_focused(-1);
-            } else if ((int)scr1_2_focus > 0) {
-                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus - 1);
-                scr1_2_apply_focus_style();
-            }
-        }
-    }
-}
-
-static void lora_setting_event_handler(lv_event_t * e)
-{
-    char buf[32]={0};
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * obj = lv_event_get_target(e);
-    const char *flag = ( const char *)lv_event_get_user_data(e);
-    int select = lv_dropdown_get_selected(obj);
-
-    lv_dropdown_get_selected_str(obj, buf, sizeof(buf));
-    switch (*flag)
-    {
-    case 'f': 
-        for(int i = 0; i < GET_BUFF_LEN(lora_freq_list); i++) {
-            if(lora_freq_list[select] == lora_freq_list[i]) {
-                printf("set freq %.1fMHz\n", lora_freq_list[i]);
-                ui_lora_set_freq(lora_freq_list[i]);
-            }
-        }
-        break;
-    case 'b': 
-        for(int i = 0; i < GET_BUFF_LEN(lora_band_list); i++) {
-            if(lora_band_list[select] == lora_band_list[i]) {
-                printf("set bandwidth %dKhz\n", lora_band_list[i]);
-                ui_lora_set_bandwidth(lora_band_list[i]);
-            }
-        }
-        break;
-    case 'p': 
-        for(int i = 0; i < GET_BUFF_LEN(lora_power_list); i++) {
-            if(lora_power_list[select] == lora_power_list[i]) {
-                printf("set power %ddBm\n", lora_power_list[i]);
-                ui_lora_set_power(lora_power_list[i]);
-            }
-        }
-        break;
-    
-    default:
-        break;
-    }
-}
-
-static lv_obj_t * scr1_2_lora_setting_create(lv_obj_t *parent, const char *text)
-{
-    lv_obj_t *ui_Container1 = lv_obj_create(parent);
-    lv_obj_remove_style_all(ui_Container1);
-    lv_obj_set_height(ui_Container1, 42);
-    lv_obj_set_width(ui_Container1, lv_pct(100));
-    lv_obj_set_x(ui_Container1, 35);
-    lv_obj_set_y(ui_Container1, -16);
-    lv_obj_set_align(ui_Container1, LV_ALIGN_CENTER);
-    lv_obj_set_flex_flow(ui_Container1, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ui_Container1, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(ui_Container1, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_pad_row(ui_Container1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_column(ui_Container1, 20, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t *ui_Label14 = lv_label_create(ui_Container1);
-    lv_obj_set_width(ui_Label14, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label14, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label14, -60);
-    lv_obj_set_y(ui_Label14, -42);
-    lv_obj_set_align(ui_Label14, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label14, text);
-    lv_obj_set_style_text_font(ui_Label14, FONT_BOLD_MONO_SIZE_15, LV_PART_MAIN);   
-
-    lv_obj_t *ui_Dropdown1 = lv_dropdown_create(ui_Container1);
-    lv_obj_set_width(ui_Dropdown1, lv_pct(60));
-    lv_obj_set_height(ui_Dropdown1, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Dropdown1, 19);
-    lv_obj_set_y(ui_Dropdown1, -1);
-    lv_obj_add_flag(ui_Dropdown1, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
-
-    // lv_obj_set_style_bg_opa(ui_Dropdown1, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(ui_Dropdown1, 1, LV_PART_MAIN | LV_STATE_PRESSED);
-    // lv_obj_set_style_shadow_width(ui_Dropdown1, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_PRESSED);
-
-    return ui_Dropdown1;
-}
-
-static void create1_2(lv_obj_t *parent)
-{
-    // Use the home-screen taskbar (clock + battery + wifi icon) instead of
-    // the per-screen "Lora Setting <" title bar. ESC pops to Settings via
-    // scr1_2_kb_timer_cb; j/k + Enter mirror System Font's navigation.
-    ui_taskbar_create(parent);
-
-    scr1_2_cont = lv_obj_create(parent);
-    lv_obj_remove_style_all(scr1_2_cont);
-    lv_obj_set_width(scr1_2_cont, lv_pct(100));
-    lv_obj_set_height(scr1_2_cont, lv_pct(85));
-    lv_obj_set_align(scr1_2_cont, LV_ALIGN_CENTER);
-    lv_obj_set_flex_flow(scr1_2_cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(scr1_2_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(scr1_2_cont, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_pad_row(scr1_2_cont, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_column(scr1_2_cont, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    // lv_obj_set_style_border_width(scr1_2_cont, 3, LV_PART_MAIN);
-    lv_obj_set_align(scr1_2_cont, LV_ALIGN_BOTTOM_MID);
-
-    dropdown_freq = scr1_2_lora_setting_create(scr1_2_cont, "Freq: ");
-    lv_dropdown_set_options(dropdown_freq, RADIO_FREQUENCY_LIST);
-    for(int i = 0; i < GET_BUFF_LEN(lora_freq_list); i++) {
-        if(ui_lora_get_freq() == lora_freq_list[i]) {
-            lv_dropdown_set_selected(dropdown_freq, i);
-        }
-    }
-
-    dropdown_band = scr1_2_lora_setting_create(scr1_2_cont, "Band: ");
-    lv_dropdown_set_options(dropdown_band, RADIO_BANDWIDTH);
-    for(int i = 0; i < GET_BUFF_LEN(lora_band_list); i++) {
-        if(ui_lora_get_bandwidth() == lora_band_list[i]) {
-            lv_dropdown_set_selected(dropdown_band, i);
-        }
-    }
-
-    dropdown_power = scr1_2_lora_setting_create(scr1_2_cont, "Power:");
-    lv_dropdown_set_options(dropdown_power, RADIO_TX_POWER);
-    for(int i = 0; i < GET_BUFF_LEN(lora_power_list); i++) {
-        if(ui_lora_get_power() == lora_power_list[i]) {
-            lv_dropdown_set_selected(dropdown_power, i);
-        }
-    }
-    static const char freq_flag = 'f';
-    static const char band_flag = 'b';
-    static const char power_flag = 'p';
-    lv_obj_add_event_cb(dropdown_freq, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&freq_flag);
-    lv_obj_add_event_cb(dropdown_band, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&band_flag);
-    lv_obj_add_event_cb(dropdown_power, lora_setting_event_handler, LV_EVENT_VALUE_CHANGED, (void *)&power_flag);
-}
-static void entry1_2(void)
-{
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    scr1_2_focus = LS_FOCUS_FREQ;
-    scr1_2_editing = false;
-    scr1_2_apply_focus_style();
-    if (!scr1_2_kb_timer) scr1_2_kb_timer = lv_timer_create(scr1_2_kb_timer_cb, 20, NULL);
-    ui_disp_full_refr();
-}
-static void exit1_2(void) {
-    if (scr1_2_kb_timer) { lv_timer_del(scr1_2_kb_timer); scr1_2_kb_timer = NULL; }
-    lv_timer_pause(taskbar_update_timer);
-    ui_disp_full_refr();
-    ui_lora_param_set();
-}
-static void destroy1_2(void) { }
-
-static scr_lifecycle_t screen1_2 = {
-    .create = create1_2,
-    .entry = entry1_2,
-    .exit  = exit1_2,
-    .destroy = destroy1_2,
-};
-#endif
 //************************************[ screen 2 ]****************************************** Setting
 // --------------------- screen 2.1 --------------------- About System
 #if 1
@@ -1697,7 +659,7 @@ static void create2_1(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "About System <" title bar. ESC on the keypad pops back
-    // to Settings via scr2_1_kb_timer_cb.
+    // to Settings via its on_key() handler.
     ui_taskbar_create(parent);
 
     lv_obj_t *info = lv_label_create(parent);
@@ -1736,8 +698,7 @@ static void create2_1(lv_obj_t *parent)
     lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 35);
 }
 
-static lv_timer_t *scr2_1_kb_timer = NULL;
-static void scr2_1_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr2_1(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -1756,12 +717,10 @@ static void entry2_1(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!scr2_1_kb_timer) scr2_1_kb_timer = lv_timer_create(scr2_1_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit2_1(void) {
     lv_timer_pause(taskbar_update_timer);
-    if (scr2_1_kb_timer) { lv_timer_del(scr2_1_kb_timer); scr2_1_kb_timer = NULL; }
     ui_disp_full_refr();
 }
 static void destroy2_1(void) { }
@@ -1771,6 +730,7 @@ static scr_lifecycle_t screen2_1 = {
     .entry = entry2_1,
     .exit  = exit2_1,
     .destroy = destroy2_1,
+    .on_key    = on_key_scr2_1,
 };
 #endif
 // --------------------- screen 2.2 --------------------- Hidden Apps
@@ -2027,8 +987,7 @@ static void create2(lv_obj_t *parent)
 
     setting_item_create(setting_curr_page);
 }
-static lv_timer_t *settings_kb_timer = NULL;
-static void settings_kb_timer_cb(lv_timer_t *t) {
+static void on_key_settings(void) {
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
@@ -2095,15 +1054,10 @@ static void entry2(void) {
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!settings_kb_timer) settings_kb_timer = lv_timer_create(settings_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit2(void) {
     lv_timer_pause(taskbar_update_timer);
-    if (settings_kb_timer) {
-        lv_timer_del(settings_kb_timer);
-        settings_kb_timer = NULL;
-    }
     ui_disp_full_refr();
 }
 static void destroy2(void) {
@@ -2118,6 +1072,7 @@ static scr_lifecycle_t screen2 = {
     .entry = entry2,
     .exit  = exit2,
     .destroy = destroy2,
+    .on_key    = on_key_settings,
 };
 #endif
 //************************************[ screen 3 ]****************************************** GPS
@@ -2214,7 +1169,7 @@ static void create3(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "GPS <" title bar. ESC on the keypad pops back to
-    // Settings via scr3_kb_timer_cb.
+    // Settings via its on_key() handler.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
 
@@ -2247,8 +1202,7 @@ static void create3(lv_obj_t *parent)
     lv_label_set_text_fmt(scr3_cnt_lab, " %05d ", 0);
     lv_obj_align(scr3_cnt_lab, LV_ALIGN_TOP_RIGHT, -10, status_bar_height + 4);
 }
-static lv_timer_t *scr3_kb_timer = NULL;
-static void scr3_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr3(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -2273,7 +1227,6 @@ static void entry3(void)
     }
 
     GPS_loop_timer = lv_timer_create(GPS_loop_timer_event, 3000, NULL);
-    if (!scr3_kb_timer) scr3_kb_timer = lv_timer_create(scr3_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit3(void) {
@@ -2284,7 +1237,6 @@ static void exit3(void) {
         lv_timer_del(GPS_loop_timer);
         GPS_loop_timer = NULL;
     }
-    if (scr3_kb_timer) { lv_timer_del(scr3_kb_timer); scr3_kb_timer = NULL; }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -2295,6 +1247,7 @@ static scr_lifecycle_t screen3 = {
     .entry = entry3,
     .exit  = exit3,
     .destroy = destroy3,
+    .on_key    = on_key_scr3,
 };
 
 #undef line_max
@@ -2312,7 +1265,6 @@ static scr_lifecycle_t screen3 = {
 #if 1
 static lv_obj_t *scr4_list = NULL;
 static lv_obj_t *scr4_status_lab = NULL;
-static lv_timer_t *scr4_kb_timer = NULL;
 static lv_timer_t *scr4_scan_timer = NULL;
 static int scr4_focus = 0;
 static int scr4_count = 0;
@@ -2416,7 +1368,7 @@ static void scr4_start_scan(void)
     if (!scr4_scan_timer) scr4_scan_timer = lv_timer_create(scr4_scan_timer_cb, 200, NULL);
 }
 
-static void scr4_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr4(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -2483,7 +1435,7 @@ static void create4(lv_obj_t *parent)
 {
     // Use the standard home-screen taskbar (clock + battery + wifi icon)
     // instead of the per-screen "WiFi <" title bar. ESC on the keypad still
-    // pops back to settings via scr4_kb_timer_cb.
+    // pops back to settings via its on_key() handler.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
 
@@ -2510,13 +1462,11 @@ static void entry4(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!scr4_kb_timer) scr4_kb_timer = lv_timer_create(scr4_kb_timer_cb, 30, NULL);
     scr4_start_scan();
 }
 
 static void exit4(void)
 {
-    if (scr4_kb_timer)   { lv_timer_del(scr4_kb_timer);   scr4_kb_timer = NULL; }
     if (scr4_scan_timer) { lv_timer_del(scr4_scan_timer); scr4_scan_timer = NULL; }
     // If we're leaving mid-scan (e.g. via Esc), make sure the radio is
     // actually idle and the result buffer is freed.
@@ -2536,6 +1486,7 @@ static scr_lifecycle_t screen4 = {
     .entry = entry4,
     .exit  = exit4,
     .destroy = destroy4,
+    .on_key    = on_key_scr4,
 };
 
 const char *ui_wifi_get_selected_ssid(void) { return scr4_selected_ssid; }
@@ -2555,7 +1506,6 @@ static lv_obj_t *scr4_1_pass_ta = NULL;
 static lv_obj_t *scr4_1_conn_btn = NULL;
 static lv_obj_t *scr4_1_conn_btn_lab = NULL;
 static lv_obj_t *scr4_1_status_lab = NULL;
-static lv_timer_t *scr4_1_kb_timer = NULL;
 static lv_timer_t *scr4_1_status_timer = NULL;
 // 0 = password textarea, 1 = connect button.
 static int scr4_1_focus = 0;
@@ -2633,7 +1583,7 @@ static void scr4_1_save_and_connect(void)
     scr4_1_refresh_status();
 }
 
-static void scr4_1_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr4_1(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -2750,11 +1700,9 @@ static void entry4_1(void)
     scr4_1_focus = 0;
     scr4_1_apply_focus();
     scr4_1_refresh_status();
-    if (!scr4_1_kb_timer)     scr4_1_kb_timer     = lv_timer_create(scr4_1_kb_timer_cb,    20,   NULL);
     if (!scr4_1_status_timer) scr4_1_status_timer = lv_timer_create(scr4_1_status_timer_cb, 1000, NULL);
 }
 static void exit4_1(void) {
-    if (scr4_1_kb_timer)     { lv_timer_del(scr4_1_kb_timer);     scr4_1_kb_timer     = NULL; }
     if (scr4_1_status_timer) { lv_timer_del(scr4_1_status_timer); scr4_1_status_timer = NULL; }
     ui_disp_full_refr();
 }
@@ -2771,6 +1719,7 @@ static scr_lifecycle_t screen4_1 = {
     .entry = entry4_1,
     .exit  = exit4_1,
     .destroy = destroy4_1,
+    .on_key    = on_key_scr4_1,
 };
 #endif
 // --------------------- screen 4.2 --------------------- Wifi Scan
@@ -2894,7 +1843,6 @@ static ui_test_handle test_handle_list[] = {
 static void test_item_create(int curr_apge);
 
 static lv_group_t *test_group = NULL;
-static lv_timer_t *test_kb_timer = NULL;
 
 static void test_page_switch_internal(char opt)
 {
@@ -2964,7 +1912,7 @@ static void create5(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "Test <" title bar. ESC on the keypad pops back to
-    // Settings via test_kb_timer_cb; per-item letter shortcuts focus the
+    // Settings via its on_key() handler; per-item letter shortcuts focus the
     // matching test row.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
@@ -2988,7 +1936,7 @@ static void create5(lv_obj_t *parent)
     test_page_num = test_num / SETTING_PAGE_MAX_ITEM;
     test_item_create(test_curr_page);
 }
-static void test_kb_timer_cb(lv_timer_t *t) {
+static void on_key_test(void) {
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
@@ -3056,14 +2004,9 @@ static void entry5(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!test_kb_timer) test_kb_timer = lv_timer_create(test_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit5(void) {
-    if (test_kb_timer) {
-        lv_timer_del(test_kb_timer);
-        test_kb_timer = NULL;
-    }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -3079,6 +2022,7 @@ static scr_lifecycle_t screen5 = {
     .entry = entry5,
     .exit  = exit5,
     .destroy = destroy5,
+    .on_key    = on_key_test,
 };
 #endif
 //************************************[ screen 6 ]****************************************** Battery
@@ -3137,7 +2081,7 @@ static void create6(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "Battery <" title bar. ESC on the keypad pops back to
-    // Settings via scr6_kb_timer_cb. Letter prefixes on the items double as
+    // Settings via its on_key() handler. Letter prefixes on the items double as
     // keypad shortcuts handled by the same kb timer.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
@@ -3155,8 +2099,7 @@ static void create6(lv_obj_t *parent)
     scr6_item_create("g  BQ27220", scr6_list_event);
 }
 
-static lv_timer_t *scr6_kb_timer = NULL;
-static void scr6_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr6(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -3183,12 +2126,10 @@ static void entry6(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!scr6_kb_timer) scr6_kb_timer = lv_timer_create(scr6_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit6(void) {
     lv_timer_pause(taskbar_update_timer);
-    if (scr6_kb_timer) { lv_timer_del(scr6_kb_timer); scr6_kb_timer = NULL; }
     ui_disp_full_refr();
 }
 static void destroy6(void) { }
@@ -3198,6 +2139,7 @@ static scr_lifecycle_t screen6 = {
     .entry = entry6,
     .exit  = exit6,
     .destroy = destroy6,
+    .on_key    = on_key_scr6,
 };
 #endif
 // --------------------- screen 6.1 --------------------- BQ25896
@@ -3267,7 +2209,7 @@ static void create6_1(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "BQ25896 <" title bar. ESC on the keypad pops back to
-    // the Battery menu via scr6_1_kb_timer_cb.
+    // the Battery menu via its on_key() handler.
     ui_taskbar_create(parent);
 
     lv_obj_t *scr6_1_cont = lv_obj_create(parent);
@@ -3289,8 +2231,7 @@ static void create6_1(lv_obj_t *parent)
     }
 }
 
-static lv_timer_t *scr6_1_kb_timer = NULL;
-static void scr6_1_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr6_1(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -3310,7 +2251,6 @@ static void entry6_1(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!scr6_1_kb_timer) scr6_1_kb_timer = lv_timer_create(scr6_1_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
     batt_6_1_timer = lv_timer_create(batt_6_1_updata_timer_event, 5000, NULL);
 }
@@ -3319,7 +2259,6 @@ static void exit6_1(void) {
         lv_timer_del(batt_6_1_timer);
         batt_6_1_timer = NULL;
     }
-    if (scr6_1_kb_timer) { lv_timer_del(scr6_1_kb_timer); scr6_1_kb_timer = NULL; }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -3330,6 +2269,7 @@ static scr_lifecycle_t screen6_1 = {
     .entry = entry6_1,
     .exit  = exit6_1,
     .destroy = destroy6_1,
+    .on_key    = on_key_scr6_1,
 };
 #undef line_max
 
@@ -3399,7 +2339,7 @@ static void create6_2(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "BQ27220 <" title bar. ESC on the keypad pops back to
-    // the Battery menu via scr6_2_kb_timer_cb.
+    // the Battery menu via its on_key() handler.
     ui_taskbar_create(parent);
 
     lv_obj_t *scr6_2_cont = lv_obj_create(parent);
@@ -3421,8 +2361,7 @@ static void create6_2(lv_obj_t *parent)
     }
 }
 
-static lv_timer_t *scr6_2_kb_timer = NULL;
-static void scr6_2_kb_timer_cb(lv_timer_t *t)
+static void on_key_scr6_2(void)
 {
     char key;
     while (ui_input_get_keypad_val(&key)) {
@@ -3442,7 +2381,6 @@ static void entry6_2(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!scr6_2_kb_timer) scr6_2_kb_timer = lv_timer_create(scr6_2_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
     batt_6_2_timer = lv_timer_create(batt_6_2_updata_timer_event, 5000, NULL);
 }
@@ -3451,7 +2389,6 @@ static void exit6_2(void) {
         lv_timer_del(batt_6_2_timer);
         batt_6_2_timer = NULL;
     }
-    if (scr6_2_kb_timer) { lv_timer_del(scr6_2_kb_timer); scr6_2_kb_timer = NULL; }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -3463,6 +2400,7 @@ static scr_lifecycle_t screen6_2 = {
     .entry = entry6_2,
     .exit  = exit6_2,
     .destroy = destroy6_2,
+    .on_key    = on_key_scr6_2,
 };
 #undef line_max
 #endif
@@ -3667,7 +2605,6 @@ static void a7682_scr_event(lv_event_t *e)
 }
 
 static lv_group_t *a7682_group = NULL;
-static lv_timer_t *a7682_kb_timer = NULL;
 
 static void a7682_page_switch_internal(char opt)
 {
@@ -3735,7 +2672,7 @@ static void a7682_item_create(int curr_apge)
     }
 }
 
-static void a7682_kb_timer_cb(lv_timer_t *t) {
+static void on_key_a7682(void) {
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
@@ -3810,7 +2747,7 @@ static void create8(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "A7682E <" title bar. ESC on the keypad pops back to
-    // Settings via a7682_kb_timer_cb; letter shortcuts pick a row.
+    // Settings via its on_key() handler; letter shortcuts pick a row.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
 
@@ -3840,14 +2777,9 @@ static void entry8(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!a7682_kb_timer) a7682_kb_timer = lv_timer_create(a7682_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit8(void) {
-    if (a7682_kb_timer) {
-        lv_timer_del(a7682_kb_timer);
-        a7682_kb_timer = NULL;
-    }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -3862,6 +2794,7 @@ static scr_lifecycle_t screen8 = {
     .entry = entry8,
     .exit  = exit8,
     .destroy = destroy8,
+    .on_key    = on_key_a7682,
 };
 #endif
 // --------------------- screen 8.1 --------------------- Call test
@@ -4070,7 +3003,6 @@ static void pcm5102_scr_event(lv_event_t *e)
 }
 
 static lv_group_t *pcm5102_group = NULL;
-static lv_timer_t *pcm5102_kb_timer = NULL;
 
 static void pcm5102_page_switch_internal(char opt)
 {
@@ -4138,7 +3070,7 @@ static void pcm5102_item_create(int curr_apge)
     }
 }
 
-static void pcm5102_kb_timer_cb(lv_timer_t *t) {
+static void on_key_pcm5102(void) {
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
@@ -4204,7 +3136,7 @@ static void create10(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "PCM5102 <" title bar. ESC on the keypad pops back to
-    // Settings via pcm5102_kb_timer_cb; letter shortcuts pick a row.
+    // Settings via its on_key() handler; letter shortcuts pick a row.
     ui_taskbar_create(parent);
     const int status_bar_height = 25;
 
@@ -4234,16 +3166,11 @@ static void entry10(void)
         lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
         lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
     }
-    if (!pcm5102_kb_timer) pcm5102_kb_timer = lv_timer_create(pcm5102_kb_timer_cb, 20, NULL);
     ui_disp_full_refr();
 }
 static void exit10(void)
 {
     ui_pcm5102_stop();
-    if (pcm5102_kb_timer) {
-        lv_timer_del(pcm5102_kb_timer);
-        pcm5102_kb_timer = NULL;
-    }
     lv_timer_pause(taskbar_update_timer);
     ui_disp_full_refr();
 }
@@ -4259,6 +3186,7 @@ static scr_lifecycle_t screen10 = {
     .entry = entry10,
     .exit  = exit10,
     .destroy = destroy10,
+    .on_key    = on_key_pcm5102,
 };
 #endif
 //************************************[ screen 11 ]****************************************** Sleep
@@ -4274,6 +3202,11 @@ static void scr11_btn_event_cb(lv_event_t * e)
 static void create11(lv_obj_t *parent)
 {
     extern TouchDrvCSTXXX touch;
+
+    // Deep sleep never returns, so flush any setting still sitting in the
+    // debounced save timer — unlike ui_shutdown_on(), this path does not go
+    // through ui_settings_save() on its way down.
+    ui_settings_save();
 
     touch.sleep();
 
@@ -4348,7 +3281,6 @@ static scr_lifecycle_t screen11 = {
 #endif
 //************************************[ UI ENTRY ]******************************************
 static lv_obj_t *menu_keypad;
-static lv_timer_t *menu_timer = NULL;
 
 static void indev_get_gesture_dir(lv_timer_t *t)
 {
@@ -4515,7 +3447,9 @@ static void ui_toast_dismiss_cb(lv_timer_t *t)
     ui_disp_full_refr();
 }
 
-static void ui_toast_show(const char *text, uint32_t ms)
+/* ui_toast_show has external linkage: split TUs (reader) show toasts for
+ * errors (declared in ui_deckpro_int.h). */
+void ui_toast_show(const char *text, uint32_t ms)
 {
     if (ui_toast_obj)   { lv_obj_del(ui_toast_obj);     ui_toast_obj   = NULL; }
     if (ui_toast_timer) { lv_timer_del(ui_toast_timer); ui_toast_timer = NULL; }
@@ -4541,36 +3475,105 @@ static void ui_toast_show(const char *text, uint32_t ms)
     lv_timer_set_repeat_count(ui_toast_timer, 1);
 }
 
-static void ui_do_ping_1111(void)
-{
-    Serial.println("[ping] 'p' pressed, starting ping to 1.1.1.1");
-    // Show "Pinging..." first, then run ping. esp_ping blocks the calling
-    // thread until the session ends, so we need a placeholder to confirm the
-    // keypress was received and to give the e-paper something to draw before
-    // the 2s wait.
-    ui_toast_show("Pinging 1.1.1.1...", 30000);
-    ui_disp_full_refr();
-    lv_refr_now(NULL);
+// ──────────────────────────────────────────────────────────────────────────────
+// § 3.10  Non-blocking NTP sync (replaces the delay(500) that froze the UI)
+// ──────────────────────────────────────────────────────────────────────────────
 
-    int rtt = -1;
-    bool ok = ui_ping("1.1.1.1", 2000, &rtt);
+// Number of 500 ms polls to attempt before giving up.
+#define NTP_POLL_RETRIES 6
+
+static lv_timer_t *s_ntp_poll_timer  = NULL;
+static int         s_ntp_retries_left = 0;
+
+static void ntp_check_timer_cb(lv_timer_t *t)
+{
+    if (ui_time_is_synced() || s_ntp_retries_left <= 0) {
+        // Time either synced or we've exhausted retries — show final status.
+        if (ui_time_is_synced()) {
+            struct tm tm_now;
+            ui_time_get_local(&tm_now);
+            char buf[64];
+            lv_snprintf(buf, sizeof(buf), "Time Synced!\n%02d:%02d:%02d",
+                        tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+            ui_toast_show(buf, 3000);
+        } else {
+            ui_toast_show("NTP Request Sent\nWaiting for sync...", 3000);
+        }
+        ui_disp_full_refr();
+        lv_timer_del(t);
+        s_ntp_poll_timer  = NULL;
+        s_ntp_retries_left = 0;
+        return;
+    }
+    s_ntp_retries_left--;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 3.10  Non-blocking ping (replaces the blocking ui_ping + delay(500))
+//
+// ui_ping() blocks for up to 2000 ms on an ICMP socket.  Running it on the
+// LVGL loop task froze all timers and bq25896_runtime_maintain() for ~2.5 s.
+// We offload it to a short-lived FreeRTOS worker task; an lv_timer polls a
+// one-item queue for the result and updates the toast from the LVGL context.
+// ──────────────────────────────────────────────────────────────────────────────
+
+typedef struct {
+    bool ok;
+    int  rtt_ms;
+} ping_result_t;
+
+static QueueHandle_t s_ping_queue     = NULL;
+static lv_timer_t   *s_ping_poll_timer = NULL;
+static volatile bool s_ping_active    = false;
+
+static void ping_worker_task(void *param)
+{
+    // Runs on its own FreeRTOS task — must NOT call any lv_obj_* functions.
+    int  rtt = -1;
+    bool ok  = ui_ping("1.1.1.1", 2000, &rtt);
+    ping_result_t result = {ok, rtt};
+    if (s_ping_queue) {
+        xQueueSend(s_ping_queue, &result, 0); // non-blocking; queue capacity = 1
+    }
+    vTaskDelete(NULL); // self-delete
+}
+
+static void ping_poll_timer_cb(lv_timer_t *t)
+{
+    if (!s_ping_queue) {
+        // Queue was destroyed (e.g. on re-entry) — abort this timer.
+        lv_timer_del(t);
+        s_ping_poll_timer = NULL;
+        return;
+    }
+
+    ping_result_t result;
+    if (xQueueReceive(s_ping_queue, &result, 0) != pdTRUE) {
+        return; // Worker not done yet — check again next tick.
+    }
+
+    // Worker finished — clean up queue and timer.
+    vQueueDelete(s_ping_queue);
+    s_ping_queue      = NULL;
+    s_ping_active     = false;
+    lv_timer_del(t);
+    s_ping_poll_timer = NULL;
+
     char buf[96];
-    if (ok) {
-        // Internet reachable -> kick off NTP. SNTP is async, so we just
-        // request the resync and report local time on the next tick if it
-        // already had a recent sample.
+    if (result.ok) {
+        // Internet reachable — kick off NTP and update the toast.
         ui_wifi_set_tz("<-03>3");
         ui_ntp_resync();
-        delay(500);
         if (ui_time_is_synced()) {
             struct tm tm_now;
             ui_time_get_local(&tm_now);
             lv_snprintf(buf, sizeof(buf),
                         "Ping 1.1.1.1\nOK  %d ms\nTime %02d:%02d:%02d",
-                        rtt, tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+                        result.rtt_ms,
+                        tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
         } else {
             lv_snprintf(buf, sizeof(buf),
-                        "Ping 1.1.1.1\nOK  %d ms\nNTP syncing...", rtt);
+                        "Ping 1.1.1.1\nOK  %d ms\nNTP syncing...", result.rtt_ms);
         }
     } else {
         lv_snprintf(buf, sizeof(buf), "Ping 1.1.1.1\nFAIL");
@@ -4580,6 +3583,48 @@ static void ui_do_ping_1111(void)
     ui_disp_full_refr();
 }
 
+static void ui_do_ping_1111(void)
+{
+    Serial.println("[ping] 'p' pressed, launching async ping to 1.1.1.1");
+
+    // Prevent double-launch: if a ping is already in flight, ignore the press.
+    if (s_ping_active) {
+        Serial.println("[ping] already in flight, ignoring");
+        return;
+    }
+
+    // Create a one-item result queue before spawning the worker so there is
+    // no window where the worker has nowhere to post its result.
+    s_ping_queue = xQueueCreate(1, sizeof(ping_result_t));
+    if (!s_ping_queue) {
+        ui_toast_show("Ping: out of memory", 3000);
+        ui_disp_full_refr();
+        return;
+    }
+
+    // Show the placeholder toast immediately so the e-paper has something to
+    // display while the worker runs (up to 2 s).
+    ui_toast_show("Pinging 1.1.1.1...", 30000);
+    ui_disp_full_refr();
+
+    s_ping_active = true;
+    BaseType_t rc = xTaskCreate(ping_worker_task, "ping_work",
+                                4096, NULL, 1, NULL);
+    if (rc != pdPASS) {
+        vQueueDelete(s_ping_queue);
+        s_ping_queue  = NULL;
+        s_ping_active = false;
+        ui_toast_show("Ping: task create failed", 3000);
+        ui_disp_full_refr();
+        return;
+    }
+
+    // Poll for the result every 50 ms; the callback cleans up when done.
+    if (s_ping_poll_timer) lv_timer_del(s_ping_poll_timer);
+    s_ping_poll_timer = lv_timer_create(ping_poll_timer_cb, 50, NULL);
+    lv_timer_set_repeat_count(s_ping_poll_timer, -1); // infinite; self-deletes when result arrives
+}
+
 static void ui_do_ntp_sync(void)
 {
     Serial.println("[ntp] 'z' pressed, starting NTP sync for Americas/Sao_Paulo");
@@ -4587,163 +3632,118 @@ static void ui_do_ntp_sync(void)
         ui_toast_show("WiFi not connected!", 3000);
         return;
     }
-    
-    ui_toast_show("Syncing time (Sao Paulo)...", 30000);
-    ui_disp_full_refr();
-    lv_refr_now(NULL);
+
+    // Cancel any in-flight NTP poll from a previous keypress.
+    if (s_ntp_poll_timer) {
+        lv_timer_del(s_ntp_poll_timer);
+        s_ntp_poll_timer  = NULL;
+        s_ntp_retries_left = 0;
+    }
 
     ui_wifi_set_tz("<-03>3");
     ui_ntp_resync();
-    
-    // Wait a bit for NTP to potentially update (non-blocking in reality but gives feedback)
-    delay(500);
-    
-    if (ui_time_is_synced()) {
-        struct tm tm_now;
-        ui_time_get_local(&tm_now);
-        char buf[64];
-        lv_snprintf(buf, sizeof(buf), "Time Synced!\n%02d:%02d:%02d", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
-        ui_toast_show(buf, 3000);
-    } else {
-        ui_toast_show("NTP Request Sent\nWaiting for sync...", 3000);
-    }
+
+    // Show a holding toast while the SNTP stack converges.
+    ui_toast_show("Syncing time (Sao Paulo)...", 10000);
     ui_disp_full_refr();
+
+    // A repeating timer re-checks ui_time_is_synced() every 500 ms and
+    // updates the toast when NTP responds (or after NTP_POLL_RETRIES * 500 ms).
+    s_ntp_retries_left = NTP_POLL_RETRIES;
+    s_ntp_poll_timer   = lv_timer_create(ntp_check_timer_cb, 500, NULL);
+    lv_timer_set_repeat_count(s_ntp_poll_timer, -1); // infinite; self-deletes on completion
 }
 
-// Reader-screen statics are defined here (rather than alongside the rest of
-// the reader code below) because the home-screen 'c' shortcut in
+// Reader resume state is defined here (rather than alongside the reader code
+// in ui_reader.cpp) because the home-screen 'c' shortcut in
 // menu_keypay_get_event needs to stage a resume target before pushing
-// SCREEN13_1, and C++ doesn't allow two file-scope static definitions.
-static char   reader_selected_file[32] = {0};
+// SCREEN13_1.  All three have external linkage so ui_reader.cpp can access
+// them (declared extern in ui_deckpro_int.h).
+char   reader_selected_file[32] = {0};
 // Set true by 'c' on the home screen; entry13_1 consumes it to seed
 // reader_page_offsets[0] so the first render is the user's last-read page.
-static bool   reader_resume_pending = false;
-static size_t reader_resume_offset  = 0;
+bool   reader_resume_pending = false;
+size_t reader_resume_offset  = 0;
 
-static void menu_keypay_get_event(lv_timer_t *timer)
+/* ---------------------------------------------------------------
+ * Global 20 ms keypad dispatch timer  (§5.1 consolidation)
+ *
+ * One LVGL timer polls the keypad ring-buffer and dispatches each
+ * key event to the current screen's on_key() hook.  The hook
+ * contains the original while/get/set drain loop verbatim, so all
+ * per-key semantics are preserved.  Screens without an on_key hook
+ * (SCREEN0, screens handled by menu_keypay_get_event) receive no
+ * delivery here — the home-screen timer below handles SCREEN0.
+ * --------------------------------------------------------------- */
+static lv_timer_t *global_kb_timer = NULL;
+static lv_timer_t *menu_timer       = NULL;
+static void global_kb_timer_cb(lv_timer_t *t)
 {
-    uint16_t curr_id = scr_mgr_get_curr_scr_id();
-    if (curr_id == SCREEN0_ID) {
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            Serial.printf("[home] key=0x%02x ('%c')\n",
-                          (unsigned char)key_val,
-                          (key_val >= 32 && key_val < 127) ? key_val : '?');
-            switch (key_val) {
-                case 's':
-                    scr_mgr_push(SCREEN2_ID, false);
-                    break;
-                case 'r':
-                    scr_mgr_push(SCREEN13_ID, false);
-                    break;
-                case 'c': {
-                    // Resume reading the last book at its saved byte
-                    // offset. Skip if no bookmark exists.
-                    char saved[32] = {0};
-                    size_t saved_off = 0;
-                    if (ui_reader_resume_get(saved, sizeof(saved), &saved_off)
-                        && saved[0]) {
-                        strncpy(reader_selected_file, saved,
-                                sizeof(reader_selected_file) - 1);
-                        reader_selected_file[sizeof(reader_selected_file) - 1] = '\0';
-                        reader_resume_offset = saved_off;
-                        reader_resume_pending = true;
-                        scr_mgr_push(SCREEN13_1_ID, false);
-                    }
-                    break;
-                }
-                case 'n':
-                    notes_selected_file[0] = '\0';
-                    scr_mgr_push(SCREEN12_1_ID, false);
-                    break;
-                case 't':
-                    scr_mgr_push(SCREEN_DICT_ID, false);
-                    break;
-                case 'q':
-                    scr_mgr_push(SCREEN_USB_MSC_ID, false);
-                    break;
-                case 'l':
-                    scr_mgr_push(SCREEN_LOCK_ID, false);
-                    break;
-                case 'd':
-                    ui_disp_white_clear();
-                    scr_mgr_push(SCREEN11_ID, false);
-                    break;
-                case 'w':
-                    ui_wifi_set_enabled(!ui_wifi_get_enabled());
-                    break;
-                case 'p':
-                    ui_do_ping_1111();
-                    break;
-                case 'z':
-                    ui_do_ntp_sync();
-                    break;
-                case 'b':
-                    ui_topbar_show_battery_set(!ui_topbar_show_battery_get());
-                    ui_taskbar_apply_battery_visibility();
-                    ui_disp_full_refr();
-                    break;
-                case 0x1B: // Esc
-                    ui_disp_hard_refr();
-                    break;
-            }
-            ui_input_set_keypad_flag(); // Consume the key
-        }
-    } else if (curr_id == SCREEN13_ID || curr_id == SCREEN13_1_ID) {
-        // The reader file list (SCREEN13) and the reader page view
-        // (SCREEN13_1) each run their own keypad timer that handles j/k/E
-        // and Esc. If we unconditionally consumed the key here we'd race
-        // with those timers and eat half the presses — making j/k feel
-        // like they need two taps to advance one page. Only consume on
-        // keys this branch actually acts on.
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            if (key_val == 'q') {
-                scr_mgr_switch(SCREEN0_ID, false);
-                ui_input_set_keypad_flag();
-            }
-        }
-    } else if (curr_id == SCREEN2_ID || curr_id == SCREEN5_ID || curr_id == SCREEN8_ID || curr_id == SCREEN10_ID) {
-        // These paginated menus have their own local kb_timers. 
-        // Don't consume here or we'll race and drop half the key events.
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            if (key_val == 'q') {
-                scr_mgr_switch(SCREEN0_ID, false);
-                ui_input_set_keypad_flag();
-            }
-        }
-    } else if (curr_id == SCREEN2_1_ID) {
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            if (key_val == 0x1B) {
-                scr_mgr_switch(SCREEN0_ID, false);
-            }
-            ui_input_set_keypad_flag();
-        }
-    } else if (curr_id == SCREEN_USB_MSC_ID) {
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            if (key_val == 0x1B) {
-                scr_mgr_switch(SCREEN0_ID, false);
-            }
-            ui_input_set_keypad_flag();
-        }
-    } else if (curr_id == SCREEN_LOCK_ID) {
-        char key_val;
-        if (ui_input_get_keypad_val(&key_val)) {
-            lock_handle_key(key_val);
-            ui_input_set_keypad_flag();
-        }
-    }
+    scr_lifecycle_t *life = scr_mgr_get_curr_life();
+    if (!life || !life->on_key) return;
+    /* Snapshot the screen ID so we can detect a navigation event
+     * (push/pop/switch) that on_key triggers.  If the screen
+     * changes we stop — the next tick will re-fetch the new
+     * screen's on_key and continue draining from there. */
+    int prev_id = scr_mgr_get_curr_scr_id();
+    life->on_key();
+    (void)prev_id; /* on_key drains the full buffer internally */
 }
 
-extern scr_lifecycle_t screen12;
-extern scr_lifecycle_t screen12_1;
-extern scr_lifecycle_t screen13;
-extern scr_lifecycle_t screen13_1;
-extern scr_lifecycle_t screen13_2;
-extern scr_lifecycle_t screen_dict;
+// Home-screen keypad handler.  All other screens use the global_kb_timer
+// dispatch below (ui_deckpro_entry()) which calls their on_key() hook.
+static void menu_keypay_get_event(lv_timer_t *timer)
+{
+    if (scr_mgr_get_curr_scr_id() != SCREEN0_ID) return;
+
+    char key_val;
+    if (!ui_input_get_keypad_val(&key_val)) return;
+    Serial.printf("[home] key=0x%02x ('%c')\n",
+                  (unsigned char)key_val,
+                  (key_val >= 32 && key_val < 127) ? key_val : '?');
+    switch (key_val) {
+        case 's': scr_mgr_push(SCREEN2_ID,        false); break;
+        case 'r': scr_mgr_push(SCREEN13_ID,       false); break;
+        case 'c': {
+            char saved[32] = {0};
+            size_t saved_off = 0;
+            if (ui_reader_resume_get(saved, sizeof(saved), &saved_off) && saved[0]) {
+                strncpy(reader_selected_file, saved, sizeof(reader_selected_file) - 1);
+                reader_selected_file[sizeof(reader_selected_file) - 1] = '\0';
+                reader_resume_offset = saved_off;
+                reader_resume_pending = true;
+                scr_mgr_push(SCREEN13_1_ID, false);
+            }
+            break;
+        }
+        case 'n': notes_selected_file[0] = '\0'; scr_mgr_push(SCREEN12_1_ID, false); break;
+        case 't': scr_mgr_push(SCREEN_DICT_ID,    false); break;
+        case 'q': scr_mgr_push(SCREEN_USB_MSC_ID, false); break;
+        case 'l': scr_mgr_push(SCREEN_LOCK_ID,    false); break;
+        case 'd': ui_disp_white_clear(); scr_mgr_push(SCREEN11_ID, false); break;
+        case 'w': ui_wifi_set_enabled(!ui_wifi_get_enabled()); break;
+        case 'p': ui_do_ping_1111(); break;
+        case 'z': ui_do_ntp_sync(); break;
+        case 'b':
+            ui_topbar_show_battery_set(!ui_topbar_show_battery_get());
+            ui_taskbar_apply_battery_visibility();
+            ui_disp_full_refr();
+            break;
+        case 0x1B: ui_disp_hard_refr(); break;
+    }
+    ui_input_set_keypad_flag();
+}
+
+extern scr_lifecycle_t screen_lock;   // ui_lockscreen.cpp
+extern scr_lifecycle_t screen1;       // ui_lora.cpp
+extern scr_lifecycle_t screen1_1;     // ui_lora.cpp
+extern scr_lifecycle_t screen1_2;     // ui_lora.cpp
+extern scr_lifecycle_t screen12;      // ui_notes.cpp
+extern scr_lifecycle_t screen12_1;    // ui_notes.cpp
+extern scr_lifecycle_t screen13;      // ui_reader.cpp
+extern scr_lifecycle_t screen13_1;    // ui_reader.cpp
+extern scr_lifecycle_t screen13_2;    // ui_reader.cpp
+extern scr_lifecycle_t screen_dict;   // ui_reader.cpp
 
 void ui_deckpro_entry(void)
 {
@@ -4804,1505 +3804,6 @@ void ui_deckpro_entry(void)
     // lv_label_set_text(menu_keypad, " ");
     // lv_obj_align(menu_keypad, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
 
+    global_kb_timer = lv_timer_create(global_kb_timer_cb, 20, NULL);
     menu_timer = lv_timer_create(menu_keypay_get_event, 40, NULL);
 }
-//************************************[ screen 12 ]***************************************** Notes List
-#if 1
-
-static void notes_list_update(void)
-{
-    lv_obj_clean(notes_list_obj);
-    char list[UI_NOTES_MAX_COUNT][32];
-    int count = 0;
-    ui_notes_get_list(notes_use_sd, list, &count);
-
-    for (int i = 0; i < count; i++) {
-        lv_obj_t * btn = lv_list_add_btn(notes_list_obj, NULL, list[i]);
-        lv_obj_set_style_text_font(btn, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-        
-        struct note_info {
-            char name[32];
-        };
-        // We can't easily pass strings in user_data without allocation, 
-        // so we'll just use the button text in the event handler.
-    }
-}
-
-static void notes_list_btn_event_cb(lv_event_t * e)
-{
-    lv_obj_t * obj = lv_event_get_target(e);
-    const char * name = lv_list_get_btn_text(notes_list_obj, obj);
-    if (name) {
-        strncpy(notes_selected_file, name, 31);
-        scr_mgr_push(SCREEN12_1_ID, false);
-    }
-}
-
-static void notes_storage_sw_event_cb(lv_event_t * e)
-{
-    lv_obj_t * sw = lv_event_get_target(e);
-    notes_use_sd = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    notes_list_update();
-}
-
-static void notes_new_btn_event_cb(lv_event_t * e)
-{
-    notes_selected_file[0] = '\0'; // Empty name means new file
-    scr_mgr_push(SCREEN12_1_ID, false);
-}
-
-static void scr12_back_btn_event_cb(lv_event_t * e)
-{
-    scr_mgr_pop(false);
-}
-
-static void create12(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-
-    lv_obj_t * sw = lv_switch_create(parent);
-    lv_obj_set_size(sw, 40, 20);
-    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, -10, status_bar_height + 5);
-    if (notes_use_sd) lv_obj_add_state(sw, LV_STATE_CHECKED);
-    lv_obj_add_event_cb(sw, notes_storage_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t * sw_label = lv_label_create(parent);
-    lv_label_set_text(sw_label, "SD");
-    lv_obj_set_style_text_font(sw_label, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-    lv_obj_align_to(sw_label, sw, LV_ALIGN_OUT_LEFT_MID, -5, 0);
-
-    notes_list_obj = lv_list_create(parent);
-    lv_obj_set_size(notes_list_obj, lv_pct(100), LV_VER_RES - status_bar_height - 60);
-    lv_obj_align(notes_list_obj, LV_ALIGN_TOP_MID, 0, status_bar_height + 30);
-    lv_obj_add_event_cb(notes_list_obj, notes_list_btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t * new_btn = lv_btn_create(parent);
-    lv_obj_set_size(new_btn, 80, 25);
-    lv_obj_align(new_btn, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_t * new_label = lv_label_create(new_btn);
-    lv_label_set_text(new_label, "New Note");
-    lv_obj_center(new_label);
-    lv_obj_add_event_cb(new_btn, notes_new_btn_event_cb, LV_EVENT_CLICKED, NULL);
-}
-
-static void entry12(void)
-{
-    notes_list_update();
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    ui_disp_full_refr();
-}
-
-static void exit12(void) { 
-    lv_timer_pause(taskbar_update_timer);
-    ui_disp_full_refr(); 
-}
-
-static void destroy12(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-}
-
-scr_lifecycle_t screen12 = {
-    .create = create12,
-    .entry = entry12,
-    .exit  = exit12,
-    .destroy = destroy12,
-};
-#endif
-
-//************************************[ screen 12.1 ]*************************************** Notes Editor
-#if 1
-static lv_obj_t *notes_editor_ta;
-static lv_timer_t *notes_editor_kb_timer = NULL;
-
-typedef enum {
-    NOTES_SAVE_OK,
-    NOTES_SAVE_EMPTY,
-    NOTES_SAVE_NO_TIME,
-    NOTES_SAVE_ERR,
-} notes_save_result_t;
-
-// Build a YYYYMMDD_HHMMSS.txt filename from system time, falling back to
-// GPS time. Returns false if neither source has a plausible date — callers
-// must surface that to the user rather than inventing a filename.
-static bool notes_make_timestamp_name(char *out, size_t out_len)
-{
-    time_t now = time(NULL);
-    struct tm tm_now;
-    if (now > 1700000000 && localtime_r(&now, &tm_now) != NULL) {
-        strftime(out, out_len, "%Y%m%d_%H%M%S.txt", &tm_now);
-        return true;
-    }
-
-    uint16_t y = 0;
-    uint8_t  mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    ui_gps_get_data(&y, &mo, &d);
-    ui_gps_get_time(&h, &mi, &s);
-    if (y >= 2024) {
-        snprintf(out, out_len, "%04u%02u%02u_%02u%02u%02u.txt",
-                 (unsigned)y, mo, d, h, mi, s);
-        return true;
-    }
-
-    return false;
-}
-
-// Save the current buffer under a fresh timestamp filename. Empty buffers
-// are skipped so backing out of an untouched editor doesn't litter the FS.
-// If no time source is available, refuses the save and shows a toast — the
-// user must sync NTP (press 'z') first so the filename can be timestamped.
-static notes_save_result_t notes_save_current(void)
-{
-    if (!notes_editor_ta) return NOTES_SAVE_ERR;
-    const char *content = lv_textarea_get_text(notes_editor_ta);
-    if (!content || content[0] == '\0') {
-        Serial.println("notes_save: empty, skipping");
-        return NOTES_SAVE_EMPTY;
-    }
-
-    char fname[40];
-    if (!notes_make_timestamp_name(fname, sizeof(fname))) {
-        Serial.println("notes_save: no time source, refusing to save");
-        ui_toast_show("Time not set\nPress 'z' to NTP sync\nthen try again", 4000);
-        return NOTES_SAVE_NO_TIME;
-    }
-    Serial.printf("notes_save: writing '%s' (%u bytes)\n",
-                  fname, (unsigned)strlen(content));
-
-    bool ok = ui_notes_write(notes_use_sd, fname, content);
-    if (!ok) {
-        Serial.println("notes_save: write failed");
-        ui_toast_show("Save failed", 3000);
-        return NOTES_SAVE_ERR;
-    }
-    return NOTES_SAVE_OK;
-}
-
-static void notes_editor_kb_timer_cb(lv_timer_t *t)
-{
-    // Drain every buffered key per tick so a burst of presses lands in one
-    // textarea update rather than one-per-tick (and one-per-redraw on this
-    // e-paper, which would feel painfully slow).
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 'E') { // Enter
-            lv_textarea_add_char(notes_editor_ta, '\n');
-        } else if (key == 0x08) { // Backspace
-            lv_textarea_del_char(notes_editor_ta);
-        } else if (key == 0x1B) { // Esc
-            notes_save_result_t r = notes_save_current();
-            if (r == NOTES_SAVE_NO_TIME || r == NOTES_SAVE_ERR) {
-                // Stay in the editor so the user doesn't lose the buffer.
-                return;
-            }
-            scr_mgr_switch(SCREEN0_ID, false);
-            return;
-        } else if (key >= 32 && key <= 126) {
-            lv_textarea_add_char(notes_editor_ta, key);
-        }
-    }
-}
-
-static void notes_save_btn_event_cb(lv_event_t * e)
-{
-    notes_save_result_t r = notes_save_current();
-    if (r == NOTES_SAVE_NO_TIME || r == NOTES_SAVE_ERR) return;
-    scr_mgr_pop(false);
-}
-
-static void notes_editor_back_btn_event_cb(lv_event_t * e)
-{
-    notes_save_result_t r = notes_save_current();
-    if (r == NOTES_SAVE_NO_TIME || r == NOTES_SAVE_ERR) return;
-    scr_mgr_pop(false);
-}
-
-static void create12_1(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-
-    notes_editor_ta = lv_textarea_create(parent);
-    lv_obj_set_size(notes_editor_ta, lv_pct(100), LV_VER_RES - status_bar_height);
-    lv_obj_align(notes_editor_ta, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_text_font(notes_editor_ta, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-    lv_textarea_set_text(notes_editor_ta, "");
-
-    lv_group_t * g = lv_group_get_default();
-    if (!g) {
-        g = lv_group_create();
-        lv_group_set_default(g);
-    }
-    lv_group_add_obj(g, notes_editor_ta);
-    lv_group_focus_obj(notes_editor_ta);
-}
-
-static void entry12_1(void)
-{
-    // Poll the keypad buffer often. The buffer absorbs bursts already, but a
-    // tight tick keeps perceived latency low between keypress and the next
-    // partial e-paper refresh.
-    notes_editor_kb_timer = lv_timer_create(notes_editor_kb_timer_cb, 20, NULL);
-
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-
-    ui_disp_full_refr();
-}
-
-static void exit12_1(void)
-{
-    if (notes_editor_kb_timer) {
-        lv_timer_del(notes_editor_kb_timer);
-        notes_editor_kb_timer = NULL;
-    }
-    lv_timer_pause(taskbar_update_timer);
-    ui_disp_full_refr();
-}
-
-static void destroy12_1(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-}
-
-scr_lifecycle_t screen12_1 = {
-    .create = create12_1,
-    .entry = entry12_1,
-    .exit  = exit12_1,
-    .destroy = destroy12_1,
-};
-#endif
-
-//************************************[ screen dict ]*************************************** Dictionary (EN -> PT-BR)
-#if 1
-static lv_obj_t  *dict_query_ta    = NULL;
-static lv_obj_t  *dict_result_lab  = NULL;
-static lv_timer_t *dict_kb_timer   = NULL;
-
-static void dict_do_lookup(void)
-{
-    if (!dict_query_ta || !dict_result_lab) return;
-    const char *q = lv_textarea_get_text(dict_query_ta);
-    if (!q || !*q) return;
-
-    // Trim trailing whitespace/newlines from the textarea before lookup.
-    char trimmed[64] = {0};
-    size_t out = 0;
-    for (size_t i = 0; q[i] && out < sizeof(trimmed) - 1; i++) {
-        unsigned char c = (unsigned char)q[i];
-        if (c >= 32 && c < 127) trimmed[out++] = (char)c;
-    }
-    while (out > 0 && trimmed[out - 1] == ' ') trimmed[--out] = '\0';
-    if (out == 0) return;
-
-    char *def = ui_dict_lookup(trimmed);
-    if (def) {
-        lv_label_set_text(dict_result_lab, def);
-        free(def);
-    } else if (!ui_dict_available()) {
-        lv_label_set_text(dict_result_lab, "Dictionary file missing.\n\nPlace eng-pob.tsv in /dict/\non the SD card.");
-    } else {
-        lv_label_set_text(dict_result_lab, "Word not found.");
-    }
-    ui_disp_full_refr();
-}
-
-static void dict_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 'E') {                       // Enter -> look up
-            dict_do_lookup();
-        } else if (key == 0x08) {               // Backspace
-            lv_textarea_del_char(dict_query_ta);
-        } else if (key == 0x1B) {               // Esc -> back home
-            scr_mgr_switch(SCREEN0_ID, false);
-            return;
-        } else if (key >= 32 && key <= 126) {
-            lv_textarea_add_char(dict_query_ta, key);
-        }
-    }
-}
-
-static void create_dict(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-
-    dict_query_ta = lv_textarea_create(parent);
-    lv_textarea_set_one_line(dict_query_ta, true);
-    lv_textarea_set_placeholder_text(dict_query_ta, "type word, press Enter");
-    lv_obj_set_size(dict_query_ta, lv_pct(100), 36);
-    lv_obj_align(dict_query_ta, LV_ALIGN_TOP_MID, 0, status_bar_height + 2);
-    lv_obj_set_style_text_font(dict_query_ta, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_textarea_set_text(dict_query_ta, "");
-
-    lv_group_t *g = lv_group_get_default();
-    if (!g) {
-        g = lv_group_create();
-        lv_group_set_default(g);
-    }
-    lv_group_add_obj(g, dict_query_ta);
-    lv_group_focus_obj(dict_query_ta);
-
-    dict_result_lab = lv_label_create(parent);
-    lv_obj_set_size(dict_result_lab, lv_pct(100) - 8, LV_VER_RES - status_bar_height - 50);
-    lv_obj_align(dict_result_lab, LV_ALIGN_TOP_MID, 0, status_bar_height + 44);
-    lv_obj_set_style_text_font(dict_result_lab, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_label_set_long_mode(dict_result_lab, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(dict_result_lab, "EN -> PT-BR\n\nType a word and press Enter.");
-}
-
-static void entry_dict(void)
-{
-    dict_kb_timer = lv_timer_create(dict_kb_timer_cb, 20, NULL);
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    ui_disp_full_refr();
-}
-
-static void exit_dict(void)
-{
-    if (dict_kb_timer) {
-        lv_timer_del(dict_kb_timer);
-        dict_kb_timer = NULL;
-    }
-    lv_timer_pause(taskbar_update_timer);
-    ui_disp_full_refr();
-}
-
-static void destroy_dict(void)
-{
-    if (menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-    dict_query_ta = NULL;
-    dict_result_lab = NULL;
-}
-
-scr_lifecycle_t screen_dict = {
-    .create  = create_dict,
-    .entry   = entry_dict,
-    .exit    = exit_dict,
-    .destroy = destroy_dict,
-};
-#endif
-
-//************************************[ screen 13 ]***************************************** Ebook Reader List
-#if 1
-
-static bool ends_with(const char *str, const char *suffix) {
-    if (!str || !suffix)
-        return false;
-    size_t len_str = strlen(str);
-    size_t len_suffix = strlen(suffix);
-    if (len_suffix > len_str)
-        return false;
-    return strncmp(str + len_str - len_suffix, suffix, len_suffix) == 0;
-}
-
-static lv_obj_t *reader_list_obj;
-static bool reader_use_sd = true; // Always use SD for ebooks
-// reader_selected_file, reader_resume_pending, and reader_resume_offset are
-// defined earlier in the file so the home-screen 'c' shortcut can reach them.
-static lv_group_t *reader_group = NULL;
-static lv_timer_t *reader_kb_timer = NULL;
-
-static void reader_apply_focus_style(lv_obj_t *btn)
-{
-    // Inverted (black bg + white text) when the row is focused via j/k.
-    lv_obj_set_style_bg_color(btn, lv_color_black(), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_opa(btn,   LV_OPA_COVER,    LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(btn, lv_color_white(), LV_PART_MAIN | LV_STATE_FOCUSED);
-}
-
-static void reader_list_update(void)
-{
-    lv_obj_clean(reader_list_obj);
-    if (reader_group) lv_group_remove_all_objs(reader_group);
-
-    char list[UI_READER_MAX_COUNT][32];
-    int count = 0;
-    ui_reader_get_list(reader_use_sd, list, &count);
-
-    for (int i = 0; i < count; i++) {
-        if (ends_with(list[i], ".txt") || ends_with(list[i], ".TXT")) {
-            lv_obj_t * btn = lv_list_add_btn(reader_list_obj, NULL, list[i]);
-            lv_obj_set_style_text_font(btn, FONT_BOLD_SIZE_14, LV_PART_MAIN);
-            reader_apply_focus_style(btn);
-            if (reader_group) lv_group_add_obj(reader_group, btn);
-        }
-    }
-}
-
-// Pulls the per-file bookmark for `name` and seeds the resume state so
-// SCREEN13_1 lands on the saved page instead of page 1.
-static void reader_seed_resume_for(const char *name)
-{
-    strncpy(reader_selected_file, name, 31);
-    reader_selected_file[31] = '\0';
-    size_t saved_off = 0;
-    if (ui_reader_bookmark_get(reader_selected_file, &saved_off)) {
-        reader_resume_offset = saved_off;
-        reader_resume_pending = true;
-    } else {
-        reader_resume_offset = 0;
-        reader_resume_pending = false;
-    }
-}
-
-static void reader_list_btn_event_cb(lv_event_t * e)
-{
-    lv_obj_t * obj = lv_event_get_target(e);
-    const char * name = lv_list_get_btn_text(reader_list_obj, obj);
-    if (name) {
-        reader_seed_resume_for(name);
-        scr_mgr_push(SCREEN13_1_ID, false);
-    }
-}
-
-static void scr13_back_btn_event_cb(lv_event_t * e)
-{
-    scr_mgr_pop(false);
-}
-
-static void reader_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (!reader_group) continue;
-        if (key == 'j') {
-            lv_group_focus_next(reader_group);
-            lv_obj_t *f = lv_group_get_focused(reader_group);
-            if (f) lv_obj_scroll_to_view(f, LV_ANIM_OFF);
-        } else if (key == 'k') {
-            lv_group_focus_prev(reader_group);
-            lv_obj_t *f = lv_group_get_focused(reader_group);
-            if (f) lv_obj_scroll_to_view(f, LV_ANIM_OFF);
-        } else if (key == 'E') {
-            lv_obj_t *f = lv_group_get_focused(reader_group);
-            if (f) {
-                const char *name = lv_list_get_btn_text(reader_list_obj, f);
-                if (name && name[0]) {
-                    reader_seed_resume_for(name);
-                    scr_mgr_push(SCREEN13_1_ID, false);
-                    return;
-                }
-            }
-        } else if (key == 0x1B) {
-            scr_mgr_pop(false);
-            return;
-        }
-    }
-}
-
-static void create13(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-
-    reader_list_obj = lv_list_create(parent);
-    lv_obj_set_size(reader_list_obj, lv_pct(100), LV_VER_RES - status_bar_height);
-    lv_obj_align(reader_list_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_event_cb(reader_list_obj, reader_list_btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    if (!reader_group) reader_group = lv_group_create();
-}
-
-static void entry13(void)
-{
-    reader_list_update();
-
-    // Focus first item so the selector is visible immediately.
-    if (reader_group) {
-        lv_obj_t *first = lv_obj_get_child(reader_list_obj, 0);
-        if (first) lv_group_focus_obj(first);
-    }
-
-    if (!reader_kb_timer) reader_kb_timer = lv_timer_create(reader_kb_timer_cb, 20, NULL);
-
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-}
-
-static void exit13(void) {
-    if (reader_kb_timer) {
-        lv_timer_del(reader_kb_timer);
-        reader_kb_timer = NULL;
-    }
-    lv_timer_pause(taskbar_update_timer);
-}
-
-static void destroy13(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-}
-
-scr_lifecycle_t screen13 = {
-    .create = create13,
-    .entry = entry13,
-    .exit  = exit13,
-    .destroy = destroy13,
-};
-#endif
-
-//************************************[ screen 13.1 ]*************************************** Ebook Reader View
-#if 1
-
-static lv_obj_t *reader_view_label;
-static lv_obj_t *reader_view_status;
-static lv_timer_t *reader_view_kb_timer = NULL;
-
-#define READER_PAGE_BYTES   1024
-#define READER_MAX_PAGES    2048
-
-static char  reader_page_buf[READER_PAGE_BYTES + 1];
-static size_t reader_file_size = 0;
-static size_t reader_page_offsets[READER_MAX_PAGES];
-static int    reader_pages_known = 0;   // number of valid offsets in the array
-static int    reader_page_idx = 0;
-
-// Reader font catalog. Each face has its own size list (lengths can differ
-// because LVGL's bitmap UNSCII only ships at 8 and 16 px, etc).
-//
-// E-ink notes:
-//  * Mono   = JetBrains Mono Bold (project-bundled). Heavy weight, monospace,
-//             reads cleanly down to 14 px on e-paper.
-//  * Sans   = LVGL Montserrat. Proportional sans-serif — classic ebook look.
-//  * Serif  = LVGL Montserrat Medium at larger sizes used as a contrast face.
-//             (LVGL doesn't ship a true serif; this slot holds a bigger,
-//             lighter Montserrat range so users have a visibly different
-//             second proportional option than "Sans".)
-//  * Pixel  = LVGL UNSCII bitmap. Pixel-perfect, no anti-aliasing — looks
-//             fantastic on e-paper at very small sizes.
-typedef struct {
-    const char       *name;
-    int               n_sizes;
-    const lv_font_t **fonts;
-    const int        *pts;
-} reader_face_t;
-
-static const lv_font_t *reader_mono_fonts[] = {
-    &Font_Mono_Bold_14, &Font_Mono_Bold_16, &Font_Mono_Bold_18, &Font_Mono_Bold_20
-};
-static const int reader_mono_pts[] = {14, 16, 18, 20};
-
-static const lv_font_t *reader_sans_fonts[] = {
-    &lv_font_montserrat_12, &lv_font_montserrat_14,
-    &lv_font_montserrat_16, &lv_font_montserrat_18
-};
-static const int reader_sans_pts[] = {12, 14, 16, 18};
-
-static const lv_font_t *reader_serif_fonts[] = {
-    &lv_font_montserrat_14, &lv_font_montserrat_18, &lv_font_montserrat_20
-};
-static const int reader_serif_pts[] = {14, 18, 20};
-
-static const lv_font_t *reader_pixel_fonts[] = {
-    &lv_font_unscii_8, &lv_font_unscii_16
-};
-static const int reader_pixel_pts[] = {8, 16};
-
-// Spleen — modern pixel font designed for HiDPI / small displays. BSD.
-static const lv_font_t *reader_spleen_fonts[] = {
-    &lv_font_spleen_5x8, &lv_font_spleen_8x16,
-    &lv_font_spleen_12x24, &lv_font_spleen_16x32
-};
-static const int reader_spleen_pts[] = {8, 16, 24, 32};
-
-// Tamzen — sharp programmer pixel font. MIT-style.
-static const lv_font_t *reader_tamzen_fonts[] = {
-    &lv_font_tamzen_6x12, &lv_font_tamzen_8x16, &lv_font_tamzen_10x20
-};
-static const int reader_tamzen_pts[] = {12, 16, 20};
-
-// Tiny — Tom Thumb 3x5, public domain. The smallest legible Latin font.
-static const lv_font_t *reader_tiny_fonts[] = {&lv_font_tom_thumb};
-static const int reader_tiny_pts[] = {6};
-
-static const reader_face_t reader_faces[] = {
-    {"Mono",   4, reader_mono_fonts,   reader_mono_pts},
-    {"Sans",   4, reader_sans_fonts,   reader_sans_pts},
-    {"Serif",  3, reader_serif_fonts,  reader_serif_pts},
-    {"Pixel",  2, reader_pixel_fonts,  reader_pixel_pts},
-    {"Spleen", 4, reader_spleen_fonts, reader_spleen_pts},
-    {"Tamzen", 3, reader_tamzen_fonts, reader_tamzen_pts},
-    {"Tiny",   1, reader_tiny_fonts,   reader_tiny_pts},
-};
-#define READER_FACE_COUNT ((int)(sizeof(reader_faces)/sizeof(reader_faces[0])))
-
-static const reader_face_t* reader_face_for_slot(int slot)
-{
-    int f = ui_font_face_get(slot);
-    if (f < 0 || f >= READER_FACE_COUNT) f = 0;
-    return &reader_faces[f];
-}
-
-static int reader_size_clamped_slot(int slot)
-{
-    const reader_face_t *fc = reader_face_for_slot(slot);
-    int s = ui_font_size_get(slot);
-    if (s < 0) s = 0;
-    if (s >= fc->n_sizes) s = fc->n_sizes - 1;
-    return s;
-}
-
-static const lv_font_t* reader_font_for_slot(int slot)
-{
-    return reader_face_for_slot(slot)->fonts[reader_size_clamped_slot(slot)];
-}
-
-// Convenience accessors for each slot's resolved font.
-static const lv_font_t* topbar_font_get(void)        { return reader_font_for_slot(UI_FONT_SLOT_TOPBAR); }
-static const lv_font_t* reader_body_font_get(void)   { return reader_font_for_slot(UI_FONT_SLOT_READER_BODY); }
-static const lv_font_t* reader_footer_font_get(void) { return reader_font_for_slot(UI_FONT_SLOT_READER_FOOTER); }
-
-static const lv_font_t* ui_get_font(int pt, bool force_mono)
-{
-    if (force_mono) {
-        // Find the best Mono Bold font for the requested size.
-        // We have 14, 15, 16, 17, 18, 19, 20.
-        if (pt <= 14) return &Font_Mono_Bold_14;
-        if (pt == 15) return &Font_Mono_Bold_15;
-        if (pt == 16) return &Font_Mono_Bold_16;
-        if (pt == 17) return &Font_Mono_Bold_17;
-        if (pt == 18) return &Font_Mono_Bold_18;
-        if (pt == 19) return &Font_Mono_Bold_19;
-        return &Font_Mono_Bold_20;
-    }
-
-    // Non-mono: every general-UI label resolves through here, so route them
-    // all through the General slot. The `pt` argument becomes a hint that the
-    // selected size index can override — this preserves the prior behavior
-    // that all general labels follow one face/size choice.
-    return reader_font_for_slot(UI_FONT_SLOT_GENERAL);
-}
-
-static const char* reader_font_face_label(int slot)
-{
-    return reader_face_for_slot(slot)->name;
-}
-
-static int reader_font_size_pt(int slot)
-{
-    return reader_face_for_slot(slot)->pts[reader_size_clamped_slot(slot)];
-}
-
-static void reader_font_step_face(int slot, int dir)
-{
-    int f = (ui_font_face_get(slot) + dir + READER_FACE_COUNT) % READER_FACE_COUNT;
-    ui_font_face_set(slot, f);
-    // Clamp size to new face's range so we don't index past the new size list.
-    int max = reader_faces[f].n_sizes - 1;
-    if (ui_font_size_get(slot) > max) ui_font_size_set(slot, max);
-}
-static void reader_font_step_size(int slot, int dir)
-{
-    int n = reader_face_for_slot(slot)->n_sizes;
-    ui_font_size_set(slot, (ui_font_size_get(slot) + dir + n) % n);
-}
-static void reader_font_cycle_face(int slot) { reader_font_step_face(slot, +1); }
-static void reader_font_cycle_size(int slot) { reader_font_step_size(slot, +1); }
-
-static void scr13_1_back_btn_event_cb(lv_event_t * e)
-{
-    scr_mgr_pop(false);
-}
-
-// The fixed-size byte buffer can hold more text than the label can show at
-// the current font/size/orientation — without this clipping the surplus
-// bytes were being silently skipped (next_off jumped past unread text).
-// Walks the buffer line-by-line using LVGL's wrap routine and returns the
-// byte index just past the last line that fully fits in the label.
-static size_t reader_clip_to_visible(size_t got)
-{
-    if (got == 0 || reader_view_label == NULL) return got;
-    const lv_font_t *font = reader_body_font_get();
-    lv_coord_t line_h = lv_font_get_line_height(font);
-    lv_coord_t letter_space = lv_obj_get_style_text_letter_space(reader_view_label, LV_PART_MAIN);
-    lv_coord_t line_space = lv_obj_get_style_text_line_space(reader_view_label, LV_PART_MAIN);
-    lv_obj_update_layout(reader_view_label);
-    lv_coord_t max_w = lv_obj_get_content_width(reader_view_label);
-    lv_coord_t avail_h = lv_obj_get_content_height(reader_view_label);
-    if (max_w <= 0 || avail_h <= 0 || line_h <= 0) return got;
-
-    // _lv_txt_get_next_line scans a NUL-terminated string; make sure the
-    // buffer is terminated at `got` so it doesn't read past valid data.
-    reader_page_buf[got] = '\0';
-
-    size_t pos = 0;
-    lv_coord_t y = 0;
-    while (pos < got) {
-        uint32_t consumed = _lv_txt_get_next_line(reader_page_buf + pos, font,
-                                                  letter_space, max_w, NULL,
-                                                  LV_TEXT_FLAG_NONE);
-        if (consumed == 0) break;
-        if (y + line_h > avail_h) {
-            // This line wouldn't fit fully — push it (and everything after)
-            // to the next page by truncating here.
-            return pos;
-        }
-        pos += consumed;
-        y += line_h + line_space;
-    }
-    return got;
-}
-
-// Reads and trims one page starting at `off` into reader_page_buf, applying
-// the same word-boundary and visible-line-fit rules as
-// reader_load_current_page. Returns the byte count consumed (== the page
-// size) or 0 at EOF. Used both by the renderer and by reader_seek_to_offset
-// to silently walk page boundaries.
-static size_t reader_read_one_page(size_t off)
-{
-    size_t got = ui_reader_read_range(reader_use_sd, reader_selected_file,
-                                      off, reader_page_buf, sizeof(reader_page_buf));
-    if (got == 0) return 0;
-
-    // If we filled the buffer and aren't at EOF, back up to the last whitespace
-    // so we don't cut a word in half.
-    bool at_eof = (off + got >= reader_file_size);
-    if (!at_eof && got > 64) {
-        for (size_t i = got - 1; i > got / 2; i--) {
-            char c = reader_page_buf[i];
-            if (c == '\n' || c == ' ' || c == '\t') {
-                reader_page_buf[i] = '\0';
-                got = i;
-                break;
-            }
-        }
-    }
-
-    // Trim to the last fully-visible line so the partial bottom row that
-    // would otherwise clip against the footer rolls onto the next page.
-    size_t visible_got = reader_clip_to_visible(got);
-    if (visible_got < got) {
-        got = visible_got;
-        reader_page_buf[got] = '\0';
-    }
-
-    return got;
-}
-
-// The bundled fonts (Tamzen, Spleen, UNSCII, Montserrat subset, Mono Bold,
-// Tom Thumb) only carry ASCII / basic Latin glyphs, so common ebook
-// typography (curly quotes, em/en dashes, ellipsis, NBSP, ...) renders as
-// LVGL "tofu" boxes. Fold the well-known codepoints to ASCII at display
-// time; pass-through unknown UTF-8 so any font that *does* have the glyph
-// (or its tofu) still works.
-//
-// Substitutions are all same-length-or-shorter than the source bytes, so
-// READER_PAGE_BYTES is a safe upper bound for the destination.
-static size_t reader_normalize_for_display(const char *src, size_t src_len,
-                                           char *dst, size_t dst_size)
-{
-    size_t i = 0, j = 0;
-    if (dst_size == 0) return 0;
-    while (i < src_len && j + 1 < dst_size) {
-        unsigned char c = (unsigned char)src[i];
-        if (c < 0x80) { dst[j++] = src[i++]; continue; }
-
-        const char *rep = NULL;
-        size_t seq = 1;
-        if ((c & 0xE0) == 0xC0 && i + 1 < src_len) {
-            seq = 2;
-            uint32_t cp = ((c & 0x1F) << 6) | ((unsigned char)src[i+1] & 0x3F);
-            switch (cp) {
-                case 0x00A0: rep = " ";  break; // NBSP
-                case 0x00AD: rep = "";   break; // soft hyphen
-                case 0x00AB: rep = "<<"; break; // «
-                case 0x00BB: rep = ">>"; break; // »
-                case 0x00B7: rep = ".";  break; // middle dot
-            }
-        } else if ((c & 0xF0) == 0xE0 && i + 2 < src_len) {
-            seq = 3;
-            uint32_t cp = ((c & 0x0F) << 12)
-                        | (((unsigned char)src[i+1] & 0x3F) << 6)
-                        |  ((unsigned char)src[i+2] & 0x3F);
-            switch (cp) {
-                case 0x2018: case 0x2019: case 0x201B:
-                case 0x2032: case 0x2035:           rep = "'";   break;
-                case 0x201A:                        rep = ",";   break;
-                case 0x201C: case 0x201D: case 0x201F:
-                case 0x2033: case 0x2036:           rep = "\"";  break;
-                case 0x201E:                        rep = ",,";  break;
-                case 0x2010: case 0x2011: case 0x2012:
-                case 0x2013: case 0x2212:           rep = "-";   break;
-                case 0x2014: case 0x2015:           rep = "--";  break;
-                case 0x2022: case 0x25CF:           rep = "*";   break;
-                case 0x2026:                        rep = "..."; break;
-                case 0x00A0:                        rep = " ";   break;
-            }
-        } else if ((c & 0xF8) == 0xF0) {
-            seq = 4;
-        }
-
-        if (rep) {
-            while (*rep && j + 1 < dst_size) dst[j++] = *rep++;
-            i += seq;
-        } else {
-            // Pass UTF-8 sequence through untouched so fonts that do carry
-            // the glyph still render it.
-            size_t end = i + seq;
-            if (end > src_len) end = src_len;
-            while (i < end && j + 1 < dst_size) dst[j++] = src[i++];
-        }
-    }
-    dst[j] = '\0';
-    return j;
-}
-
-// Loads the chunk at reader_page_offsets[reader_page_idx], trims to a clean
-// word boundary, and records the next page's offset.
-static void reader_load_current_page(void)
-{
-    size_t off = reader_page_offsets[reader_page_idx];
-    size_t got = reader_read_one_page(off);
-    if (got == 0) {
-        lv_label_set_text(reader_view_label, "(end of file)");
-        return;
-    }
-
-    // Record the next page's start offset if it's the first time we see it.
-    // Note: we record the raw file-byte count (`got`) so pagination matches
-    // the on-disk text, then normalize a separate display copy below.
-    int next_idx = reader_page_idx + 1;
-    if (next_idx >= reader_pages_known && reader_pages_known < READER_MAX_PAGES) {
-        reader_page_offsets[reader_pages_known] = off + got;
-        reader_pages_known = next_idx + 1;
-    }
-
-    static char reader_display_buf[READER_PAGE_BYTES + 1];
-    reader_normalize_for_display(reader_page_buf, got,
-                                 reader_display_buf, sizeof(reader_display_buf));
-    lv_label_set_text(reader_view_label, reader_display_buf);
-
-    // Status footer: page number + byte progress
-    if (reader_view_status) {
-        int pct = reader_file_size ? (int)((100ULL * (off + got)) / reader_file_size) : 0;
-        lv_label_set_text_fmt(reader_view_status, "p.%d  %d%%",
-                              reader_page_idx + 1, pct);
-    }
-}
-
-// Walks page boundaries forward from offset 0 using the same trimming rules
-// as the renderer, populating reader_page_offsets[0..N] until reaching the
-// page that contains `target`. Sets reader_page_idx and reader_pages_known
-// so the resumed reader has a correct page number and can navigate back to
-// every page leading up to the target. Falls through gracefully at EOF and
-// when target falls slightly off a page boundary (e.g., font changed since
-// the bookmark was saved).
-static void reader_seek_to_offset(size_t target)
-{
-    reader_page_offsets[0] = 0;
-    reader_pages_known = 1;
-    reader_page_idx = 0;
-
-    if (target == 0 || reader_file_size == 0) return;
-
-    int idx = 0;
-    while (idx + 1 < READER_MAX_PAGES) {
-        size_t off = reader_page_offsets[idx];
-        size_t got = reader_read_one_page(off);
-        if (got == 0) {
-            // Hit EOF before reaching the saved offset (file shrank or
-            // pagination drifted). Land on the last valid page.
-            reader_page_idx = idx;
-            return;
-        }
-        size_t next_off = off + got;
-        if (next_off > target) {
-            // Target falls inside page `idx`.
-            reader_page_idx = idx;
-            return;
-        }
-        idx++;
-        reader_page_offsets[idx] = next_off;
-        reader_pages_known = idx + 1;
-        if (next_off == target) {
-            // Target is exactly the start of page `idx`.
-            reader_page_idx = idx;
-            return;
-        }
-    }
-    // Walked the whole array without reaching target; stick at the last slot.
-    reader_page_idx = idx;
-}
-
-static void reader_apply_font_and_reflow(void)
-{
-    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
-    lv_obj_set_style_text_line_space(reader_view_label, ui_reader_line_space_get(), LV_PART_MAIN);
-    if (reader_view_status) {
-        lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
-    }
-    // Page byte boundaries depend on file content, not font, so we keep the
-    // current offset but invalidate any pre-computed page after this one —
-    // the *visible* page changes (different font = different wrap) but the
-    // start offset is still valid. Forward pages will be re-recorded as the
-    // user advances.
-    reader_pages_known = reader_page_idx + 1;
-    reader_load_current_page();
-}
-
-static void reader_apply_rotation(void)
-{
-    ui_set_reader_landscape(ui_reader_rotation_get() == 1);
-}
-
-// Resize page label + status footer for the current orientation. Called on
-// entry and on the 'r' rotation toggle: the label height is in pixels, so
-// it does not auto-adapt when LV_VER_RES flips between 240 and 320.
-static void reader_apply_layout(void)
-{
-    int status_bar_height = ui_reader_bars_hidden_get() ? 14 : 25;
-    int footer_height     = ui_reader_bars_hidden_get() ? 8 : 24;
-    int pad_left = 10;
-    if (menu_taskbar) {
-        if (ui_reader_bars_hidden_get()) lv_obj_add_flag(menu_taskbar, LV_OBJ_FLAG_HIDDEN);
-        else                    lv_obj_clear_flag(menu_taskbar, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (reader_view_label) {
-        lv_obj_set_size(reader_view_label, lv_pct(100),
-                        LV_VER_RES - status_bar_height - footer_height);
-        lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, status_bar_height);
-        lv_obj_set_style_pad_left(reader_view_label, pad_left, LV_PART_MAIN);
-    }
-    if (reader_view_status) {
-        if (ui_reader_bars_hidden_get()) {
-            lv_obj_add_flag(reader_view_status, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_clear_flag(reader_view_status, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_size(reader_view_status, lv_pct(100), footer_height);
-            lv_obj_align(reader_view_status, LV_ALIGN_BOTTOM_MID, 0, 0);
-            lv_obj_set_style_pad_left(reader_view_status, pad_left, LV_PART_MAIN);
-        }
-    }
-}
-
-static void reader_view_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    bool changed = false;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc -> back to list
-            scr_mgr_pop(false);
-            return;
-        } else if (key == 'j') { // next page
-            size_t next_off = (reader_page_idx + 1 < reader_pages_known)
-                                ? reader_page_offsets[reader_page_idx + 1] : 0;
-            if (reader_page_idx + 1 < reader_pages_known && next_off < reader_file_size) {
-                reader_page_idx++;
-                changed = true;
-            }
-        } else if (key == 'k') { // prev page
-            if (reader_page_idx > 0) {
-                reader_page_idx--;
-                changed = true;
-            }
-        } else if (key == 'f') { // cycle reader body font face
-            reader_font_cycle_face(UI_FONT_SLOT_READER_BODY);
-            reader_apply_font_and_reflow();
-            ui_disp_full_refr();
-        } else if (key == 's') { // cycle reader body font size
-            reader_font_cycle_size(UI_FONT_SLOT_READER_BODY);
-            reader_apply_font_and_reflow();
-            ui_disp_full_refr();
-        } else if (key == 'b') { // toggle topbar battery icon + %
-            ui_topbar_show_battery_set(!ui_topbar_show_battery_get());
-            ui_taskbar_apply_battery_visibility();
-            ui_disp_full_refr();
-        } else if (key == 'h') { // toggle top/bottom bars for distraction-free reading
-            ui_reader_bars_hidden_set(!ui_reader_bars_hidden_get());
-            reader_apply_layout();
-            // Body region just grew/shrank, so forward page boundaries no
-            // longer line up with the new visible height — invalidate them
-            // and reflow the current page against the new clip rect.
-            reader_apply_font_and_reflow();
-            ui_disp_full_refr();
-        } else if (key == 'r') { // toggle portrait/landscape
-            // The TCA8418 occasionally emits two press events for a single
-            // physical key tap (no software debounce in peri_keypad), and
-            // because this loop drains all queued keys per tick, two 'r's
-            // would toggle rotation back to the original — causing a
-            // visible mid-tick portrait flush followed by a landscape one.
-            // Debounce: ignore further 'r' presses within 300 ms.
-            static uint32_t last_rot_ms = 0;
-            uint32_t now = lv_tick_get();
-            if (now - last_rot_ms < 300) continue;
-            last_rot_ms = now;
-
-            ui_reader_rotation_set(!ui_reader_rotation_get());
-            reader_apply_rotation();
-            // The label height is fixed in pixels, so it does not adapt
-            // to the new LV_VER_RES on its own — re-run the layout.
-            reader_apply_layout();
-            // After rotation the label width changes, so forward page
-            // boundaries no longer line up — invalidate them and reload.
-            reader_apply_font_and_reflow();
-            ui_disp_full_refr();
-        }
-    }
-    if (changed) {
-        reader_load_current_page();
-        // Page flips just swap text; let LVGL push them via the panel's fast
-        // partial refresh (no clean/flicker cycle). Ghost pixels accumulate,
-        // so do one clean full refresh every N pages to clear them.
-        static int partial_pages_since_full = 0;
-        const int FULL_REFRESH_EVERY = 8;
-        if (++partial_pages_since_full >= FULL_REFRESH_EVERY) {
-            partial_pages_since_full = 0;
-            ui_disp_full_refr();
-        }
-    }
-}
-
-static void create13_1(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-    int footer_height = 24;
-
-    reader_view_label = lv_label_create(parent);
-    lv_obj_set_size(reader_view_label, lv_pct(100),
-                    LV_VER_RES - status_bar_height - footer_height);
-    lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, status_bar_height);
-    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
-    lv_obj_set_style_text_line_space(reader_view_label, ui_reader_line_space_get(), LV_PART_MAIN);
-    lv_label_set_long_mode(reader_view_label, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(reader_view_label, "");
-
-    reader_view_status = lv_label_create(parent);
-    lv_obj_set_size(reader_view_status, lv_pct(100), footer_height);
-    lv_obj_align(reader_view_status, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(reader_view_status, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(reader_view_status, LV_OPA_COVER, LV_PART_MAIN);
-    lv_label_set_text(reader_view_status, "");
-}
-
-static void entry13_1(void)
-{
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-
-    // Apply rotation first; it affects screen dims that the layout reads.
-    reader_apply_rotation();
-
-    // The taskbar was built in create13_1 while still in portrait, so its
-    // width was captured at 240. After rotating to landscape (320) the
-    // right-aligned status cluster (battery, charge, wifi) would otherwise
-    // sit ~80 px shy of the true right edge.
-    if (menu_taskbar) {
-        lv_obj_set_width(menu_taskbar, LV_HOR_RES);
-    }
-
-    // Same story for the page label and footer: their heights were sized
-    // off LV_VER_RES at create time (portrait 320) and would overflow in
-    // landscape (240). reader_apply_layout re-clamps them and applies the
-    // landscape left padding.
-    reader_apply_layout();
-
-    // Re-apply font in case it was changed in settings since last visit.
-    lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
-    lv_obj_set_style_text_line_space(reader_view_label, ui_reader_line_space_get(), LV_PART_MAIN);
-    if (reader_view_status) {
-        lv_obj_set_style_text_font(reader_view_status, reader_footer_font_get(), LV_PART_MAIN);
-    }
-
-    // Open the file once and cache its handle for the lifetime of the view.
-    // Every page read (resume seek, j/k page flip, font reflow) now reuses
-    // this handle instead of reopening, which used to dominate cold-load time
-    // on long books — the resume walk reads one ~1 KB chunk per page from 0
-    // to the saved offset, and reopening through SD on the shared SPI bus
-    // for each of those was the bottleneck.
-    reader_file_size = ui_reader_open_view(reader_use_sd, reader_selected_file);
-    // If the home-screen 'c' shortcut launched us with a saved offset for
-    // this file, walk page boundaries from offset 0 up to that point so
-    // both the page number and back-navigation are correct from the very
-    // first render. (Previously we just seeded offsets[0] with the saved
-    // offset, which made every resumed session look like "page 1" with no
-    // history.)
-    size_t target_off = 0;
-    if (reader_resume_pending && reader_resume_offset < reader_file_size) {
-        target_off = reader_resume_offset;
-    }
-    reader_resume_pending = false;
-    reader_resume_offset = 0;
-    reader_seek_to_offset(target_off);
-
-    if (reader_file_size == 0) {
-        lv_label_set_text_fmt(reader_view_label,
-            "Could not open file.\n\nFile: %s",
-            reader_selected_file);
-        if (reader_view_status) lv_label_set_text(reader_view_status, "");
-    } else {
-        reader_load_current_page();
-    }
-
-    if (!reader_view_kb_timer) {
-        reader_view_kb_timer = lv_timer_create(reader_view_kb_timer_cb, 20, NULL);
-    }
-    ui_disp_full_refr();
-}
-
-static void exit13_1(void)
-{
-    // Persist the page the user was on so the home-screen 'c' shortcut can
-    // resume here next time. Save the byte offset of the *current* page
-    // start, not the next page, so 'c' lands on the same page they left.
-    if (reader_selected_file[0] && reader_file_size > 0 &&
-        reader_page_idx >= 0 && reader_page_idx < reader_pages_known) {
-        ui_reader_resume_set(reader_selected_file,
-                             reader_page_offsets[reader_page_idx]);
-    }
-
-    lv_timer_pause(taskbar_update_timer);
-    if (reader_view_kb_timer) {
-        lv_timer_del(reader_view_kb_timer);
-        reader_view_kb_timer = NULL;
-    }
-    ui_reader_close_view();
-    // Other screens are laid out for portrait — restore on the way out so
-    // the rest of the UI doesn't render rotated.
-    ui_set_reader_landscape(false);
-    ui_disp_full_refr();
-}
-
-static void destroy13_1(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-}
-
-scr_lifecycle_t screen13_1 = {
-    .create = create13_1,
-    .entry = entry13_1,
-    .exit  = exit13_1,
-    .destroy = destroy13_1,
-};
-#endif
-
-//************************************[ screen 13.2 ]*************************************** Reader Font
-#if 1
-
-static lv_obj_t *system_font_slot_btn = NULL;
-static lv_obj_t *system_font_face_btn = NULL;
-static lv_obj_t *system_font_size_btn = NULL;
-static lv_obj_t *system_font_lsp_btn  = NULL;
-static lv_obj_t *system_font_preview = NULL;
-static lv_timer_t *system_font_kb_timer = NULL;
-
-// j/k navigates between the four buttons (Slot, Face, Size, Line space).
-// Enter toggles "edit mode" on the focused button — while editing, j/k
-// cycles that button's value instead of moving focus. Esc exits edit mode
-// if active, otherwise pops the screen. The Slot button picks which font
-// slot the Face/Size buttons (and the live preview) operate on. The Line
-// space button is reader-only and adjusts the gap between text lines in
-// the reader body label.
-typedef enum {
-    SF_FOCUS_SLOT = 0,
-    SF_FOCUS_FACE = 1,
-    SF_FOCUS_SIZE = 2,
-    SF_FOCUS_LSP  = 3,
-    SF_FOCUS_COUNT = 4,
-} system_font_focus_t;
-static system_font_focus_t system_font_focus = SF_FOCUS_SLOT;
-static int  system_font_slot = UI_FONT_SLOT_GENERAL;
-static bool system_font_editing = false;
-
-static const char* system_font_slot_label(int slot)
-{
-    switch (slot) {
-        case UI_FONT_SLOT_GENERAL:       return "General";
-        case UI_FONT_SLOT_TOPBAR:        return "Top bar";
-        case UI_FONT_SLOT_READER_BODY:   return "Reader body";
-        case UI_FONT_SLOT_READER_FOOTER: return "Reader footer";
-        default:                         return "?";
-    }
-}
-
-static void system_font_step_slot(int dir)
-{
-    int s = (system_font_slot + dir + UI_FONT_SLOT_COUNT) % UI_FONT_SLOT_COUNT;
-    system_font_slot = s;
-}
-
-static void system_font_apply_focus_style(void)
-{
-    if (!system_font_slot_btn || !system_font_face_btn ||
-        !system_font_size_btn || !system_font_lsp_btn) return;
-
-    lv_obj_t *btns[SF_FOCUS_COUNT] = {
-        system_font_slot_btn, system_font_face_btn,
-        system_font_size_btn, system_font_lsp_btn
-    };
-    for (int i = 0; i < SF_FOCUS_COUNT; i++) {
-        bool focused = (i == (int)system_font_focus);
-        bool editing = focused && system_font_editing;
-        if (editing) {
-            // Inverted: black bg, white text — clearly distinct from focused.
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 3, LV_PART_MAIN);
-        } else if (focused) {
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 3, LV_PART_MAIN);
-        } else {
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 1, LV_PART_MAIN);
-        }
-    }
-}
-
-static void system_font_refresh_labels(void)
-{
-    int slot = system_font_slot;
-    if (system_font_slot_btn) {
-        lv_obj_t *lab = lv_obj_get_child(system_font_slot_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Slot: %s", system_font_slot_label(slot));
-    }
-    if (system_font_face_btn) {
-        lv_obj_t *lab = lv_obj_get_child(system_font_face_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Face: %s", reader_font_face_label(slot));
-    }
-    if (system_font_size_btn) {
-        lv_obj_t *lab = lv_obj_get_child(system_font_size_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Size: %d", reader_font_size_pt(slot));
-    }
-    if (system_font_lsp_btn) {
-        lv_obj_t *lab = lv_obj_get_child(system_font_lsp_btn, 0);
-        if (lab) lv_label_set_text_fmt(lab, "Line space: %d px", ui_reader_line_space_get());
-    }
-    if (system_font_preview) {
-        lv_obj_set_style_text_font(system_font_preview, reader_font_for_slot(slot), LV_PART_MAIN);
-        lv_obj_set_style_text_line_space(system_font_preview, ui_reader_line_space_get(), LV_PART_MAIN);
-    }
-    system_font_apply_focus_style();
-}
-
-// Step the reader line spacing in 2-px increments and wrap within [0, 16].
-// 2 px keeps the option count small while still giving a visible difference
-// on the e-paper at the reader body's font sizes.
-static void system_font_step_line_space(int dir)
-{
-    int step = 2;
-    int v = ui_reader_line_space_get() + dir * step;
-    if (v > 16) v = 0;
-    if (v < 0)  v = 16;
-    ui_reader_line_space_set(v);
-}
-
-static void system_font_step_focused(int dir)
-{
-    int slot = system_font_slot;
-    if      (system_font_focus == SF_FOCUS_SLOT) system_font_step_slot(dir);
-    else if (system_font_focus == SF_FOCUS_FACE) reader_font_step_face(slot, dir);
-    else if (system_font_focus == SF_FOCUS_SIZE) reader_font_step_size(slot, dir);
-    else                                         system_font_step_line_space(dir);
-}
-
-static void system_font_kb_timer_cb(lv_timer_t *t)
-{
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc
-            if (system_font_editing) {
-                system_font_editing = false;
-                system_font_apply_focus_style();
-            } else {
-                scr_mgr_pop(false);
-                return;
-            }
-        } else if (key == 'E') { // Enter -> toggle edit mode
-            system_font_editing = !system_font_editing;
-            system_font_apply_focus_style();
-        } else if (key == 'j') {
-            if (system_font_editing) {
-                system_font_step_focused(+1);
-                system_font_refresh_labels();
-            } else if ((int)system_font_focus < SF_FOCUS_COUNT - 1) {
-                system_font_focus = (system_font_focus_t)((int)system_font_focus + 1);
-                system_font_apply_focus_style();
-            }
-        } else if (key == 'k') {
-            if (system_font_editing) {
-                system_font_step_focused(-1);
-                system_font_refresh_labels();
-            } else if ((int)system_font_focus > 0) {
-                system_font_focus = (system_font_focus_t)((int)system_font_focus - 1);
-                system_font_apply_focus_style();
-            }
-        }
-    }
-}
-
-static void system_font_slot_event_cb(lv_event_t *e)
-{
-    if (e->code != LV_EVENT_CLICKED) return;
-    system_font_step_slot(+1);
-    system_font_refresh_labels();
-}
-
-static void system_font_face_event_cb(lv_event_t *e)
-{
-    if (e->code != LV_EVENT_CLICKED) return;
-    reader_font_cycle_face(system_font_slot);
-    system_font_refresh_labels();
-}
-
-static void system_font_size_event_cb(lv_event_t *e)
-{
-    if (e->code != LV_EVENT_CLICKED) return;
-    reader_font_cycle_size(system_font_slot);
-    system_font_refresh_labels();
-}
-
-static void system_font_lsp_event_cb(lv_event_t *e)
-{
-    if (e->code != LV_EVENT_CLICKED) return;
-    system_font_step_line_space(+1);
-    system_font_refresh_labels();
-}
-
-static void create13_2(lv_obj_t *parent)
-{
-    ui_taskbar_create(parent);
-    int status_bar_height = 25;
-
-    lv_obj_t *cont = lv_obj_create(parent);
-    lv_obj_set_size(cont, lv_pct(100), LV_VER_RES - status_bar_height);
-    lv_obj_align(cont, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(cont, 8, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(cont, 8, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
-
-    system_font_slot_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_slot_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_slot_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_slot_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_slot_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_slot_btn, 5, LV_PART_MAIN);
-    lv_obj_t *sloblbl = lv_label_create(system_font_slot_btn);
-    lv_obj_set_style_text_font(sloblbl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(sloblbl);
-    lv_obj_add_event_cb(system_font_slot_btn, system_font_slot_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_face_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_face_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_face_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_face_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_face_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_face_btn, 5, LV_PART_MAIN);
-    lv_obj_t *fl = lv_label_create(system_font_face_btn);
-    lv_obj_set_style_text_font(fl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(fl);
-    lv_obj_add_event_cb(system_font_face_btn, system_font_face_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_size_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_size_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_size_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_size_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_size_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_size_btn, 5, LV_PART_MAIN);
-    lv_obj_t *sl = lv_label_create(system_font_size_btn);
-    lv_obj_set_style_text_font(sl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(sl);
-    lv_obj_add_event_cb(system_font_size_btn, system_font_size_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_lsp_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_lsp_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_lsp_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_lsp_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_lsp_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_lsp_btn, 5, LV_PART_MAIN);
-    lv_obj_t *lsl = lv_label_create(system_font_lsp_btn);
-    lv_obj_set_style_text_font(lsl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(lsl);
-    lv_obj_add_event_cb(system_font_lsp_btn, system_font_lsp_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_preview = lv_label_create(cont);
-    lv_obj_set_width(system_font_preview, lv_pct(100));
-    lv_label_set_long_mode(system_font_preview, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(system_font_preview,
-        "The quick brown fox jumps over the lazy dog. 0123456789");
-}
-
-static void entry13_2(void)
-{
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
-    system_font_focus = SF_FOCUS_SLOT;
-    system_font_slot = UI_FONT_SLOT_GENERAL;
-    system_font_editing = false;
-    system_font_refresh_labels();
-    if (!system_font_kb_timer)
-        system_font_kb_timer = lv_timer_create(system_font_kb_timer_cb, 20, NULL);
-}
-
-static void exit13_2(void)
-{
-    if (system_font_kb_timer) {
-        lv_timer_del(system_font_kb_timer);
-        system_font_kb_timer = NULL;
-    }
-    lv_timer_pause(taskbar_update_timer);
-}
-
-static void destroy13_2(void) {
-    if (menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-    system_font_slot_btn = NULL;
-    system_font_face_btn = NULL;
-    system_font_size_btn = NULL;
-    system_font_lsp_btn  = NULL;
-    system_font_preview = NULL;
-}
-
-scr_lifecycle_t screen13_2 = {
-    .create  = create13_2,
-    .entry   = entry13_2,
-    .exit    = exit13_2,
-    .destroy = destroy13_2,
-};
-#endif
-
-

@@ -252,6 +252,17 @@ int scr_mgr_get_curr_scr_id(void)
     return -1;
 }
 
+/* Return the lifecycle table for the currently active screen, or NULL if
+ * no screen is on the stack.  Used by the global keypad-dispatch timer
+ * to call the current screen's on_key() hook without a switch/if chain. */
+scr_lifecycle_t *scr_mgr_get_curr_life(void)
+{
+    if (scr_stack_top) {
+        return scr_stack_top->life;
+    }
+    return NULL;
+}
+
 // set anim
 void scr_mgr_set_anim(lv_scr_load_anim_t sw, lv_scr_load_anim_t push, lv_scr_load_anim_t pop)
 {

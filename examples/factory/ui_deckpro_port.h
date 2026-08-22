@@ -312,6 +312,22 @@ void ui_reader_resume_set(const char *filename, size_t offset);
 // or false if no bookmark exists for it.
 bool ui_reader_bookmark_get(const char *filename, size_t *offset);
 
+// Per-file page-index bookmark (§3.5).
+//
+// Stores and retrieves the LVGL reader page index (i.e. the index into
+// reader_page_offsets[]) alongside the byte-offset bookmark so that
+// ui_reader_resume can start rendering at the saved page directly instead
+// of walking the full O(n) offset array from page 0.
+//
+// Call ui_reader_bookmark_page_set() whenever ui_reader_resume_set() is
+// called, passing the current page index. On resume, call
+// ui_reader_bookmark_page_get() first; if it returns true, seed
+// reader_page_offsets[0] = saved_byte_offset and start at saved_page_index
+// (invalidate on geometry/font change by clearing both keys when those
+// settings change).
+void ui_reader_bookmark_page_set(const char *filename, int page_index);
+bool ui_reader_bookmark_page_get(const char *filename, int *page_index_out);
+
 // USB MSC
 void ui_usb_msc_begin(void);
 void ui_usb_msc_end(void);

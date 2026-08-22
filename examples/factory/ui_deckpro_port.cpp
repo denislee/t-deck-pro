@@ -82,20 +82,23 @@ static bool wifi_enabled = false;
 static volatile ui_wifi_status_t wifi_status = UI_WIFI_STATUS_DISABLED;
 static volatile bool ntp_synced = false;
 
+// Forward declaration — defined after ui_settings_save() below.
+static void settings_mark_dirty(void);
+
 int  ui_font_face_get(int slot)         { return default_font_face[font_slot_clamp(slot)]; }
-void ui_font_face_set(int slot, int f)  { default_font_face[font_slot_clamp(slot)] = f; ui_settings_save(); }
+void ui_font_face_set(int slot, int f)  { default_font_face[font_slot_clamp(slot)] = f; settings_mark_dirty(); }
 int  ui_font_size_get(int slot)         { return default_font_size[font_slot_clamp(slot)]; }
-void ui_font_size_set(int slot, int s)  { default_font_size[font_slot_clamp(slot)] = s; ui_settings_save(); }
+void ui_font_size_set(int slot, int s)  { default_font_size[font_slot_clamp(slot)] = s; settings_mark_dirty(); }
 int  ui_reader_rotation_get(void)         { return default_reader_rotation; }
-void ui_reader_rotation_set(int r)        { default_reader_rotation = r ? 1 : 0; ui_settings_save(); }
+void ui_reader_rotation_set(int r)        { default_reader_rotation = r ? 1 : 0; settings_mark_dirty(); }
 int  ui_reader_line_space_get(void)       { return default_reader_line_space; }
-void ui_reader_line_space_set(int px)     { default_reader_line_space = reader_line_space_clamp(px); ui_settings_save(); }
+void ui_reader_line_space_set(int px)     { default_reader_line_space = reader_line_space_clamp(px); settings_mark_dirty(); }
 bool ui_topbar_show_battery_get(void)     { return default_topbar_show_battery; }
-void ui_topbar_show_battery_set(bool on)  { default_topbar_show_battery = on; ui_settings_save(); }
+void ui_topbar_show_battery_set(bool on)  { default_topbar_show_battery = on; settings_mark_dirty(); }
 bool ui_reader_bars_hidden_get(void)         { return default_reader_bars_hidden; }
-void ui_reader_bars_hidden_set(bool hidden)  { default_reader_bars_hidden = hidden; ui_settings_save(); }
+void ui_reader_bars_hidden_set(bool hidden)  { default_reader_bars_hidden = hidden; settings_mark_dirty(); }
 int  ui_lock_landscape_get(void)             { return default_lock_landscape; }
-void ui_lock_landscape_set(int r)            { default_lock_landscape = r ? 1 : 0; ui_settings_save(); }
+void ui_lock_landscape_set(int r)            { default_lock_landscape = r ? 1 : 0; settings_mark_dirty(); }
 
 // FNV-1a 32-bit hash of the filename, formatted as "b_xxxxxxxx" (10 chars).
 // Per-file bookmarks live under a per-filename NVS key derived this way
@@ -157,8 +160,108 @@ bool ui_reader_bookmark_get(const char *filename, size_t *offset)
     return true;
 }
 
+// Per-book page index persistence (§3.5 companion API).
+//
+// The page index is stored under "p_xxxxxxxx" — the same FNV-1a hash of
+// the filename as the byte-offset key ("b_xxxxxxxx"), but with a different
+// prefix. Both keys fit within NVS's 15-character key limit.
+//
+// Usage pattern (from ui_deckpro.cpp):
+//   Save:    ui_reader_bookmark_page_set(filename, current_page_index);
+//   Restore: ui_reader_bookmark_page_get(filename, &saved_page_index);
+//            then seed reader_page_offsets[0] = saved_byte_offset and start
+//            rendering from saved_page_index instead of walking from 0.
+
+static void reader_page_key(const char *filename, char out[11])
+{
+    // Derive the NVS key from the same hash as the byte-offset bookmark so
+    // the two keys for a file are easily associated. "p_" prefix keeps them
+    // distinct from the "b_" offset keys.
+    uint32_t h = 2166136261u;
+    if (filename) {
+        for (const unsigned char *p = (const unsigned char *)filename; *p; ++p) {
+            h ^= *p;
+            h *= 16777619u;
+        }
+    }
+    snprintf(out, 11, "p_%08x", (unsigned)h);
+}
+
+void ui_reader_bookmark_page_set(const char *filename, int page_index)
+{
+    if (!filename || !filename[0]) return;
+    char key[11];
+    reader_page_key(filename, key);
+    Preferences prefs;
+    prefs.begin("t-deck-pro", false);
+    prefs.putInt(key, page_index);
+    prefs.end();
+}
+
+// Returns true and fills *page_index_out if a page bookmark was previously
+// saved for filename. Returns false if no page bookmark exists (e.g. the
+// book was bookmarked by an older firmware that didn't store the page index,
+// or has never been opened).
+bool ui_reader_bookmark_page_get(const char *filename, int *page_index_out)
+{
+    if (!filename || !filename[0]) return false;
+    char key[11];
+    reader_page_key(filename, key);
+    Preferences prefs;
+    prefs.begin("t-deck-pro", true);
+    bool present = prefs.isKey(key);
+    int  page    = prefs.getInt(key, 0);
+    prefs.end();
+    if (!present) return false;
+    if (page_index_out) *page_index_out = page;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Debounced NVS settings persistence (§3.9)
+//
+// ui_settings_save() is the immediate / forced form — it writes all 26 keys
+// and clears the pending timer.  Setters inside this file call
+// settings_mark_dirty() instead, which arms a one-shot LVGL timer that flushes
+// a second later; rapid toggles therefore produce a single NVS round-trip.
+//
+// Paths that power the device down (ui_shutdown_on) call ui_settings_save()
+// directly so the most recent state is never lost.
+// ---------------------------------------------------------------------------
+static bool        s_settings_dirty = false;
+static lv_timer_t *s_settings_timer = NULL;
+
+static void settings_deferred_flush(lv_timer_t * /*t*/)
+{
+    s_settings_timer = NULL; // one-shot; LVGL won't reschedule it
+    if (s_settings_dirty) {
+        ui_settings_save(); // clears s_settings_dirty
+    }
+}
+
+// Mark settings as changed and (re)arm the debounce timer. Must be called
+// from the LVGL task only (same thread as lv_timer_create).
+static void settings_mark_dirty(void)
+{
+    s_settings_dirty = true;
+    if (s_settings_timer == NULL) {
+        s_settings_timer = lv_timer_create(settings_deferred_flush, 1000, NULL);
+        if (s_settings_timer) lv_timer_set_repeat_count(s_settings_timer, 1);
+    } else {
+        // Extend the deadline from this moment so rapid changes collapse.
+        lv_timer_reset(s_settings_timer);
+    }
+}
+
 void ui_settings_save(void)
 {
+    // Cancel any pending deferred write — we are doing the flush right now.
+    if (s_settings_timer != NULL) {
+        lv_timer_del(s_settings_timer);
+        s_settings_timer = NULL;
+    }
+    s_settings_dirty = false;
+
     Preferences prefs;
     prefs.begin("t-deck-pro", false);
     prefs.putInt("lang", default_language);
@@ -287,11 +390,11 @@ static int lora_default_band = 125;
 static int lora_default_power = 22;
 
 float ui_lora_get_freq(void) { return lora_default_freq; }
-void ui_lora_set_freq(float freq) { lora_default_freq = freq; ui_settings_save(); }
+void ui_lora_set_freq(float freq) { lora_default_freq = freq; settings_mark_dirty(); }
 int ui_lora_get_bandwidth(void) { return lora_default_band; }
-void ui_lora_set_bandwidth(float bd) { lora_default_band = bd; ui_settings_save(); }
+void ui_lora_set_bandwidth(float bd) { lora_default_band = bd; settings_mark_dirty(); }
 int ui_lora_get_power(void) { return lora_default_power; }
-void ui_lora_set_power(float po) { lora_default_power = po; ui_settings_save(); }
+void ui_lora_set_power(float po) { lora_default_power = po; settings_mark_dirty(); }
 
 void ui_lora_param_set(void)
 {
@@ -329,13 +432,13 @@ void ui_lora_set_recv_flag(void)
 void ui_setting_set_language(int language)
 {
     default_language = language;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_keypad_light(bool on)
 {
     digitalWrite(BOARD_KEYBOARD_LED, on);
     default_keypad_light = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_apply_keypad_light(bool on)
 {
@@ -345,13 +448,13 @@ void ui_setting_set_red_led(bool on)
 {
     digitalWrite(BOARD_RED_LED, on);
     default_red_led_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_motor_status(bool on)
 {
     digitalWrite(BOARD_MOTOR_PIN, on);
     default_motor_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_gps_status(bool on)
 {
@@ -363,7 +466,7 @@ void ui_setting_set_gps_status(bool on)
         digitalWrite(BOARD_GPS_EN, LOW);
     }
     default_gps_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_lora_status(bool on)
 {
@@ -374,7 +477,7 @@ void ui_setting_set_lora_status(bool on)
         digitalWrite(BOARD_LORA_EN, LOW);
     }
     default_lora_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_gyro_status(bool on)
 {
@@ -382,7 +485,7 @@ void ui_setting_set_gyro_status(bool on)
     // it from the gyro toggle. Track the preference; the gyro driver itself
     // can honor it at the software level.
     default_gyro_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_a7682_status(bool on)
 {
@@ -396,7 +499,7 @@ void ui_setting_set_a7682_status(bool on)
         digitalWrite(BOARD_A7682E_PWRKEY, LOW);
     }
     default_a7682_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 void ui_setting_set_touch_status(bool on)
 {
@@ -404,7 +507,7 @@ void ui_setting_set_touch_status(bool on)
     // the gyro and must stay up), but the LVGL touchpad_read callback honors
     // this flag and stops reporting points when off.
     default_touch_status = on;
-    ui_settings_save();
+    settings_mark_dirty();
 }
 
 // get function
@@ -673,7 +776,7 @@ void ui_wifi_set_ssid(const char *ssid)
     if (!ssid) return;
     strncpy(default_wifi_ssid, ssid, sizeof(default_wifi_ssid) - 1);
     default_wifi_ssid[sizeof(default_wifi_ssid) - 1] = '\0';
-    ui_settings_save();
+    settings_mark_dirty();
 }
 
 void ui_wifi_get_password(char *out, int out_len)
@@ -688,7 +791,7 @@ void ui_wifi_set_password(const char *password)
     if (!password) return;
     strncpy(default_wifi_password, password, sizeof(default_wifi_password) - 1);
     default_wifi_password[sizeof(default_wifi_password) - 1] = '\0';
-    ui_settings_save();
+    settings_mark_dirty();
 }
 
 void ui_wifi_get_tz(char *out, int out_len)
@@ -705,7 +808,7 @@ void ui_wifi_set_tz(const char *tz)
     default_wifi_tz[sizeof(default_wifi_tz) - 1] = '\0';
     setenv("TZ", default_wifi_tz, 1);
     tzset();
-    ui_settings_save();
+    settings_mark_dirty();
 }
 
 int ui_wifi_get_status(void)
@@ -1305,12 +1408,16 @@ void ui_a7682_loop_suspend(void)
 
 void ui_shutdown_on(void)
 {
+    // Flush any pending debounced settings write before we cut power.
+    // The deferred timer will never fire once the device is off.
+    ui_settings_save();
     ink_screen_prepare_shutdown();
     PPM.shutdown();
     Serial.println("Shutdown .....");
 }
 
 //************************************[ screen 10 ]****************************************** PCM5102
+#ifdef BOARD_HAS_PCM5102A
 bool ui_pcm5102_cb(const char *at_cmd)
 {
     audio.connecttoFS(SPIFFS, "/iphone_call.mp3");
@@ -1322,34 +1429,19 @@ void ui_pcm5102_stop(void)
     audio.stopSong();
 }
 
-// optional
+// optional Audio library event callback — only present when the audio
+// stack is compiled in, since the Audio object that calls it won't exist
+// on the 4G / no-DAC variant.
 void audio_info(const char *info){
     Serial.print("info        "); Serial.println(info);
 }
-// void audio_id3data(const char *info){  //id3 metadata
-//     Serial.print("id3data     ");Serial.println(info);
-// }
-// void audio_eof_mp3(const char *info){  //end of file
-//     Serial.print("eof_mp3     ");Serial.println(info);
-// }
-// void audio_showstation(const char *info){
-//     Serial.print("station     ");Serial.println(info);
-// }
-// void audio_showstreamtitle(const char *info){
-//     Serial.print("streamtitle ");Serial.println(info);
-// }
-// void audio_bitrate(const char *info){
-//     Serial.print("bitrate     ");Serial.println(info);
-// }
-// void audio_commercial(const char *info){  //duration in sec
-//     Serial.print("commercial  ");Serial.println(info);
-// }
-// void audio_icyurl(const char *info){  //homepage
-//     Serial.print("icyurl      ");Serial.println(info);
-// }
-// void audio_lasthost(const char *info){  //stream URL played
-//     Serial.print("lasthost    ");Serial.println(info);
-// }
+#else
+// Stubs for builds without the PCM5102A audio stack. The surrounding
+// feature (screen 10) degrades quietly: the callback returns false to
+// signal unavailability, and stop is a no-op.
+bool ui_pcm5102_cb(const char * /*at_cmd*/) { return false; }
+void ui_pcm5102_stop(void) {}
+#endif /* BOARD_HAS_PCM5102A */
 
 //************************************[ screen 12 ]****************************************** Notes
 #include <SPIFFS.h>
@@ -1581,19 +1673,96 @@ bool ui_notes_delete(bool is_sd, const char *filename)
 //      remainder. Linear scan also handles the case where multiple entries
 //      share a headword (we return the first match).
 
-static int dict_line_read(File &f, char *buf, size_t buf_size)
+// ---------------------------------------------------------------------------
+// Buffered reader for the dictionary binary search (§3.4)
+//
+// Each dict_buf_read_line / dict_buf_skip_line call issues one
+// f.read(chunk, 512) per 512-byte window instead of one f.read() per byte,
+// dropping ~20,000 single-byte VFS/FATFS/SPI round-trips to ~40 per lookup.
+//
+// The virtual file position tracked by dict_buf_tell() is byte-for-byte
+// identical to what f.position() would return after the equivalent single-byte
+// reads, so the binary-search algorithm and its convergence bounds are
+// unchanged.
+// ---------------------------------------------------------------------------
+#define DICT_CHUNK_SIZE 512
+
+typedef struct {
+    File    *f;
+    uint8_t  chunk[DICT_CHUNK_SIZE];
+    int      chunk_len;   // valid bytes in chunk[]
+    int      chunk_pos;   // next byte to consume
+    long     chunk_start; // file offset of chunk[0]
+} dict_buf_t;
+
+static void dict_buf_init(dict_buf_t *b, File *f)
 {
-    // Returns bytes read (excluding '\n'), -1 on EOF before any data. The
-    // line is null-terminated. Lines longer than buf_size-1 are truncated;
-    // the file pointer is still advanced past the '\n'.
-    size_t n = 0;
-    bool any = false;
+    b->f          = f;
+    b->chunk_len  = 0;
+    b->chunk_pos  = 0;
+    b->chunk_start = 0;
+}
+
+// Advance the chunk window by reading the next DICT_CHUNK_SIZE bytes from
+// the underlying file. Must only be called when the current chunk is fully
+// consumed (chunk_pos >= chunk_len).
+static bool dict_buf_refill(dict_buf_t *b)
+{
+    b->chunk_start += b->chunk_len; // previous chunk fully consumed
+    b->chunk_pos    = 0;
+    b->chunk_len    = (int)b->f->read(b->chunk, DICT_CHUNK_SIZE);
+    return b->chunk_len > 0;
+}
+
+// Virtual file position: equals f.position() of the equivalent unbuffered
+// reader at every point the binary-search algorithm samples it.
+static long dict_buf_tell(const dict_buf_t *b)
+{
+    return b->chunk_start + b->chunk_pos;
+}
+
+// Seek the underlying file and reset the buffer. After this call
+// dict_buf_tell(b) == pos.
+static void dict_buf_seek(dict_buf_t *b, long pos)
+{
+    b->f->seek((uint32_t)pos);
+    b->chunk_start = pos;
+    b->chunk_pos   = 0;
+    b->chunk_len   = 0;
+}
+
+// Consume bytes up to and including the next '\n' (or EOF). Used to discard
+// the partial line at a binary-search seek point.
+static void dict_buf_skip_line(dict_buf_t *b)
+{
     while (true) {
-        int c = f.read();
-        if (c < 0) break;
+        if (b->chunk_pos >= b->chunk_len) {
+            if (!dict_buf_refill(b)) return; // EOF
+        }
+        uint8_t c = b->chunk[b->chunk_pos++];
+        if (c == '\n') return;
+    }
+}
+
+// Read one line into buf (up to buf_size-1 bytes), null-terminated.
+// '\r' is stripped (handles CRLF files transparently). Lines longer than
+// buf_size-1 are truncated; the reader still consumes through to '\n'.
+// Returns bytes written (excluding '\0'), or -1 on EOF before any data.
+static int dict_buf_read_line(dict_buf_t *b, char *buf, size_t buf_size)
+{
+    size_t n   = 0;
+    bool   any = false;
+    while (true) {
+        if (b->chunk_pos >= b->chunk_len) {
+            if (!dict_buf_refill(b)) break; // EOF
+        }
+        uint8_t c = b->chunk[b->chunk_pos++];
         any = true;
         if (c == '\n') break;
+        if (c == '\r') continue; // strip CR so CRLF files work
         if (n + 1 < buf_size) buf[n++] = (char)c;
+        // even when buf is full keep consuming until '\n' so the file
+        // position stays consistent for the binary-search accounting
     }
     buf[n] = '\0';
     return any ? (int)n : -1;
@@ -1656,36 +1825,35 @@ char* ui_dict_lookup(const char *word)
     long hi = (long)f.size();
     char line[512];
 
+    // dict_buf provides ~512-byte block reads so the binary search issues
+    // ~40 SD transactions instead of ~20,000 single-byte VFS calls.
+    dict_buf_t buf;
+    dict_buf_init(&buf, &f);
+
     while (hi - lo > 512) {
         long mid = lo + (hi - lo) / 2;
-        f.seek(mid);
+        dict_buf_seek(&buf, mid);
         if (mid != 0) {
-            // Discard partial line at the seek point.
-            while (true) {
-                int c = f.read();
-                if (c < 0 || c == '\n') break;
-            }
+            // Discard the partial line we landed in the middle of.
+            dict_buf_skip_line(&buf);
         }
-        long line_start = f.position();
-        int len = dict_line_read(f, line, sizeof(line));
+        long line_start = dict_buf_tell(&buf);
+        int len = dict_buf_read_line(&buf, line, sizeof(line));
         if (len < 0) { hi = line_start; continue; }
         int cmp = dict_strcasecmp_word(line, word);
-        if (cmp < 0) lo = f.position();
+        if (cmp < 0) lo = dict_buf_tell(&buf);
         else         hi = line_start;
     }
 
-    // Linear scan of the remaining window.
-    f.seek(lo);
+    // Linear scan of the remaining ≤512-byte window.
+    dict_buf_seek(&buf, lo);
     if (lo != 0) {
-        while (true) {
-            int c = f.read();
-            if (c < 0 || c == '\n') break;
-        }
+        dict_buf_skip_line(&buf);
     }
 
     char *result = NULL;
-    while ((long)f.position() < hi) {
-        int len = dict_line_read(f, line, sizeof(line));
+    while (dict_buf_tell(&buf) < hi) {
+        int len = dict_buf_read_line(&buf, line, sizeof(line));
         if (len < 0) break;
         int cmp = dict_strcasecmp_word(line, word);
         if (cmp == 0) {
@@ -1694,7 +1862,7 @@ char* ui_dict_lookup(const char *word)
             result = dict_decode_definition(def);
             break;
         }
-        if (cmp > 0) break; // sorted, so we've passed it
+        if (cmp > 0) break; // file is sorted — we've passed the target
     }
 
     f.close();
