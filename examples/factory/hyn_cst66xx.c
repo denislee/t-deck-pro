@@ -1,3 +1,5 @@
+#ifdef BOARD_HAS_TOUCH
+
 #include "hyn_core.h"
 
 
@@ -270,6 +272,8 @@ const struct hyn_ts_fuc cst66xx_fuc = {
     .tp_get_dbg_data = NULL,
     .tp_get_test_result = NULL,
 };
+
+#endif /* BOARD_HAS_TOUCH */
 
 
 

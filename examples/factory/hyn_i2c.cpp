@@ -1,3 +1,5 @@
+#ifdef BOARD_HAS_TOUCH
+
 #include "hyn_core.h"
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -118,3 +120,5 @@ bool gpio_get_value(uint32_t gpio_id)
 {
     return gpio_get_level((gpio_num_t)gpio_id);
 }
+
+#endif /* BOARD_HAS_TOUCH */

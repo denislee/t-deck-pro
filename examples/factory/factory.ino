@@ -30,7 +30,9 @@ TaskHandle_t a7682_handle;
 
 XPowersPPM PPM;
 BQ27220 bq27220;
+#ifdef BOARD_HAS_PCM5102A
 Audio audio;
+#endif
 
 static constexpr uint16_t FACTORY_BATTERY_DESIGN_CAPACITY_MAH = 1400;
 static constexpr uint16_t FACTORY_BQ25896_CHARGE_TARGET_MV = 4208;
@@ -43,7 +45,12 @@ static constexpr uint32_t FACTORY_BQ25896_RUNTIME_CHECK_MS = 5000;
 static constexpr uint32_t FACTORY_BQ25896_RECOVERY_COOLDOWN_MS = 30000;
 static constexpr uint32_t FACTORY_EPD_SPI_HZ = 20000000;
 TouchDrvCSTXXX touch;
-GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)); // GDEQ031T10 240x320, UC8253, (no inking, backside mark KEGMO 3100)
+// Page height is HEIGHT/8 (40 rows, 1,200 B) rather than HEIGHT (9,600 B).
+// The normal flush path bypasses the page buffer entirely — flush_epd_bitmap()
+// calls display.epd2.writeImage() directly. The paged buffer is only used by
+// disp_hard_refresh() and disp_white_clear() (fillScreen loops), which iterate
+// over 8 pages of 40 rows each with no visible difference to the user.
+GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT / 8> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)); // GDEQ031T10 240x320, UC8253, (no inking, backside mark KEGMO 3100)
 
 uint8_t *decodebuffer = NULL;
 int disp_refr_mode = DISP_REFR_MODE_PART;
@@ -60,6 +67,15 @@ const char Version_str2[] = "T-Deck-Pro V1.1";
 
 bool peri_init_st[E_PERI_NUM_MAX] = {0};
 static SemaphoreHandle_t shared_spi_mutex = nullptr;
+// Nesting depth for shared_spi_lock/unlock. Incremented after the recursive
+// mutex is taken; decremented before it is given. shared_spi_release_all_cs()
+// is called only when the outermost unlock runs (depth reaches 0).
+static uint32_t s_spi_depth = 0;
+
+// One-shot LVGL timer used to defer display.epd2.powerOff() by ~2 s after the
+// last flush. Both this timer and flush_epd_bitmap() run from lv_task_handler()
+// on the Arduino loop task, so there is no concurrency between them.
+static lv_timer_t *s_epd_poweroff_timer = NULL;
 
 static void shared_spi_release_all_cs()
 {
@@ -87,23 +103,35 @@ void shared_spi_lock(void)
     }
     if (shared_spi_mutex != nullptr) {
         xSemaphoreTakeRecursive(shared_spi_mutex, portMAX_DELAY);
+        // Depth is updated only after the mutex is acquired, so it is
+        // always consistent with the recursive hold count.
+        s_spi_depth++;
     }
 }
 
 void shared_spi_unlock(void)
 {
     if (shared_spi_mutex != nullptr) {
-        shared_spi_release_all_cs();
+        // Release all CS lines only when the outermost lock is unwound.
+        // An inner unlock inside a nested critical section must not deassert
+        // CS while the outer holder is still mid-transaction.
+        if (--s_spi_depth == 0) {
+            shared_spi_release_all_cs();
+        }
         xSemaphoreGiveRecursive(shared_spi_mutex);
     }
 }
 
+// Deasserts all CS lines so each driver can assert only its own pin before
+// beginning a transaction. Does NOT assert cs_pin LOW — drivers manage their
+// own chip-select timing. The cs_pin argument is retained for call-site
+// clarity (callers pass the pin they are about to use) but is not driven here.
+// Rename to shared_spi_deselect_all() is a follow-up: callers in other files
+// would need updating and are owned by a different agent.
 void shared_spi_prepare_device(int cs_pin)
 {
+    (void)cs_pin;  /* see comment above — pin is not driven here */
     shared_spi_release_all_cs();
-    if (cs_pin >= 0) {
-        digitalWrite(cs_pin, HIGH);
-    }
 }
 
 /*********************************************************************************
@@ -206,6 +234,19 @@ static void logical_area_to_panel(const lv_area_t *logical, lv_area_t *panel)
     }
 }
 
+// Timer callback that powers the EPD panel off after ~2 s of display
+// idleness. Runs from lv_task_handler() — same task as flush_epd_bitmap()
+// and ink_screen_prepare_shutdown() — so there is no concurrency.
+static void epd_poweroff_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_epd_poweroff_timer = NULL;  /* mark as expired before the SPI call */
+    shared_spi_lock();
+    shared_spi_prepare_device(BOARD_EPD_CS);
+    display.epd2.powerOff();
+    shared_spi_unlock();
+}
+
 static void flush_epd_bitmap(const lv_area_t *panel_area)
 {
     const lv_coord_t width = lv_area_get_width(panel_area);
@@ -237,21 +278,45 @@ static void flush_epd_bitmap(const lv_area_t *panel_area)
         display.epd2.refresh(false);
     }
 
-    display.epd2.powerOff();
     shared_spi_unlock();
+
+    // Defer powerOff() rather than doing it on every flush. Rapid UI changes
+    // (typing, settings navigation) pay the panel power-on cost only once
+    // for the whole burst. Re-arm the timer on each flush so the 2 s window
+    // restarts from the *last* flush, not the first.
+    if (s_epd_poweroff_timer != NULL) {
+        lv_timer_reset(s_epd_poweroff_timer);
+    } else {
+        s_epd_poweroff_timer = lv_timer_create(epd_poweroff_timer_cb, 2000, NULL);
+        lv_timer_set_repeat_count(s_epd_poweroff_timer, 1);
+    }
 }
 
 // GDEQ031T10::writeImage requires the partial-update X window to start and
 // span multiples of 8 pixels (one byte per 8 horizontal pixels). LVGL hands us
-// arbitrary invalidate bounding boxes in *logical* coordinates, called before
-// sw_rotate runs — so in landscape (ROT_90) logical-Y is what becomes panel-X
-// after rotation. Round both axes to be safe regardless of orientation.
+// arbitrary invalidate bounding boxes in *logical* coordinates before any
+// rotation is applied.
+//
+// The flush path (logical_area_to_panel + flush_epd_bitmap) rotates 90° CW in
+// landscape: logical-X maps to panel-Y and logical-Y maps to panel-X. So the
+// axis that must be 8-aligned in panel space is:
+//   portrait  — logical X  (direct 1:1)
+//   landscape — logical Y  (becomes panel X after 90° CW rotation)
+//
+// Rounding is conservative: x1/y1 round down (never shrink the dirty area),
+// x2/y2 round up.
 static void display_driver_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
 {
-    area->x1 &= ~0x7;
-    area->x2 |= 0x7;
-    area->y1 &= ~0x7;
-    area->y2 |= 0x7;
+    (void)disp_drv;
+    if (s_landscape) {
+        /* logical Y → panel X; align logical Y to 8-pixel boundary */
+        area->y1 &= ~0x7;
+        area->y2 |= 0x7;
+    } else {
+        /* logical X → panel X; align logical X to 8-pixel boundary */
+        area->x1 &= ~0x7;
+        area->x2 |= 0x7;
+    }
 }
 
 static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
@@ -344,6 +409,15 @@ void ink_screen_prepare_shutdown(void)
 {
     if (!peri_init_st[E_PERI_INK_SCREEN]) {
         return;
+    }
+
+    // Cancel the deferred power-down timer before explicitly powering off.
+    // Both this function and the timer callback run from the LVGL task so
+    // there is no concurrency, but we must not leave a stale timer that
+    // fires after the panel has already been powered off for sleep/shutdown.
+    if (s_epd_poweroff_timer != NULL) {
+        lv_timer_del(s_epd_poweroff_timer);
+        s_epd_poweroff_timer = NULL;
     }
 
     shared_spi_lock();
@@ -518,7 +592,12 @@ static bool sd_care_init(void)
 
 static void a7682_task(void *param)
 {
-    vTaskSuspend(a7682_handle);
+    // Suspend the calling task. NULL means "self" in FreeRTOS and is correct
+    // here: this task runs at priority 20, above its creator (priority 1), so
+    // FreeRTOS switches to it before xTaskCreate() returns and assigns
+    // a7682_handle. Using the global at this point would read an uninitialised
+    // handle (NULL at boot), which would accidentally suspend the idle task.
+    vTaskSuspend(NULL);
     while (1)
     {
         while (SerialAT.available())
@@ -574,11 +653,12 @@ static bool A7682E_init(void)
     return (retry < retry_cnt);
 }
 
+#ifdef BOARD_HAS_PCM5102A
 static bool pcm5102a_init(void)
 {
     bool ret = audio.setPinout(BOARD_I2S_BCLK, BOARD_I2S_LRC, BOARD_I2S_DOUT);
 
-    if (ret == false) 
+    if (ret == false)
         Serial.printf("[%d] Execution error\n", __LINE__);
 
     audio.setVolume(21); // 0...21
@@ -590,6 +670,7 @@ static bool pcm5102a_init(void)
 
     return true;
 }
+#endif /* BOARD_HAS_PCM5102A */
 
 static void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
     Serial.printf("Listing spiffs directory: %s\n", dirname);
@@ -650,17 +731,28 @@ static void peripheral_init_task(void *param)
     } else {
         peri_init_st[E_PERI_GPS] = false;
     }
-    // Gyro disabled — BHI260AP responds at the I2C scan but its chip-ID
-    // readback returns 0xFFFF on this V1.1 board, and the SensorLib init
-    // path retries with 1 s delays generating Wire.cpp:499 Error 263 spam.
+    // Gyro — only attempt init when the BHI260AP driver is compiled in.
+    // On this V1.1 board the chip-ID readback returns 0xFFFF and SensorLib
+    // retries with 1 s delays generating Wire.cpp:499 Error 263 spam.
+    // BOARD_1V8_EN (IO38) powers BOTH the gyro AND the CST328 touch IC; it
+    // stays HIGH at boot (setup()) regardless of this flag.
+#ifdef BOARD_HAS_BHI260AP
+    peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
+#else
     peri_init_st[E_PERI_BHI260AP]   = false;
+#endif
     peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
     peri_init_st[E_PERI_A7682E]     = A7682E_init();
 
+#ifdef BOARD_HAS_PCM5102A
     if(peri_init_st[E_PERI_A7682E] == false)
     {
         peri_init_st[E_PERI_PCM5102A] = pcm5102a_init();
     }
+#else
+    // Audio hardware not compiled in; PCM5102A init is skipped.
+    peri_init_st[E_PERI_PCM5102A] = false;
+#endif
 
     Serial.println("Background peripheral initialization complete.");
     vTaskDelete(NULL);
@@ -803,10 +895,12 @@ void loop()
     // keypad is drained by a dedicated FreeRTOS task — see keypad_task_create().
     bq25896_runtime_maintain();
 
-    if(peri_init_st[E_PERI_PCM5102A] == true) 
+#ifdef BOARD_HAS_PCM5102A
+    if(peri_init_st[E_PERI_PCM5102A] == true)
     {
         audio.loop();
     }
+#endif /* BOARD_HAS_PCM5102A */
     
     vTaskDelay(1);
 
@@ -860,6 +954,13 @@ void disp_hard_refresh(void)
 
 void disp_white_clear(void)
 {
+    // Cancel the deferred power-down timer — we are about to power off
+    // explicitly at the end of this function.
+    if (s_epd_poweroff_timer != NULL) {
+        lv_timer_del(s_epd_poweroff_timer);
+        s_epd_poweroff_timer = NULL;
+    }
+
     shared_spi_lock();
     shared_spi_prepare_device(BOARD_EPD_CS);
     display.setFullWindow();

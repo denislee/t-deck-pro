@@ -115,12 +115,22 @@ bool gps_init(void)
 
 void gps_task(void *param)
 {
-    vTaskSuspend(gps_handle);
+    // Suspend ourselves immediately. gps_handle is still NULL here because
+    // this task runs before xTaskCreate() has returned and written the global.
+    // vTaskSuspend(NULL) always means "calling task", which is what we want;
+    // vTaskSuspend(gps_handle) would dereference a NULL handle — undefined
+    // behaviour if the scheduler ever changes. An explicit NULL makes the
+    // intent unambiguous and removes the latent bug. gps_task_resume() will
+    // wake us via the now-valid gps_handle once init is complete.
+    vTaskSuspend(NULL);
+
     while(1)
     {
-        while (Serial.available()) {
-            SerialGPS.write(Serial.read());
-        }
+        // NOTE: the former 'while (Serial.available()) SerialGPS.write(Serial.read())'
+        // USB-console passthrough was removed. It races with a7682_task which
+        // drains the same SerialMon UART, splitting console input
+        // non-deterministically between the GPS and the modem — a correctness
+        // bug. The modem's own drain loop must remain the sole consumer.
 
         while (SerialGPS.available()) {
             int c = SerialGPS.read();
@@ -135,7 +145,12 @@ void gps_task(void *param)
             Serial.println(F("No GPS detected: check wiring."));
             delay(1000);
         }
-        vTaskDelay(1);
+
+        // The u-blox MIA-M10Q runs at 1 Hz; waking 1000×/s to drain a UART
+        // that has data ~1×/s wastes CPU and bus bandwidth. 20 ms covers the
+        // full NMEA burst that arrives each second without adding perceptible
+        // latency to the fix display.
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 

@@ -1,4 +1,9 @@
 
+// This translation unit contributes 103 KB (bhy2_firmware_image blob + driver
+// vtable) to the linked image.  Exclude it entirely when the BHI260AP is not
+// fitted; peripheral.h provides inline no-op stubs for the public entry points.
+#ifdef BOARD_HAS_BHI260AP
+
 #include <Wire.h>
 #include <SPI.h>
 #include <Arduino.h>
@@ -124,3 +129,5 @@ bool BHI260AP_init(void)
 
     return true;
 }
+
+#endif /* BOARD_HAS_BHI260AP */

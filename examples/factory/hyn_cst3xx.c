@@ -1,3 +1,5 @@
+#ifdef BOARD_HAS_TOUCH
+
 #include "hyn_core.h"
 
 #define BOOT_I2C_ADDR   (0x1A)
@@ -214,6 +216,8 @@ const struct hyn_ts_fuc cst3xx_fuc = {
     .tp_get_dbg_data = NULL,
     .tp_get_test_result = NULL,
 };
+
+#endif /* BOARD_HAS_TOUCH */
 
 
 

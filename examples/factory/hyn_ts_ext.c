@@ -1,4 +1,6 @@
 
+#ifdef BOARD_HAS_TOUCH
+
 #include "hyn_core.h"
 
 void hyn_irq_set(struct hyn_ts_data *ts_data, u8 value)
@@ -77,6 +79,8 @@ int fac_test_log_save(char *log_name,struct hyn_ts_data *ts_data,s16 *test_data,
 {
 	return 0;
 }
+
+#endif /* BOARD_HAS_TOUCH */
 
 
 

@@ -1,3 +1,9 @@
+// The Hynitron touch stack (hyn_touch, hyn_i2c, hyn_cst*) is excluded from
+// the link unless BOARD_HAS_TOUCH is defined at build time.  On the 4G board
+// the CST328 is hard-disabled; factory.h provides the declarations and
+// hyn_touch.cpp provides the no-op stubs in the #else branch below.
+#ifdef BOARD_HAS_TOUCH
+
 #include "Arduino.h"
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
@@ -172,3 +178,21 @@ int hyn_touch_init(void)
 
     return !ret;
 }
+
+#else /* !BOARD_HAS_TOUCH — provide no-op stubs so callers link without change */
+
+/* factory.h declares these inside extern "C" so callers see C linkage.
+ * The stubs must match that linkage or the linker cannot resolve them. */
+extern "C" {
+int hyn_touch_init(void) { return -1; }
+
+uint8_t hyn_touch_get_point(int16_t *x_array, int16_t *y_array, uint8_t get_point)
+{
+    (void)x_array;
+    (void)y_array;
+    (void)get_point;
+    return 0;
+}
+} /* extern "C" */
+
+#endif /* BOARD_HAS_TOUCH */

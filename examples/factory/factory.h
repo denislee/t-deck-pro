@@ -9,11 +9,12 @@
 #define XPOWERS_CHIP_BQ25896
 #include <XPowersLib.h>
 #include "bq27220.h"
+#ifdef BOARD_HAS_PCM5102A
 #include "Audio.h"
+#endif
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
-#include "FS.h"
 #include "SPIFFS.h"
 
 /*********************************************************************************
@@ -41,7 +42,9 @@ extern TaskHandle_t a7682_handle;
 extern bool peri_init_st[E_PERI_NUM_MAX];
 extern XPowersPPM PPM;
 extern BQ27220 bq27220;
+#ifdef BOARD_HAS_PCM5102A
 extern Audio audio;
+#endif
 
 /*********************************************************************************
  *                                  TYPEDEFS

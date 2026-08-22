@@ -1,5 +1,6 @@
 
 #include <Adafruit_TCA8418.h>
+#include <Adafruit_TCA8418_registers.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -60,6 +61,21 @@ const char shift_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
 
 Adafruit_TCA8418 keypad;
 keypad_cb keypad_listener = NULL;
+
+// Binary semaphore given by the INT ISR and taken by keypad_task. Created in
+// keypad_task_create(); safe to check for NULL before any xSemaphore call.
+static SemaphoreHandle_t keypad_irq_sem = NULL;
+
+// ISR fired on the falling edge of BOARD_KEYBOARD_INT (GPIO 15). The TCA8418
+// holds the line low until INT_STAT is cleared, so a single falling edge per
+// event burst is all we get. ISR gives the semaphore and yields; I2C access,
+// logging, and mutex operations are all forbidden here.
+static void IRAM_ATTR keypad_irq_handler(void)
+{
+    BaseType_t higher_woken = pdFALSE;
+    xSemaphoreGiveFromISR(keypad_irq_sem, &higher_woken);
+    portYIELD_FROM_ISR(higher_woken);
+}
 
 // Mutex serializing access to the primary I2C bus (Wire on BOARD_I2C_SDA/SCL).
 // The keypad task drains the TCA8418 from a higher-priority context that can
@@ -140,8 +156,15 @@ bool keypad_init(int address)
     // all other pins will be inputs
     keypad.matrix(KEYPAD_ROWS, KEYPAD_COLS);
 
-    // flush the internal buffer
+    // flush the internal buffer and clear any stale interrupt flags before the
+    // ISR is attached, so we start from a known-clean state.
     keypad.flush();
+
+    // Enable key-event interrupt (KE_IEN) so TCA8418 asserts INT on key state
+    // changes. GPI_IEN is also set by enableInterrupts() — harmless here since
+    // all GPIOs are configured as matrix rows/columns, not GPI inputs.
+    keypad.enableInterrupts();
+
     i2c0_unlock();
 
     return true;
@@ -215,24 +238,36 @@ void keypad_loop(void)
         keypad_state = state;
         keypad_buf_push(c);
     }
+
+    // Clear K_INT (and GPI_INT) in INT_STAT so the open-drain INT line
+    // de-asserts. The TCA8418 holds INT low until this register is written
+    // with 1-to-clear bits, regardless of FIFO state. Must be done while
+    // i2c0_lock is still held — before i2c0_unlock() below.
+    keypad.writeRegister(TCA8418_REG_INT_STAT,
+                         TCA8418_REG_STAT_K_INT | TCA8418_REG_STAT_GPI_INT);
+
     i2c0_unlock();
 }
 
-// Dedicated drain task. Runs above the Arduino loopTask so the TCA8418's
-// 10-deep on-chip FIFO gets serviced even while the main loop is blocked
-// inside lv_task_handler -> e-paper SPI refresh (which can take >300ms).
-// At ~5ms cadence the FIFO can absorb >2000 events/sec — well above any
-// realistic typing rate — so presses no longer drop on the chip side.
+// Dedicated drain task. Blocks on keypad_irq_sem, which is given by the
+// falling-edge ISR on BOARD_KEYBOARD_INT. When the TCA8418 asserts INT the
+// task wakes, drains the full FIFO in one pass (keypad_loop), and clears
+// INT_STAT so the line de-asserts. The 500 ms timeout is a safety net: if the
+// ISR was missed (e.g. INT was already low at attachInterrupt time, or a
+// glitch prevented the edge) the task re-syncs by draining and clearing.
+// Because keypad_loop() clears INT_STAT unconditionally, the timeout path is
+// a genuine recovery — not just a no-op poll.
 static TaskHandle_t keypad_task_handle = NULL;
 
 static void keypad_task(void *param)
 {
     (void)param;
-    const TickType_t period = pdMS_TO_TICKS(5);
-    TickType_t last = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(500);
     for (;;) {
+        // Block until INT fires or the safety-net timeout expires.
+        xSemaphoreTake(keypad_irq_sem, timeout);
+        // Drain the full TCA8418 FIFO and clear INT_STAT in one locked burst.
         keypad_loop();
-        vTaskDelayUntil(&last, period);
     }
 }
 
@@ -241,9 +276,22 @@ void keypad_task_create(void)
     if (keypad_task_handle) {
         return;
     }
+
+    // Create the binary semaphore that the INT ISR uses to wake the task.
+    // xSemaphoreCreateBinary() starts unsignalled, so the task will block
+    // immediately on its first xSemaphoreTake until INT fires or timeout.
+    keypad_irq_sem = xSemaphoreCreateBinary();
+
+    // Configure the INT pin with a pull-up so it idles HIGH. The TCA8418
+    // open-drains the line LOW when an event is queued and holds it there
+    // until INT_STAT is cleared; a falling edge therefore marks each new burst.
+    pinMode(BOARD_KEYBOARD_INT, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BOARD_KEYBOARD_INT),
+                    keypad_irq_handler, FALLING);
+
     // Priority above loopTask (1) so we preempt the e-paper SPI refresh, but
     // below the time-critical GPS/LoRa tasks. 4 KB stack: nominally a TCA8418
-    // poll is tiny, but when the I2C bus is unhealthy (Error 263 timeouts on
+    // drain is tiny, but when the I2C bus is unhealthy (Error 263 timeouts on
     // shared peripherals) the Wire error-handling path eats hundreds of
     // additional bytes — 2 KB tripped the stack canary in practice.
     xTaskCreate(keypad_task, "keypad", 4096, NULL, KEYPAD_PRIORITY, &keypad_task_handle);

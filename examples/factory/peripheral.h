@@ -1,7 +1,7 @@
 #ifndef __PERIPHERAL_H__
 #define __PERIPHERAL_H__
 
-#define GPS_PRIORITY     (configMAX_PRIORITIES - 1)
+#define GPS_PRIORITY     (configMAX_PRIORITIES - 8)
 #define LORA_PRIORITY    (configMAX_PRIORITIES - 2)
 #define WS2812_PRIORITY  (configMAX_PRIORITIES - 3)
 #define BATTERY_PRIORITY (configMAX_PRIORITIES - 4)
@@ -63,9 +63,22 @@ void keypad_regetser_cb(keypad_cb cb);
 void keypad_set_flag(void);
 void keypad_task_create(void);
 
-// gyro
+// gyro — compiled only when the BHI260AP hardware is present.
+// Without BOARD_HAS_BHI260AP (the default 4G build) the 103 KB firmware blob
+// is excluded from the link and these entry points become inline no-ops.
+#ifdef BOARD_HAS_BHI260AP
 bool BHI260AP_init(void);
 void BHI260AP_get_val(int val_type, float *x, float *y, float *z);
+#else
+static inline bool BHI260AP_init(void) { return false; }
+static inline void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
+{
+    (void)val_type;
+    if (x) *x = 0.0f;
+    if (y) *y = 0.0f;
+    if (z) *z = 0.0f;
+}
+#endif /* BOARD_HAS_BHI260AP */
 
 // LTR553
 bool LTR553_init(void);
