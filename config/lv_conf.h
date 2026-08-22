@@ -362,7 +362,7 @@
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_22 0
 #define LV_FONT_MONTSERRAT_24 0
-#define LV_FONT_MONTSERRAT_26 1
+#define LV_FONT_MONTSERRAT_26 0  /*removed: only reached via .fallback on the two Spleen faces; .fallback set to NULL*/
 #define LV_FONT_MONTSERRAT_28 0
 #define LV_FONT_MONTSERRAT_30 0
 #define LV_FONT_MONTSERRAT_32 0
@@ -720,7 +720,7 @@
 *==================*/
 
 /*Enable the examples to be built with the library*/
-#define LV_BUILD_EXAMPLES 1
+#define LV_BUILD_EXAMPLES 0  /*disabled: factory sketch never uses examples; guards against future LDF pulling lib/lvgl/examples/ in*/
 
 /*===================
  * DEMO USAGE
@@ -736,7 +736,7 @@
 #define LV_USE_DEMO_KEYPAD_AND_ENCODER 0
 
 /*Benchmark your system*/
-#define LV_USE_DEMO_BENCHMARK 1
+#define LV_USE_DEMO_BENCHMARK 0  /*disabled: factory sketch never uses this demo; guards against future LDF pulling lib/lvgl/demos/ in*/
 #if LV_USE_DEMO_BENCHMARK
 /*Use RGB565A8 images with 16 bit color depth instead of ARGB8565*/
 #define LV_DEMO_BENCHMARK_RGB565A8 0

@@ -248,7 +248,7 @@ lv_font_t lv_font_spleen_16x32 = {
 #endif
     .dsc = &font_dsc,
 #if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
-    .fallback = &lv_font_montserrat_26,
+    .fallback = NULL, /*was &lv_font_montserrat_26 — removed: never a sensible fallback for a fixed-pitch face, and pulled 32.9 KB into the image for nothing*/
 #endif
 };
 
