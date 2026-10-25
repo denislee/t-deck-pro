@@ -30,7 +30,6 @@
 #define TINY_GSM_MODEM_SIM7672
 #endif
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
-#define MODEM_GPS_ENABLE_GPIO               (-1)
 
 #include <TinyGsmClient.h>
 
@@ -49,20 +48,6 @@ extern Audio audio;
 /*********************************************************************************
  *                                  TYPEDEFS
  * *******************************************************************************/
-union flush_buf_pixel
-{
-    struct _byte {
-        uint8_t b1 : 1;
-        uint8_t b2 : 1;
-        uint8_t b3 : 1;
-        uint8_t b4 : 1;
-        uint8_t b5 : 1;
-        uint8_t b6 : 1;
-        uint8_t b7 : 1;
-        uint8_t b8 : 1;
-    }bit;
-    uint8_t full;
-};
 
 /*********************************************************************************
  *                              GLOBAL PROTOTYPES
@@ -71,6 +56,7 @@ union flush_buf_pixel
 extern "C" {
 #endif
 
+void board_rails_hold(bool hold);
 void disp_full_refr(void); // Next global refresh
 void disp_hard_refresh(void); // Thorough B/W cycle refresh
 void disp_white_clear(void); // Single full-screen white frame
@@ -79,12 +65,17 @@ void ink_screen_prepare_shutdown(void);
 void shared_spi_bus_init(void);
 void shared_spi_lock(void);
 void shared_spi_unlock(void);
-void shared_spi_prepare_device(int cs_pin);
-int hyn_touch_init(void);
-uint8_t hyn_touch_get_point(int16_t *x_array, int16_t *y_array, uint8_t get_point);
 
 #ifdef __cplusplus
 }
+
+/* Holds the shared SPI bus (LoRa / SD / EPD) for the enclosing scope. */
+struct SpiGuard {
+    SpiGuard()  { shared_spi_lock(); }
+    ~SpiGuard() { shared_spi_unlock(); }
+    SpiGuard(const SpiGuard &) = delete;
+    SpiGuard &operator=(const SpiGuard &) = delete;
+};
 #endif
 
 #endif

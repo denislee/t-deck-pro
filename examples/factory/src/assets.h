@@ -8,18 +8,6 @@ extern "C" {
 #include "lvgl.h"
 
 // image
-LV_IMG_DECLARE(img_lora)
-LV_IMG_DECLARE(img_SD)
-LV_IMG_DECLARE(img_about)
-LV_IMG_DECLARE(img_setting)
-LV_IMG_DECLARE(img_other)
-LV_IMG_DECLARE(img_GPS)
-LV_IMG_DECLARE(img_batt)
-LV_IMG_DECLARE(img_test)
-LV_IMG_DECLARE(img_wifi)
-LV_IMG_DECLARE(img_A7682E)
-LV_IMG_DECLARE(img_PCM5102)
-LV_IMG_DECLARE(img_touch)
 LV_IMG_DECLARE(img_start)
 
 

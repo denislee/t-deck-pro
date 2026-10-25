@@ -12,6 +12,10 @@ static String lora_recv_data;
 static bool lora_recv_success = false;
 static int lora_recv_rssi = 0;
 
+// True only once lora_init() completed. Until then the radio may be
+// unpowered (BOARD_LORA_EN low) and must not be touched over SPI.
+static bool s_lora_ready = false;
+
 // transmit 
 static int transmissionState = RADIOLIB_ERR_NONE;
 static volatile bool transmittedFlag = false;
@@ -28,10 +32,42 @@ static void set_receive_flag(void){
     receivedFlag = true;
 }
 
+// Run one radio config call; on failure log it and fail the whole init
+// (the caller's SpiGuard releases the bus).
+#define LORA_TRY(expr, what)                                              \
+    do {                                                                  \
+        int _st = (expr);                                                 \
+        if (_st != RADIOLIB_ERR_NONE) {                                   \
+            Serial.printf("[SX1262] %s failed, code %d\n", (what), _st);  \
+            return false;                                                 \
+        }                                                                 \
+    } while (0)
+
+// Non-fatal variant: log the same message and carry on. The original code
+// ignored every status code except "invalid value" for these calls, so a
+// missing TCXO / RF-switch pin must not cost the user a working radio.
+#define LORA_WARN(expr, what)                                             \
+    do {                                                                  \
+        int _st = (expr);                                                 \
+        if (_st != RADIOLIB_ERR_NONE) {                                   \
+            Serial.printf("[SX1262] %s failed, code %d\n", (what), _st);  \
+        }                                                                 \
+    } while (0)
+
+static bool lora_apply_user_params(void)
+{
+    LORA_TRY(radio.setFrequency(ui_lora_get_freq()), "frequency");
+    LORA_TRY(radio.setBandwidth(ui_lora_get_bandwidth()), "bandwidth");
+    LORA_TRY(radio.setOutputPower(ui_lora_get_power()), "output power");
+    return true;
+}
+
 bool lora_init(void)
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_LORA_CS);
+    SpiGuard spi;
+
+    // Nothing may talk to the radio until this init has fully succeeded.
+    s_lora_ready = false;
 
     Serial.print(F("[SX1262] Initializing ... "));
     int state = radio.begin(ui_lora_get_freq());
@@ -40,98 +76,36 @@ bool lora_init(void)
     } else {
         Serial.print(F("failed, code "));
         Serial.println(state);
-        shared_spi_unlock();
         return false;
     }
 
     radio.setPacketSentAction(set_transmit_flag);
 
-    // set carrier frequency to 433.5 MHz
-    if (radio.setFrequency(ui_lora_get_freq()) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Serial.println(F("Selected frequency is invalid for this module!"));
-        while (true);
-    }
+    if (!lora_apply_user_params()) return false;
 
-    // set bandwidth to 250 kHz
-    if (radio.setBandwidth(ui_lora_get_bandwidth()) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Serial.println(F("Selected bandwidth is invalid for this module!"));
-        while (true);
-    }
-
-    // set spreading factor to 10
-    if (radio.setSpreadingFactor(10) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Serial.println(F("Selected spreading factor is invalid for this module!"));
-        while (true);
-    }
-
-    // set coding rate to 6
-    if (radio.setCodingRate(6) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Serial.println(F("Selected coding rate is invalid for this module!"));
-        while (true);
-    }
-
-    // set LoRa sync word to 0xAB
-    if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Unable to set sync word!"));
-        while (true);
-    }
-
-    // set output power to 10 dBm (accepted range is -17 - 22 dBm)
-    if (radio.setOutputPower(ui_lora_get_power()) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Serial.println(F("Selected output power is invalid for this module!"));
-        while (true);
-    }
-
-    // set over current protection limit to 80 mA (accepted range is 45 - 240 mA)
-    // NOTE: set value to 0 to disable overcurrent protection
-    if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Serial.println(F("Selected current limit is invalid for this module!"));
-        while (true);
-    }
-
-    // set LoRa preamble length to 15 symbols (accepted range is 0 - 65535)
-    if (radio.setPreambleLength(15) == RADIOLIB_ERR_INVALID_PREAMBLE_LENGTH) {
-        Serial.println(F("Selected preamble length is invalid for this module!"));
-        while (true);
-    }
-
-    // disable CRC
-    if (radio.setCRC(false) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Serial.println(F("Selected CRC is invalid for this module!"));
-        while (true);
-    }
-
-    // Some SX126x modules have TCXO (temperature compensated crystal
-    // oscillator). To configure TCXO reference voltage,
-    // the following method can be used.
-    if (radio.setTCXO(2.4) == RADIOLIB_ERR_INVALID_TCXO_VOLTAGE) {
-        Serial.println(F("Selected TCXO voltage is invalid for this module!"));
-        while (true);
-    }
-
-    // Some SX126x modules use DIO2 as RF switch. To enable
-    // this feature, the following method can be used.
-    // NOTE: As long as DIO2 is configured to control RF switch,
-    //       it can't be used as interrupt pin!
-    if (radio.setDio2AsRfSwitch() != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Failed to set DIO2 as RF switch!"));
-        while (true);
-    }
+    LORA_TRY(radio.setSpreadingFactor(10), "spreading factor");
+    LORA_TRY(radio.setCodingRate(6), "coding rate");
+    LORA_WARN(radio.setSyncWord(0xAB), "sync word");
+    LORA_WARN(radio.setCurrentLimit(140), "current limit");
+    LORA_WARN(radio.setPreambleLength(15), "preamble length");
+    LORA_WARN(radio.setCRC(false), "CRC");
+    LORA_WARN(radio.setTCXO(2.4), "TCXO voltage");
+    LORA_WARN(radio.setDio2AsRfSwitch(), "DIO2 as RF switch");
 
     Serial.println(F("All settings succesfully changed!"));
 
     Serial.println(F("[SX1262] Sending first packet ... "));
     transmissionState = radio.startTransmit("Hello World!");
-    // radio.sleep();
 
-    shared_spi_unlock();
+    s_lora_ready = true;
     return true;
 }
 
 void lora_set_mode(int mode) 
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_LORA_CS);
+    if (!s_lora_ready) return;
+
+    SpiGuard spi;
 
     if(mode == LORA_MODE_SEND){
         radio.setPacketSentAction(set_transmit_flag);
@@ -149,7 +123,6 @@ void lora_set_mode(int mode)
         }
     }
     lora_mode = mode;
-    shared_spi_unlock();
 }
 
 int lora_get_mode(void)
@@ -159,22 +132,21 @@ int lora_get_mode(void)
 
 void lora_receive_loop(void)
 {
+    if (!s_lora_ready) return;
+
     if(receivedFlag){
         receivedFlag = false;
 
         lora_recv_success = true;
 
-        shared_spi_lock();
-        shared_spi_prepare_device(BOARD_LORA_CS);
+        SpiGuard spi;
 
-        // String str;
         receivedState = radio.readData(lora_recv_data);
         if(receivedState == RADIOLIB_ERR_NONE){
             Serial.println(F("[SX1262] Received packet!"));
 
             Serial.print(F("[SX1262] Data:\t\t"));
             Serial.println(lora_recv_data.c_str());
-            // Serial.println("%d", (int)lora_recv_data.toInt());
 
             Serial.print(F("[SX1262] RSSI:\t\t"));
             Serial.print(radio.getRSSI());
@@ -184,18 +156,17 @@ void lora_receive_loop(void)
             Serial.print(F("failed, code "));
             Serial.println(receivedState);
         }
-
-        shared_spi_unlock();
     }
 }
 
 void lora_transmit(const char *str)
 {
+    if (!s_lora_ready) return;
+
     if(transmittedFlag){
         transmittedFlag = false;
 
-        shared_spi_lock();
-        shared_spi_prepare_device(BOARD_LORA_CS);
+        SpiGuard spi;
 
         if(transmissionState == RADIOLIB_ERR_NONE){
             Serial.println(F("transmission finished!"));
@@ -207,7 +178,6 @@ void lora_transmit(const char *str)
         radio.finishTransmit();
         Serial.print(F("[Lora] Sending another packet ... "));
         transmissionState = radio.startTransmit(str);
-        shared_spi_unlock();
     }
 }
 
@@ -225,34 +195,16 @@ void lora_set_recv_flag(void)
 
 void lora_sleep(void)
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_LORA_CS);
+    if (!s_lora_ready) return;
+
+    SpiGuard spi;
     radio.sleep();
-    shared_spi_unlock();
 }
 
-void lora_param_set(void)
+bool lora_param_set(void)
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_LORA_CS);
+    if (!s_lora_ready) return false;
 
-    // set carrier frequency to 433.5 MHz
-    if (radio.setFrequency(ui_lora_get_freq()) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Serial.println(F("Selected frequency is invalid for this module!"));
-        while (true);
-    }
-
-    // set bandwidth to 250 kHz
-    if (radio.setBandwidth(ui_lora_get_bandwidth()) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Serial.println(F("Selected bandwidth is invalid for this module!"));
-        while (true);
-    }
-
-    // set output power to 10 dBm (accepted range is -17 - 22 dBm)
-    if (radio.setOutputPower(ui_lora_get_power()) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Serial.println(F("Selected output power is invalid for this module!"));
-        while (true);
-    }
-
-    shared_spi_unlock();
+    SpiGuard spi;
+    return lora_apply_user_params();
 }

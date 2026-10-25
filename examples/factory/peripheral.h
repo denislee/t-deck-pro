@@ -2,9 +2,6 @@
 #define __PERIPHERAL_H__
 
 #define GPS_PRIORITY     (configMAX_PRIORITIES - 8)
-#define LORA_PRIORITY    (configMAX_PRIORITIES - 2)
-#define WS2812_PRIORITY  (configMAX_PRIORITIES - 3)
-#define BATTERY_PRIORITY (configMAX_PRIORITIES - 4)
 #define A7682E_PRIORITY  (configMAX_PRIORITIES - 5)
 // Above the Arduino loopTask (priority 1) so the keypad drains even while the
 // main loop is blocked inside an e-paper SPI refresh.
@@ -15,9 +12,18 @@
 // full transaction (beginTransmission / write* / endTransmission, or any lib
 // call that wraps those). Without it, the keypad task can preempt mid-call
 // and corrupt TwoWire's internal txBuffer state.
-void i2c0_lock_init(void);
 void i2c0_lock(void);
 void i2c0_unlock(void);
+
+#ifdef __cplusplus
+/* Holds the I2C-0 bus mutex for the enclosing scope. */
+struct I2C0Guard {
+    I2C0Guard()  { i2c0_lock(); }
+    ~I2C0Guard() { i2c0_unlock(); }
+    I2C0Guard(const I2C0Guard &) = delete;
+    I2C0Guard &operator=(const I2C0Guard &) = delete;
+};
+#endif
 
 enum {
     E_PERI_LORA = 0,
@@ -32,12 +38,10 @@ enum {
     E_PERI_A7682E,
     E_PERI_PCM5102A,
     E_PERI_INK_SCREEN,
-    E_PERI_MIC,
     E_PERI_NUM_MAX,
 };
 
 // lora sx1262
-// #define LORA_FREQ      850.0
 #define LORA_MODE_SEND 0
 #define LORA_MODE_RECV 1
 
@@ -49,17 +53,18 @@ void lora_transmit(const char *str);
 bool lora_get_recv(const char **str, int *rssi);
 void lora_set_recv_flag(void);
 void lora_sleep(void);
-void lora_param_set(void);
+bool lora_param_set(void);
 // keypad
 #define KEYPAD_PRESS   1
 #define KEYPAD_RELEASE 0
 
-typedef void (*keypad_cb)(int state, char val);
+// Key codes the keypad driver pushes for the non-printable keys.
+#define KEY_ENTER     '\r'
+#define KEY_ESC       0x1B
+#define KEY_BACKSPACE 0x08
 
 bool keypad_init(int address);
 int keypad_get_val(char *c);
-void keypad_loop(void);
-void keypad_regetser_cb(keypad_cb cb);
 void keypad_set_flag(void);
 void keypad_task_create(void);
 
@@ -82,12 +87,9 @@ static inline void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
 
 // LTR553
 bool LTR553_init(void);
-uint16_t LTR_553ALS_get_channel(int ch); // ch 0~1
-uint16_t LTR_553ALS_get_ps(void);
 
 // gps u-blox m10q
 bool gps_init(void);
-void gps_task_create(void);
 void gps_task_suspend(void);
 void gps_task_resume(void);
 void gps_get_coord(double *lat, double *lng);

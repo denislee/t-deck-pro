@@ -10,7 +10,8 @@
 #
 # Usage:
 #   make build                  # compile current src_dir from platformio.ini
-#   make upload                 # compile and flash to device
+#   make upload                 # compile and flash factory firmware (default)
+#   make upload-modem           # build & flash the 4G -> WiFi tethering sketch
 #   make flash-factory          # flash a prebuilt factory firmware bin
 #   make flash-spiffs           # flash spiffs.bin at SPIFFS partition offset
 #   make flash-meshtastic       # flash a prebuilt meshtastic build
@@ -30,6 +31,15 @@ ENV           ?= T-Deck-Pro
 CHIP          ?= esp32s3
 BAUD          ?= 921600
 MONITOR_BAUD  ?= 115200
+
+# Optional: override the sketch directory for a single invocation without
+# editing platformio.ini. Used by upload-modem to point at examples/tethering
+# while leaving the default factory build path intact.
+SRC_DIR       ?=
+PIO_ENV       := $(if $(SRC_DIR),PLATFORMIO_SRC_DIR=$(SRC_DIR))
+
+# Tethering sketch: its own env (Arduino-ESP32 3.x) and source dir.
+MODEM_ARGS    := ENV=T-Deck-Pro-modem SRC_DIR=examples/tethering
 
 # Auto-detect port by:
 #   1) preferring /dev/serial/by-id/* (udev-stable symlinks keyed by USB
@@ -58,34 +68,36 @@ MONITOR_BAUD  ?= 115200
 # NOTE: avoid unbalanced parens inside $(shell ...) -- make's parser pairs
 # them naively, so a shell `case .. in foo) ..` would close the function
 # prematurely. We use grep -E with anchored alternations (no parens) instead.
+ESP32_VIDS := ^303a$$|^10c4$$|^1a86$$|^0403$$
+
+# vid_of(<tty name>) prints the USB vendor id of a tty by walking up from
+# /sys/class/tty/<name>/device until an idVendor file appears (empty output when
+# the tty has no USB parent). Defined at the top of the snippet so both loops --
+# and the recipe-time re-evaluation -- share it.
 define DETECT_PORT_SH
+vid_of() { \
+    cur=$$(readlink -f "/sys/class/tty/$$1/device" 2>/dev/null); \
+    [ -n "$$cur" ] || return 0; \
+    for _ in 1 2 3 4 5 6; do \
+        if [ -f "$$cur/idVendor" ]; then cat "$$cur/idVendor"; return 0; fi; \
+        p=$$(dirname "$$cur"); [ "$$p" = "$$cur" ] && return 0; cur="$$p"; \
+    done; \
+}; \
 match=""; \
 for s in /dev/serial/by-id/*; do \
     [ -L "$$s" ] || continue; \
     target=$$(readlink -f "$$s"); \
     [ -e "$$target" ] || continue; \
     name=$$(basename "$$target"); \
-    cur=$$(readlink -f "/sys/class/tty/$$name/device" 2>/dev/null); \
-    [ -n "$$cur" ] || continue; \
-    vid=""; \
-    for _ in 1 2 3 4 5 6; do \
-        [ -f "$$cur/idVendor" ] && { vid=$$(cat "$$cur/idVendor"); break; }; \
-        p=$$(dirname "$$cur"); [ "$$p" = "$$cur" ] && break; cur="$$p"; \
-    done; \
-    if echo "$$vid" | grep -qE '^303a$$|^10c4$$|^1a86$$|^0403$$'; then match="$$s"; break; fi; \
+    vid=$$(vid_of "$$name"); \
+    if echo "$$vid" | grep -qE '$(ESP32_VIDS)'; then match="$$s"; break; fi; \
 done; \
 if [ -z "$$match" ]; then \
     for d in /dev/ttyACM* /dev/ttyUSB*; do \
         [ -e "$$d" ] || continue; \
         name=$$(basename "$$d"); \
-        cur=$$(readlink -f "/sys/class/tty/$$name/device" 2>/dev/null); \
-        [ -n "$$cur" ] || continue; \
-        vid=""; \
-        for _ in 1 2 3 4 5 6; do \
-            [ -f "$$cur/idVendor" ] && { vid=$$(cat "$$cur/idVendor"); break; }; \
-            p=$$(dirname "$$cur"); [ "$$p" = "$$cur" ] && break; cur="$$p"; \
-        done; \
-        if echo "$$vid" | grep -qE '^303a$$|^10c4$$|^1a86$$|^0403$$'; then match="$$d"; break; fi; \
+        vid=$$(vid_of "$$name"); \
+        if echo "$$vid" | grep -qE '$(ESP32_VIDS)'; then match="$$d"; break; fi; \
     done; \
 fi; \
 if [ -z "$$match" ]; then \
@@ -120,7 +132,14 @@ MESHTASTIC_OFFSET := 0x0
 ESPTOOL_FLAGS := --chip $(CHIP) --port $(PORT) --baud $(BAUD)
 WRITE_FLAGS   := --flash_mode qio --flash_freq 80m --flash_size 16MB
 
-.PHONY: help build upload clean flash-factory flash-spiffs flash-meshtastic erase monitor chip-info
+# flash_bin(<file>, <offset>, <label>): check the image exists, then write it.
+define FLASH_BIN
+	@test -f "$(1)" || { echo "$(3) firmware not found: $(1)"; exit 1; }
+	@echo ">>> Flashing $(1) -> $(2)"
+	$(ESPTOOL) $(ESPTOOL_FLAGS) write_flash $(WRITE_FLAGS) $(2) "$(1)"
+endef
+
+.PHONY: help build upload upload-modem build-modem clean flash-factory flash-spiffs flash-meshtastic erase monitor chip-info
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -132,9 +151,9 @@ help:
 	@echo "MESHTASTIC=$(MESHTASTIC)"
 
 build: ## Compile current src_dir for $(ENV)
-	$(PIO) run -e $(ENV)
+	$(PIO_ENV) $(PIO) run -e $(ENV)
 
-upload: build ## Compile and flash to device
+upload: ## Compile and flash to device
 	@port="$(PORT)"; \
 	if [ ! -e "$$port" ]; then \
 	    port=$$($(DETECT_PORT_SH)); \
@@ -153,15 +172,19 @@ upload: build ## Compile and flash to device
 	    exit 1; \
 	fi; \
 	echo ">>> Uploading to $$port"; \
-	$(PIO) run -e $(ENV) -t upload --upload-port "$$port"
+	$(PIO_ENV) $(PIO) run -e $(ENV) -t upload --upload-port "$$port"
+
+build-modem: ## Compile the tethering sketch (4G -> WiFi softAP)
+	@$(MAKE) build $(MODEM_ARGS)
+
+upload-modem: ## Compile and flash the tethering sketch (4G -> WiFi softAP)
+	@$(MAKE) upload $(MODEM_ARGS)
 
 clean: ## Clean build artifacts
 	$(PIO) run -e $(ENV) -t clean
 
 flash-factory: ## Flash a prebuilt factory firmware bin at 0x0
-	@test -f "$(FACTORY)" || { echo "Factory firmware not found: $(FACTORY)"; exit 1; }
-	@echo ">>> Flashing $(FACTORY) -> $(FACTORY_OFFSET)"
-	$(ESPTOOL) $(ESPTOOL_FLAGS) write_flash $(WRITE_FLAGS) $(FACTORY_OFFSET) "$(FACTORY)"
+	$(call FLASH_BIN,$(FACTORY),$(FACTORY_OFFSET),Factory)
 
 flash-spiffs: ## Flash spiffs.bin at SPIFFS partition offset
 	@test -f "$(SPIFFS)" || { echo "SPIFFS image not found: $(SPIFFS)"; exit 1; }
@@ -169,9 +192,7 @@ flash-spiffs: ## Flash spiffs.bin at SPIFFS partition offset
 	$(ESPTOOL) $(ESPTOOL_FLAGS) write_flash $(SPIFFS_OFFSET) "$(SPIFFS)"
 
 flash-meshtastic: ## Flash a prebuilt meshtastic build at 0x0
-	@test -f "$(MESHTASTIC)" || { echo "Meshtastic firmware not found: $(MESHTASTIC)"; exit 1; }
-	@echo ">>> Flashing $(MESHTASTIC) -> $(MESHTASTIC_OFFSET)"
-	$(ESPTOOL) $(ESPTOOL_FLAGS) write_flash $(WRITE_FLAGS) $(MESHTASTIC_OFFSET) "$(MESHTASTIC)"
+	$(call FLASH_BIN,$(MESHTASTIC),$(MESHTASTIC_OFFSET),Meshtastic)
 
 erase: ## Erase entire flash
 	$(ESPTOOL) $(ESPTOOL_FLAGS) erase_flash

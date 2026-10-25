@@ -2,19 +2,14 @@
 #include "ui_scr_mrg.h"
 
 /* 记录所有的屏幕卡片 */ 
-scr_card_t *scr_mgr_head;
-scr_card_t *scr_mgr_top;
+static scr_card_t *scr_mgr_head;
+static scr_card_t *scr_mgr_top;
 
 /* 被调用屏幕栈 */
-scr_card_t *scr_stack_root;
-scr_card_t *scr_stack_top;
+static scr_card_t *scr_stack_root;
+static scr_card_t *scr_stack_top;
 
-uint32_t scr_anim_time = SCR_MGR_ANIM_TIME; 
-lv_scr_load_anim_t scr_anim_sw = SCR_MGR_SCR_SWITCH_ANIM;
-lv_scr_load_anim_t scr_anim_push = SCR_MGR_SCR_PUSH_ANIM;
-lv_scr_load_anim_t scr_anim_pop = SCR_MGR_SCR_POP_ANIM;
-
-uint32_t default_bg_color = 0xFF0000;
+static const uint32_t default_bg_color = 0xFF0000;
 /*********************************************************************************
  *                              STATIC FUNCTION
  *********************************************************************************/
@@ -24,12 +19,9 @@ static lv_obj_t *scr_mgr_default_style(scr_card_t *card)
     lv_obj_set_size(obj, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(obj, lv_color_hex(default_bg_color), LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
-    // lv_obj_align(obj, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    // lv_obj_set_scroll_snap_x(obj, LV_SCROLL_SNAP_CENTER);
-    // lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_ROW);
-    // lv_obj_set_style_bg_opa(obj, LV_OPA_0, 0);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-    card->life->create(obj);
+    if (card->life->create)
+        card->life->create(obj);
     return obj;
 }
 
@@ -44,47 +36,35 @@ static scr_card_t *scr_mgr_find_by_id(int id) // 检查链表中没有没此 id
     return NULL;
 }
 
-static scr_card_t *scr_mgr_get_top(scr_card_t *head) // 获取链表最前面的节点 
-{
-    scr_card_t *p = head;
-
-    while(p->next != NULL){
-        p = p->next;
-    }
-    return p;
-}
-
 static void scr_mgr_active(scr_card_t *card)  // 设置屏幕卡片为活跃状态 
 {
-    if(card->st == SCR_MGR_STATE_DESTROYED){
-        // card->obj = card->life->create(NULL);
-        card->obj = scr_mgr_default_style(card);
-        card->life->entry();
-        card->st = SCR_MGR_STATE_ACTIVE;
-    } else if(card->st == SCR_MGR_STATE_CREATED || card->st == SCR_MGR_STATE_INACTIVE){
-        card->life->entry();
+    if(card->st == SCR_MGR_STATE_CREATED || card->st == SCR_MGR_STATE_INACTIVE){
+        if (card->life->entry)
+            card->life->entry();
         card->st = SCR_MGR_STATE_ACTIVE;
     }
 }
 
 static void scr_mgr_inactive(scr_card_t *card)
 {
-    if(card->st > SCR_MGR_STATE_INACTIVE){
-        card->life->exit();
+    if(card->st == SCR_MGR_STATE_ACTIVE){
+        if (card->life->exit)
+            card->life->exit();
         card->st = SCR_MGR_STATE_INACTIVE;
     }
 }
 
 static void scr_mgr_remove(scr_card_t *card)
 {
-    if(card->st > SCR_MGR_STATE_INACTIVE){
-        card->life->exit();
-        card->life->destroy();
-        card->st = SCR_MGR_STATE_IDLE;
-    } else if(card->st > SCR_MGR_STATE_DESTROYED){
-        card->life->destroy();
-        card->st = SCR_MGR_STATE_IDLE;
+    if(card->st == SCR_MGR_STATE_ACTIVE){
+        if (card->life->exit)
+            card->life->exit();
     }
+    if(card->st != SCR_MGR_STATE_IDLE){
+        if (card->life->destroy)
+            card->life->destroy();
+    }
+    card->st = SCR_MGR_STATE_IDLE;
 }
 
 /*********************************************************************************
@@ -131,29 +111,25 @@ bool scr_mgr_switch(int id, bool anim)  // 清空栈，然后切换到指定 id�
 {
     scr_card_t *tgt_card = scr_mgr_find_by_id(id);
     scr_card_t *stack_scr = NULL;
-    lv_obj_t *curr_obj = NULL;
+    lv_obj_t *old_top_obj;
+
+    (void)anim;
 
     if(tgt_card == NULL) // 没有找到该屏幕
         return false;
 
-    if(scr_stack_top != NULL) { // 如果有多张屏幕卡片叠在一起，就先记录顶层卡片
-        curr_obj = scr_stack_top->obj;
-        stack_scr = scr_stack_top->prev;
+    old_top_obj = scr_stack_top ? scr_stack_top->obj : NULL;
+    while(scr_stack_top != NULL) { // 清除所有卡片
+        scr_card_t *prev = scr_stack_top->prev;
         scr_mgr_remove(scr_stack_top);
-        lv_mem_free((void *)scr_stack_top);
-        scr_stack_top = stack_scr;
-    }
-    while(scr_stack_top != NULL) { // 然后清除所有卡片
-        stack_scr = scr_stack_top->prev;
-        curr_obj = scr_stack_top->obj;
-        scr_mgr_remove(scr_stack_top);
-        lv_mem_free((void *)scr_stack_top);
-        scr_stack_top = stack_scr;
+        if (scr_stack_top->obj && scr_stack_top->obj != old_top_obj)
+            lv_obj_del(scr_stack_top->obj);     // non-active screens can go now
+        lv_mem_free(scr_stack_top);
+        scr_stack_top = prev;
     }
 
     stack_scr = lv_mem_alloc(sizeof(scr_card_t));
     stack_scr->id = tgt_card->id;
-    // stack_scr->obj = tgt_card->life->create(NULL);
     stack_scr->obj = scr_mgr_default_style(tgt_card);
     stack_scr->st = SCR_MGR_STATE_CREATED;
     stack_scr->life = tgt_card->life;
@@ -164,13 +140,9 @@ bool scr_mgr_switch(int id, bool anim)  // 清空栈，然后切换到指定 id�
 
     scr_mgr_active(stack_scr); // 设置屏幕卡片为活跃状态
 
-    if(scr_anim_sw != LV_SCR_LOAD_ANIM_NONE && anim){
-        lv_scr_load_anim(stack_scr->obj, scr_anim_sw, scr_anim_time, 0, true);
-    } else{
-        lv_scr_load(stack_scr->obj);
-        if(curr_obj)
-            lv_obj_del(curr_obj);
-    }
+    lv_scr_load(stack_scr->obj);
+    if (old_top_obj)
+        lv_obj_del(old_top_obj);   // the previously active screen
     return true;
 }
 
@@ -178,6 +150,8 @@ bool scr_mgr_push(int id, bool anim)
 {
     scr_card_t *tgt_card = scr_mgr_find_by_id(id);
     scr_card_t *stack_scr = NULL;
+
+    (void)anim;
 
     if(tgt_card == NULL){ // 没有找到该屏幕
         return false;
@@ -189,7 +163,6 @@ bool scr_mgr_push(int id, bool anim)
 
     stack_scr = lv_mem_alloc(sizeof(scr_card_t));
     stack_scr->id = tgt_card->id;
-    // stack_scr->obj = tgt_card->life->create(NULL);
     stack_scr->obj = scr_mgr_default_style(tgt_card);
     stack_scr->st = SCR_MGR_STATE_CREATED;
     stack_scr->life = tgt_card->life;
@@ -208,11 +181,7 @@ bool scr_mgr_push(int id, bool anim)
 
     scr_mgr_active(stack_scr);
 
-    if(scr_anim_push != LV_SCR_LOAD_ANIM_NONE && anim){
-        lv_scr_load_anim(stack_scr->obj, scr_anim_push, scr_anim_time, 0, false);
-    } else{
-        lv_scr_load(stack_scr->obj);
-    }
+    lv_scr_load(stack_scr->obj);
     return true;
 }
 
@@ -220,6 +189,8 @@ bool scr_mgr_pop(bool anim)
 {
     scr_card_t *dst_item = NULL;
     lv_obj_t *cur_obj;
+
+    (void)anim;
 
     if(scr_stack_top == NULL || scr_stack_top == scr_stack_root){
         return false;
@@ -233,15 +204,11 @@ bool scr_mgr_pop(bool anim)
 
     scr_mgr_active(dst_item);
 
-    if(scr_anim_pop != LV_SCR_LOAD_ANIM_NONE && anim){
-        lv_scr_load_anim(dst_item->obj, scr_anim_pop, scr_anim_time, 0, true);
-    } else{
-        lv_scr_load(dst_item->obj);
-        if (cur_obj) {
-            lv_obj_del(cur_obj);
-        }
+    lv_scr_load(dst_item->obj);
+    if (cur_obj) {
+        lv_obj_del(cur_obj);
     }
-    return false;
+    return true;
 }
 
 int scr_mgr_get_curr_scr_id(void)
@@ -263,24 +230,9 @@ scr_lifecycle_t *scr_mgr_get_curr_life(void)
     return NULL;
 }
 
-// set anim
-void scr_mgr_set_anim(lv_scr_load_anim_t sw, lv_scr_load_anim_t push, lv_scr_load_anim_t pop)
+/* Return the screen object of the currently active screen, or NULL if no
+ * screen is on the stack. */
+lv_obj_t *scr_mgr_get_curr_obj(void)
 {
-    if(sw >= LV_SCR_LOAD_ANIM_NONE && sw <= LV_SCR_LOAD_ANIM_OUT_BOTTOM){
-        scr_anim_sw = sw;
-    }
-    if(push >= LV_SCR_LOAD_ANIM_NONE && push <= LV_SCR_LOAD_ANIM_OUT_BOTTOM){
-        scr_anim_push = push;
-    }
-    if(pop >= LV_SCR_LOAD_ANIM_NONE && pop <= LV_SCR_LOAD_ANIM_OUT_BOTTOM){
-        scr_anim_pop = pop;
-    }
+    return scr_stack_top ? scr_stack_top->obj : NULL;
 }
-
-// set bg color
-void scr_mgr_set_bg_color(uint32_t c)
-{
-    default_bg_color = c;
-}
-
-

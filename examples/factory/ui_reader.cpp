@@ -4,7 +4,7 @@
  *
  * Also contains the reader font catalog (reader_faces[]) and the two
  * cross-TU font helpers that all split TUs share:
- *   ui_get_font()     — resolves FONT_BOLD_SIZE_* macros everywhere
+ *   ui_get_font()     — resolves the UI_FONT / UI_FONT_MONO() macros everywhere
  *   topbar_font_get() — used by ui_taskbar_create() in ui_deckpro.cpp
  *
  * Pure move from ui_deckpro.cpp.  No behaviour change.
@@ -13,7 +13,6 @@
 
 
 //************************************[ screen dict ]*************************************** Dictionary (EN -> PT-BR)
-#if 1
 static lv_obj_t  *dict_query_ta    = NULL;
 static lv_obj_t  *dict_result_lab  = NULL;
 
@@ -24,13 +23,8 @@ static void dict_do_lookup(void)
     if (!q || !*q) return;
 
     // Trim trailing whitespace/newlines from the textarea before lookup.
-    char trimmed[64] = {0};
-    size_t out = 0;
-    for (size_t i = 0; q[i] && out < sizeof(trimmed) - 1; i++) {
-        unsigned char c = (unsigned char)q[i];
-        if (c >= 32 && c < 127) trimmed[out++] = (char)c;
-    }
-    while (out > 0 && trimmed[out - 1] == ' ') trimmed[--out] = '\0';
+    char trimmed[64];
+    size_t out = ui_ascii_trim(trimmed, sizeof(trimmed), q);
     if (out == 0) return;
 
     char *def = ui_dict_lookup(trimmed);
@@ -50,11 +44,11 @@ static void on_key_dict(void)
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == 'E') {                       // Enter -> look up
+        if (key == KEY_ENTER) {                 // Enter -> look up
             dict_do_lookup();
-        } else if (key == 0x08) {               // Backspace
+        } else if (key == KEY_BACKSPACE) {      // Backspace
             lv_textarea_del_char(dict_query_ta);
-        } else if (key == 0x1B) {               // Esc -> back home
+        } else if (key == KEY_ESC) {            // Esc -> back home
             scr_mgr_switch(SCREEN0_ID, false);
             return;
         } else if (key >= 32 && key <= 126) {
@@ -66,54 +60,41 @@ static void on_key_dict(void)
 static void create_dict(lv_obj_t *parent)
 {
     ui_taskbar_create(parent);
-    int status_bar_height = 25;
 
     dict_query_ta = lv_textarea_create(parent);
     lv_textarea_set_one_line(dict_query_ta, true);
     lv_textarea_set_placeholder_text(dict_query_ta, "type word, press Enter");
     lv_obj_set_size(dict_query_ta, lv_pct(100), 36);
-    lv_obj_align(dict_query_ta, LV_ALIGN_TOP_MID, 0, status_bar_height + 2);
-    lv_obj_set_style_text_font(dict_query_ta, FONT_BOLD_SIZE_15, LV_PART_MAIN);
+    lv_obj_align(dict_query_ta, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H + 2);
+    lv_obj_set_style_text_font(dict_query_ta, UI_FONT, LV_PART_MAIN);
     lv_textarea_set_text(dict_query_ta, "");
 
-    lv_group_t *g = lv_group_get_default();
-    if (!g) {
-        g = lv_group_create();
-        lv_group_set_default(g);
-    }
+    lv_group_t *g = ui_default_group();
     lv_group_add_obj(g, dict_query_ta);
     lv_group_focus_obj(dict_query_ta);
 
     dict_result_lab = lv_label_create(parent);
-    lv_obj_set_size(dict_result_lab, lv_pct(100) - 8, LV_VER_RES - status_bar_height - 50);
-    lv_obj_align(dict_result_lab, LV_ALIGN_TOP_MID, 0, status_bar_height + 44);
-    lv_obj_set_style_text_font(dict_result_lab, FONT_BOLD_SIZE_15, LV_PART_MAIN);
+    lv_obj_set_size(dict_result_lab, lv_pct(100) - 8, LV_VER_RES - UI_TASKBAR_H - 50);
+    lv_obj_align(dict_result_lab, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H + 44);
+    lv_obj_set_style_text_font(dict_result_lab, UI_FONT, LV_PART_MAIN);
     lv_label_set_long_mode(dict_result_lab, LV_LABEL_LONG_WRAP);
     lv_label_set_text(dict_result_lab, "EN -> PT-BR\n\nType a word and press Enter.");
 }
 
 static void entry_dict(void)
 {
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
+    ui_taskbar_enter();
     ui_disp_full_refr();
 }
 
 static void exit_dict(void)
 {
-    lv_timer_pause(taskbar_update_timer);
+    ui_taskbar_leave();
     ui_disp_full_refr();
 }
 
 static void destroy_dict(void)
 {
-    if (menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
     dict_query_ta = NULL;
     dict_result_lab = NULL;
 }
@@ -125,10 +106,8 @@ scr_lifecycle_t screen_dict = {
     .destroy = destroy_dict,
     .on_key    = on_key_dict,
 };
-#endif
 
 //************************************[ screen 13 ]***************************************** Ebook Reader List
-#if 1
 
 static bool ends_with(const char *str, const char *suffix) {
     if (!str || !suffix)
@@ -141,7 +120,6 @@ static bool ends_with(const char *str, const char *suffix) {
 }
 
 static lv_obj_t *reader_list_obj;
-static bool reader_use_sd = true; // Always use SD for ebooks
 // reader_selected_file, reader_resume_pending, and reader_resume_offset are
 // defined earlier in the file so the home-screen 'c' shortcut can reach them.
 static lv_group_t *reader_group = NULL;
@@ -161,12 +139,12 @@ static void reader_list_update(void)
 
     char list[UI_READER_MAX_COUNT][32];
     int count = 0;
-    ui_reader_get_list(reader_use_sd, list, &count);
+    ui_reader_get_list(list, &count);
 
     for (int i = 0; i < count; i++) {
         if (ends_with(list[i], ".txt") || ends_with(list[i], ".TXT")) {
             lv_obj_t * btn = lv_list_add_btn(reader_list_obj, NULL, list[i]);
-            lv_obj_set_style_text_font(btn, FONT_BOLD_SIZE_14, LV_PART_MAIN);
+            lv_obj_set_style_text_font(btn, UI_FONT, LV_PART_MAIN);
             reader_apply_focus_style(btn);
             if (reader_group) lv_group_add_obj(reader_group, btn);
         }
@@ -199,11 +177,6 @@ static void reader_list_btn_event_cb(lv_event_t * e)
     }
 }
 
-static void scr13_back_btn_event_cb(lv_event_t * e)
-{
-    scr_mgr_pop(false);
-}
-
 static void on_key_reader(void)
 {
     char key;
@@ -218,7 +191,7 @@ static void on_key_reader(void)
             lv_group_focus_prev(reader_group);
             lv_obj_t *f = lv_group_get_focused(reader_group);
             if (f) lv_obj_scroll_to_view(f, LV_ANIM_OFF);
-        } else if (key == 'E') {
+        } else if (key == KEY_ENTER) {
             lv_obj_t *f = lv_group_get_focused(reader_group);
             if (f) {
                 const char *name = lv_list_get_btn_text(reader_list_obj, f);
@@ -228,7 +201,7 @@ static void on_key_reader(void)
                     return;
                 }
             }
-        } else if (key == 0x1B) {
+        } else if (key == KEY_ESC) {
             scr_mgr_pop(false);
             return;
         }
@@ -238,10 +211,9 @@ static void on_key_reader(void)
 static void create13(lv_obj_t *parent)
 {
     ui_taskbar_create(parent);
-    int status_bar_height = 25;
 
     reader_list_obj = lv_list_create(parent);
-    lv_obj_set_size(reader_list_obj, lv_pct(100), LV_VER_RES - status_bar_height);
+    lv_obj_set_size(reader_list_obj, lv_pct(100), LV_VER_RES - UI_TASKBAR_H);
     lv_obj_align(reader_list_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(reader_list_obj, reader_list_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -259,35 +231,21 @@ static void entry13(void)
     }
 
 
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
+    ui_taskbar_enter();
 }
 
 static void exit13(void) {
-    lv_timer_pause(taskbar_update_timer);
-}
-
-static void destroy13(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
+    ui_taskbar_leave();
 }
 
 scr_lifecycle_t screen13 = {
     .create = create13,
     .entry = entry13,
     .exit  = exit13,
-    .destroy = destroy13,
     .on_key    = on_key_reader,
 };
-#endif
 
 //************************************[ screen 13.1 ]*************************************** Ebook Reader View
-#if 1
 
 static lv_obj_t *reader_view_label;
 static lv_obj_t *reader_view_status;
@@ -460,11 +418,6 @@ static void reader_font_step_size(int slot, int dir)
 static void reader_font_cycle_face(int slot) { reader_font_step_face(slot, +1); }
 static void reader_font_cycle_size(int slot) { reader_font_step_size(slot, +1); }
 
-static void scr13_1_back_btn_event_cb(lv_event_t * e)
-{
-    scr_mgr_pop(false);
-}
-
 // ── § 3.5 fix 1: cached layout geometry ──────────────────────────────────────
 // max_w / avail_h / line_h / letter_space / line_space only change when the
 // font, rotation, or bar visibility changes.  Computing them per page via
@@ -559,7 +512,7 @@ static size_t reader_clip_to_visible(size_t got)
 static size_t reader_read_one_page(size_t off)
 {
     if (!reader_page_buf) return 0; // guard: PSRAM not yet allocated
-    size_t got = ui_reader_read_range(reader_use_sd, reader_selected_file,
+    size_t got = ui_reader_read_range(reader_selected_file,
                                       off, reader_page_buf, READER_PAGE_BYTES + 1);
     if (got == 0) return 0;
 
@@ -784,13 +737,11 @@ static void reader_apply_rotation(void)
 // the next reader_geo_refresh() picks up the new dimensions.
 static void reader_apply_layout(void)
 {
-    int status_bar_height = ui_reader_bars_hidden_get() ? 14 : 25;
-    int footer_height     = ui_reader_bars_hidden_get() ? 8 : 24;
+    bool bars_hidden    = ui_reader_bars_hidden_get();
+    int status_bar_height = bars_hidden ? 14 : UI_TASKBAR_H;
+    int footer_height     = bars_hidden ? 8 : 24;
     int pad_left = 10;
-    if (menu_taskbar) {
-        if (ui_reader_bars_hidden_get()) lv_obj_add_flag(menu_taskbar, LV_OBJ_FLAG_HIDDEN);
-        else                    lv_obj_clear_flag(menu_taskbar, LV_OBJ_FLAG_HIDDEN);
-    }
+    ui_obj_set_hidden(menu_taskbar, bars_hidden);
     if (reader_view_label) {
         lv_obj_set_size(reader_view_label, lv_pct(100),
                         LV_VER_RES - status_bar_height - footer_height);
@@ -798,10 +749,8 @@ static void reader_apply_layout(void)
         lv_obj_set_style_pad_left(reader_view_label, pad_left, LV_PART_MAIN);
     }
     if (reader_view_status) {
-        if (ui_reader_bars_hidden_get()) {
-            lv_obj_add_flag(reader_view_status, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_clear_flag(reader_view_status, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden(reader_view_status, bars_hidden);
+        if (!bars_hidden) {
             lv_obj_set_size(reader_view_status, lv_pct(100), footer_height);
             lv_obj_align(reader_view_status, LV_ALIGN_BOTTOM_MID, 0, 0);
             lv_obj_set_style_pad_left(reader_view_status, pad_left, LV_PART_MAIN);
@@ -818,7 +767,7 @@ static void on_key_reader_view(void)
     bool changed = false;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc -> back to list
+        if (key == KEY_ESC) { // Esc -> back to list
             scr_mgr_pop(false);
             return;
         } else if (key == 'j') { // next page
@@ -872,9 +821,7 @@ static void on_key_reader_view(void)
             // visible mid-tick portrait flush followed by a landscape one.
             // Debounce: ignore further 'r' presses within 300 ms.
             static uint32_t last_rot_ms = 0;
-            uint32_t now = lv_tick_get();
-            if (now - last_rot_ms < 300) continue;
-            last_rot_ms = now;
+            if (!ui_debounce(&last_rot_ms, 300)) continue;
 
             ui_reader_rotation_set(!ui_reader_rotation_get());
             reader_apply_rotation();
@@ -904,13 +851,12 @@ static void on_key_reader_view(void)
 static void create13_1(lv_obj_t *parent)
 {
     ui_taskbar_create(parent);
-    int status_bar_height = 25;
     int footer_height = 24;
 
     reader_view_label = lv_label_create(parent);
     lv_obj_set_size(reader_view_label, lv_pct(100),
-                    LV_VER_RES - status_bar_height - footer_height);
-    lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, status_bar_height);
+                    LV_VER_RES - UI_TASKBAR_H - footer_height);
+    lv_obj_align(reader_view_label, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H);
     lv_obj_set_style_text_font(reader_view_label, reader_body_font_get(), LV_PART_MAIN);
     lv_obj_set_style_text_line_space(reader_view_label, ui_reader_line_space_get(), LV_PART_MAIN);
     lv_label_set_long_mode(reader_view_label, LV_LABEL_LONG_WRAP);
@@ -958,6 +904,14 @@ static uint32_t reader_geo_cookie(void)
     return c;
 }
 
+// entry13_1 runs from inside scr_mgr_push(), so popping synchronously there
+// would free the very card the push is still filling in. Defer the pop to the
+// next LVGL tick, when the push has returned.
+static void reader_pop_async(void *)
+{
+    scr_mgr_pop(false);
+}
+
 static void entry13_1(void)
 {
     // ── § 2.3: allocate reader buffers from PSRAM ─────────────────────────
@@ -979,17 +933,14 @@ static void entry13_1(void)
         Serial.println("[reader] PSRAM alloc failed — refusing to open reader");
         ui_toast_show("Reader: not enough PSRAM", 4000);
         ui_disp_full_refr();
-        // The screen is already pushed; pop it so we don't land on a blank view.
-        scr_mgr_pop(false);
+        // The screen is already pushed; pop it so we don't land on a blank
+        // view — deferred, because we are still inside scr_mgr_push().
+        lv_async_call(reader_pop_async, NULL);
         return;
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
+    ui_taskbar_enter();
 
     // Apply rotation first; it affects screen dims that the layout reads.
     reader_apply_rotation();
@@ -1020,7 +971,7 @@ static void entry13_1(void)
     // Open the file once and cache its handle for the lifetime of the view.
     // Every page read (resume seek, j/k page flip, font reflow) now reuses
     // this handle instead of reopening.
-    reader_file_size = ui_reader_open_view(reader_use_sd, reader_selected_file);
+    reader_file_size = ui_reader_open_view(reader_selected_file);
 
     if (reader_resume_pending && reader_resume_offset < reader_file_size) {
         // ── § 3.5 fix 2: O(1) resume fast path ───────────────────────────
@@ -1096,7 +1047,7 @@ static void exit13_1(void)
     reader_resume_page_base = 0;
     // ─────────────────────────────────────────────────────────────────────
 
-    lv_timer_pause(taskbar_update_timer);
+    ui_taskbar_leave();
     ui_reader_close_view();
     // Other screens are laid out for portrait — restore on the way out so
     // the rest of the UI doesn't render rotated.
@@ -1111,24 +1062,14 @@ static void exit13_1(void)
     ui_disp_full_refr();
 }
 
-static void destroy13_1(void) {
-    if(menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
-}
-
 scr_lifecycle_t screen13_1 = {
     .create = create13_1,
     .entry = entry13_1,
     .exit  = exit13_1,
-    .destroy = destroy13_1,
     .on_key    = on_key_reader_view,
 };
-#endif
 
 //************************************[ screen 13.2 ]*************************************** Reader Font
-#if 1
 
 static lv_obj_t *system_font_slot_btn = NULL;
 static lv_obj_t *system_font_face_btn = NULL;
@@ -1182,21 +1123,7 @@ static void system_font_apply_focus_style(void)
     };
     for (int i = 0; i < SF_FOCUS_COUNT; i++) {
         bool focused = (i == (int)system_font_focus);
-        bool editing = focused && system_font_editing;
-        if (editing) {
-            // Inverted: black bg, white text — clearly distinct from focused.
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 3, LV_PART_MAIN);
-        } else if (focused) {
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 3, LV_PART_MAIN);
-        } else {
-            lv_obj_set_style_bg_color(btns[i], DECKPRO_COLOR_BG, LV_PART_MAIN);
-            lv_obj_set_style_text_color(btns[i], DECKPRO_COLOR_FG, LV_PART_MAIN);
-            lv_obj_set_style_border_width(btns[i], 1, LV_PART_MAIN);
-        }
+        ui_edit_focus_style(btns[i], focused, focused && system_font_editing);
     }
 }
 
@@ -1252,7 +1179,7 @@ static void on_key_system_font(void)
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == 0x1B) { // Esc
+        if (key == KEY_ESC) { // Esc
             if (system_font_editing) {
                 system_font_editing = false;
                 system_font_apply_focus_style();
@@ -1260,7 +1187,7 @@ static void on_key_system_font(void)
                 scr_mgr_pop(false);
                 return;
             }
-        } else if (key == 'E') { // Enter -> toggle edit mode
+        } else if (key == KEY_ENTER) { // Enter -> toggle edit mode
             system_font_editing = !system_font_editing;
             system_font_apply_focus_style();
         } else if (key == 'j') {
@@ -1311,62 +1238,39 @@ static void system_font_lsp_event_cb(lv_event_t *e)
     system_font_refresh_labels();
 }
 
+// One 100%-wide row button with a centred label. The four System Font rows
+// (Slot, Face, Size, Line space) differ only in their callback.
+static lv_obj_t *make_btn(lv_obj_t *cont, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_btn_create(cont);
+    lv_obj_set_width(btn, lv_pct(100));
+    lv_obj_set_style_bg_color(btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_text_color(btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 5, LV_PART_MAIN);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_obj_set_style_text_font(label, UI_FONT, LV_PART_MAIN);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    return btn;
+}
+
 static void create13_2(lv_obj_t *parent)
 {
     ui_taskbar_create(parent);
-    int status_bar_height = 25;
 
     lv_obj_t *cont = lv_obj_create(parent);
-    lv_obj_set_size(cont, lv_pct(100), LV_VER_RES - status_bar_height);
+    lv_obj_set_size(cont, lv_pct(100), LV_VER_RES - UI_TASKBAR_H);
     lv_obj_align(cont, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(cont, 8, LV_PART_MAIN);
     lv_obj_set_style_pad_row(cont, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(cont, DECKPRO_COLOR_BG, LV_PART_MAIN);
 
-    system_font_slot_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_slot_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_slot_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_slot_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_slot_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_slot_btn, 5, LV_PART_MAIN);
-    lv_obj_t *sloblbl = lv_label_create(system_font_slot_btn);
-    lv_obj_set_style_text_font(sloblbl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(sloblbl);
-    lv_obj_add_event_cb(system_font_slot_btn, system_font_slot_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_face_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_face_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_face_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_face_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_face_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_face_btn, 5, LV_PART_MAIN);
-    lv_obj_t *fl = lv_label_create(system_font_face_btn);
-    lv_obj_set_style_text_font(fl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(fl);
-    lv_obj_add_event_cb(system_font_face_btn, system_font_face_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_size_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_size_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_size_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_size_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_size_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_size_btn, 5, LV_PART_MAIN);
-    lv_obj_t *sl = lv_label_create(system_font_size_btn);
-    lv_obj_set_style_text_font(sl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(sl);
-    lv_obj_add_event_cb(system_font_size_btn, system_font_size_event_cb, LV_EVENT_CLICKED, NULL);
-
-    system_font_lsp_btn = lv_btn_create(cont);
-    lv_obj_set_width(system_font_lsp_btn, lv_pct(100));
-    lv_obj_set_style_bg_color(system_font_lsp_btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(system_font_lsp_btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(system_font_lsp_btn, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(system_font_lsp_btn, 5, LV_PART_MAIN);
-    lv_obj_t *lsl = lv_label_create(system_font_lsp_btn);
-    lv_obj_set_style_text_font(lsl, FONT_BOLD_SIZE_15, LV_PART_MAIN);
-    lv_obj_center(lsl);
-    lv_obj_add_event_cb(system_font_lsp_btn, system_font_lsp_event_cb, LV_EVENT_CLICKED, NULL);
+    system_font_slot_btn = make_btn(cont, system_font_slot_event_cb);
+    system_font_face_btn = make_btn(cont, system_font_face_event_cb);
+    system_font_size_btn = make_btn(cont, system_font_size_event_cb);
+    system_font_lsp_btn  = make_btn(cont, system_font_lsp_event_cb);
 
     system_font_preview = lv_label_create(cont);
     lv_obj_set_width(system_font_preview, lv_pct(100));
@@ -1377,11 +1281,7 @@ static void create13_2(lv_obj_t *parent)
 
 static void entry13_2(void)
 {
-    lv_timer_resume(taskbar_update_timer);
-    if (menu_taskbar) {
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", ui_battery_27220_get_percent());
-    }
+    ui_taskbar_enter();
     system_font_focus = SF_FOCUS_SLOT;
     system_font_slot = UI_FONT_SLOT_GENERAL;
     system_font_editing = false;
@@ -1390,14 +1290,10 @@ static void entry13_2(void)
 
 static void exit13_2(void)
 {
-    lv_timer_pause(taskbar_update_timer);
+    ui_taskbar_leave();
 }
 
 static void destroy13_2(void) {
-    if (menu_taskbar) {
-        lv_obj_del(menu_taskbar);
-        menu_taskbar = NULL;
-    }
     system_font_slot_btn = NULL;
     system_font_face_btn = NULL;
     system_font_size_btn = NULL;
@@ -1412,6 +1308,5 @@ scr_lifecycle_t screen13_2 = {
     .destroy = destroy13_2,
     .on_key    = on_key_system_font,
 };
-#endif
 
 

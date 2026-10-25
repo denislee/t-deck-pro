@@ -20,12 +20,11 @@
 /*********************************************************************************
  *                                   DEFINES
  * *******************************************************************************/
-#ifndef DEFAULT_LANGUAGE_EN
-#define DEFAULT_LANGUAGE_EN 1
-#endif
-#ifndef DEFAULT_LANGUAGE_CN
-#define DEFAULT_LANGUAGE_CN 0
-#endif
+
+// True while a GPS bring-up (baud scan) is in flight. Owned by
+// ui_deckpro_port.cpp, set by factory.ino around its boot-time gps_init() so
+// the settings toggle does not start a second scan on the same UART.
+extern volatile bool gps_init_running;
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,10 +35,6 @@ void ui_disp_hard_refr(void);
 void ui_disp_white_clear(void);
 void ui_set_reader_landscape(bool landscape);
 
-// DEFAULT_LANGUAGE_CN、DEFAULT_LANGUAGE_EN
-void ui_setting_set_language(int language);
-int ui_setting_get_language(void);
-
 // settings persistence
 void ui_settings_load(void);
 void ui_settings_save(void);
@@ -49,9 +44,10 @@ bool ui_setting_get_red_led(void);
 bool ui_setting_get_motor_status(void);
 bool ui_setting_get_gps_status(void);
 bool ui_setting_get_lora_status(void);
+#ifdef BOARD_HAS_BHI260AP
 bool ui_setting_get_gyro_status(void);
+#endif
 bool ui_setting_get_a7682_status(void);
-bool ui_setting_get_touch_status(void);
 
 void ui_setting_set_keypad_light(bool on);
 // Drive the keypad LED without touching the persisted user preference.
@@ -62,9 +58,10 @@ void ui_setting_set_red_led(bool on);
 void ui_setting_set_motor_status(bool on);
 void ui_setting_set_gps_status(bool on);
 void ui_setting_set_lora_status(bool on);
+#ifdef BOARD_HAS_BHI260AP
 void ui_setting_set_gyro_status(bool on);
+#endif
 void ui_setting_set_a7682_status(bool on);
-void ui_setting_set_touch_status(bool on);
 
 // setting - > About System
 const char *ui_setting_get_sf_ver(void);
@@ -72,7 +69,6 @@ const char *ui_setting_get_hd_ver(void);
 void ui_setting_get_sd_capacity(uint64_t *total, uint64_t *used);
 
 // [ screen 3 ] --- GPS
-void ui_gps_task_suspend(void);
 void ui_gps_task_resume(void);
 void ui_gps_get_coord(double *lat, double *lng);
 void ui_gps_get_data(uint16_t *year, uint8_t *month, uint8_t *day);
@@ -81,7 +77,6 @@ void ui_gps_get_satellites(uint32_t *vsat);
 void ui_gps_get_speed(double *speed);
 
 // [ screen 4 ] --- Wifi Scan
-void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len);
 // Async variants used by screen4 so an Esc press can interrupt without
 // having to wait for the (multi-second) WiFi.scanNetworks() to return.
 // _start_async kicks off WiFi.scanNetworks(async=true, hidden=true).
@@ -91,17 +86,16 @@ void ui_wifi_get_scan_info(ui_wifi_scan_info_t *list, int list_len);
 void ui_wifi_scan_start_async(void);
 int  ui_wifi_scan_poll(ui_wifi_scan_info_t *list, int list_len);
 void ui_wifi_scan_cancel(void);
+// Bring the radio up/down without touching the persisted user preference.
+void ui_wifi_radio_set(bool en);
+// Bring the radio up/down AND persist the user's on/off intent.
 void ui_wifi_set_enabled(bool en);
 bool ui_wifi_get_enabled(void);
 
 // [ screen 4.1 ] --- Wifi Config + NTP
-// Stored credentials. Buffers must be at least 33 bytes for SSID and 65 for password.
-void ui_wifi_get_ssid(char *out, int out_len);
+// Stored credentials. Setter buffers are copied; no length is returned.
 void ui_wifi_set_ssid(const char *ssid);
-void ui_wifi_get_password(char *out, int out_len);
 void ui_wifi_set_password(const char *password);
-// Timezone string in POSIX TZ format (e.g. "UTC0", "EST5EDT,M3.2.0,M11.1.0").
-void ui_wifi_get_tz(char *out, int out_len);
 void ui_wifi_set_tz(const char *tz);
 
 typedef enum {
@@ -113,14 +107,14 @@ typedef enum {
 } ui_wifi_status_t;
 int ui_wifi_get_status(void);
 void ui_wifi_get_ip(char *out, int out_len);
-// Kicks off an asynchronous connect attempt using stored creds. Returns false
-// immediately if creds are missing.
-bool ui_wifi_connect(void);
 void ui_wifi_disconnect(void);
 
-// True once SNTP has produced a plausible local time (year >= 2024).
+// True once SNTP has actually answered. Polling also latches a completed
+// sync. This is not "the clock is plausible" — a persisted or
+// compile-time-seeded clock is valid with no network round-trip at all.
 bool ui_time_is_synced(void);
-// Fills 'out' with current local time. Returns true when the clock is synced.
+// Fills 'out' with current local time. Returns true once the local clock is
+// plausible (year >= 2024), i.e. restored from NVS or set by GPS/SNTP.
 bool ui_time_get_local(struct tm *out);
 // Triggers a manual NTP refresh (no-op if WiFi is not connected).
 void ui_ntp_resync(void);
@@ -141,9 +135,6 @@ bool ui_ping(const char *host_or_ip, int timeout_ms, int *rtt_ms_out);
 
 // [ screen 5 ] --- State
 bool ui_test_get(int peri_id);
-bool ui_test_sd_card(void);
-bool ui_test_a7682e(void);
-bool ui_test_pcm5102(void);
 
 // [ screen 6 ] --- Battery
 /* 25896 */
@@ -161,15 +152,12 @@ const char * ui_batt_25896_get_ntc_st(void);
 
 /* 27220 */
 bool ui_battery_27220_is_vaild(void);
-bool ui_battery_27220_get_input(void);
 bool ui_battery_27220_get_charge_finish(void);
 uint16_t ui_battery_27220_get_status(void);
 uint16_t ui_battery_27220_get_voltage(void);
 int16_t ui_battery_27220_get_current(void);
 uint16_t ui_battery_27220_get_temperature(void);
 uint16_t ui_battery_27220_get_full_capacity(void);
-uint16_t ui_battery_27220_get_design_capacity(void);
-uint16_t ui_battery_27220_get_remaining_capacity(void);
 uint16_t ui_battery_27220_get_remain_capacity(void);
 uint16_t ui_battery_27220_get_percent(void);
 uint16_t ui_battery_27220_get_health(void);
@@ -180,18 +168,19 @@ bool ui_battery_27220_is_low_alarm(void);
 bool ui_battery_is_external_power_present(void);
 
 // [ screen 7 ] --- Input
-int ui_input_get_touch_coord(int *x, int *y);
 int ui_input_get_keypad_val(char *val);
 void ui_input_set_keypad_flag(void);
+#ifdef BOARD_HAS_BHI260AP
 int ui_other_get_gyro(float *x, float *y, float *z);
+#endif
 
 // [ screen 8 ] --- Lora
 float ui_lora_get_freq(void);
 void ui_lora_set_freq(float freq);
 int ui_lora_get_bandwidth(void);
-void ui_lora_set_bandwidth(float bd);
+void ui_lora_set_bandwidth(int bd);
 int ui_lora_get_power(void);
-void ui_lora_set_power(float po);
+void ui_lora_set_power(int po);
 void ui_lora_param_set(void);
 int ui_lora_get_mode(void);
 void ui_lora_set_mode(int mode);
@@ -213,30 +202,26 @@ bool ui_pcm5102_cb(const char *at_cmd);
 void ui_pcm5102_stop(void);
 
 // [ screen 12 ] --- Notes
-#define UI_NOTES_MAX_COUNT 20
-void ui_notes_get_list(bool is_sd, char list[UI_NOTES_MAX_COUNT][32], int *count);
-char* ui_notes_read(bool is_sd, const char *filename);
-bool ui_notes_write(bool is_sd, const char *filename, const char *content);
-bool ui_notes_delete(bool is_sd, const char *filename);
+/* Copy only printable ASCII from src into dst (size n), strip trailing spaces; returns the length. */
+size_t ui_ascii_trim(char *dst, size_t n, const char *src);
+bool ui_notes_write(const char *filename, const char *content);
 
 // [ screen 13 ] --- Ebook Reader
 #define UI_READER_MAX_COUNT 20
-void ui_reader_get_list(bool is_sd, char list[UI_READER_MAX_COUNT][32], int *count);
-char* ui_reader_read(bool is_sd, const char *filename);
-size_t ui_reader_size(bool is_sd, const char *filename);
+void ui_reader_get_list(char list[UI_READER_MAX_COUNT][32], int *count);
 // Reads up to buf_size-1 bytes starting at `offset`, null-terminates buf,
 // returns bytes actually read (0 on failure / EOF).
-size_t ui_reader_read_range(bool is_sd, const char *filename, size_t offset, char *buf, size_t buf_size);
+size_t ui_reader_read_range(const char *filename, size_t offset, char *buf, size_t buf_size);
 
 // Opens the named book file and caches the File handle so subsequent
-// ui_reader_read_range calls (with the same is_sd/filename) reuse it instead
+// ui_reader_read_range calls (with the same filename) reuse it instead
 // of reopening the file from scratch each time. Returns the file size, or 0
 // on open failure. Call ui_reader_close_view() when leaving the reader.
 //
 // Why: opening a file on the SD card walks FAT directory entries over SPI;
 // for a long book the resume-seek and per-page-flip read paths used to do
 // that on every 1 KB page, making cold-load and big-book resumes slow.
-size_t ui_reader_open_view(bool is_sd, const char *filename);
+size_t ui_reader_open_view(const char *filename);
 void   ui_reader_close_view(void);
 
 // [ screen dict ] --- Dictionary
@@ -331,7 +316,6 @@ bool ui_reader_bookmark_page_get(const char *filename, int *page_index_out);
 // USB MSC
 void ui_usb_msc_begin(void);
 void ui_usb_msc_end(void);
-bool ui_usb_msc_is_active(void);
 
 #ifdef __cplusplus
 }

@@ -14,11 +14,9 @@
 SensorBHI260AP bhy;
 struct bhy2_data_xyz accel_data;
 struct bhy2_data_xyz gyro_data;
-struct bhy2_data_xyz magn_data;
 
 float accel_factor;
 float gyro_factor;
-float magn_factor;
 
 void accel_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, uint64_t *timestamp)
 {
@@ -46,24 +44,10 @@ void gyro_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, u
     //              );
 }
 
-void magn_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, uint64_t *timestamp)
-{
-    magn_factor = get_sensor_default_scaling(sensor_id);
-    bhy2_parse_xyz(data_ptr, &magn_data);
-    Serial.print(bhy.getSensorName(sensor_id));
-    // Serial.print(":");
-    // Serial.printf("x: %f, y: %f, z: %f;\r\n",
-    //               magn_data.x * magn_factor,
-    //               magn_data.y * magn_factor,
-    //               magn_data.z * magn_factor
-    //              );
-}
-
 /**
  * int val_type 
  *      1 --- acceleration
  *      2 --- gyroscope
- *      3 --- Magnetometer
 */
 void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
 {
@@ -83,11 +67,6 @@ void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
             *y = gyro_data.y * gyro_factor;
             *z = gyro_data.z * gyro_factor;
          break;
-        case 3:
-            *x = magn_data.x * magn_factor;
-            *y = magn_data.y * magn_factor;
-            *z = magn_data.z * magn_factor;
-         break;
         default:
             *x = 0;
             *y = 0;
@@ -98,6 +77,8 @@ void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
 
 bool BHI260AP_init(void)
 {
+    I2C0Guard g;
+
     // Set the reset pin and interrupt pin, if any
     bhy.setPins(BOARD_GYROSCOPDE_RST, BOARD_GYROSCOPDE_INT);
 
@@ -123,9 +104,6 @@ bool BHI260AP_init(void)
 
     // Set the gyroscope sensor result callback function
     bhy.onResultEvent(SENSOR_ID_GYRO_PASS, gyro_process_callback);
-
-    // Set the Magnetometer sensor result callback function
-    bhy.onResultEvent(SENSOR_ID_MAG_PASS, magn_process_callback);
 
     return true;
 }

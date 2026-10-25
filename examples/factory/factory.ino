@@ -1,5 +1,5 @@
 /**
- * @file      test_touchpad.h
+ * @file      factory.ino
  * @author    ShallowGreen123
  * @license   MIT
  * @copyright Copyright (c) 2023  Shenzhen Xin Yuan Electronic Technology Co., Ltd
@@ -11,19 +11,13 @@
 #include <Arduino.h>
 #include "utilities.h"
 #include <GxEPD2_BW.h>
-#include <TouchDrvCSTXXX.hpp>
-#include <TinyGPS++.h>
 #include "lvgl.h"
 #include "ui_deckpro.h"
-#include <Fonts/FreeMonoBold9pt7b.h>
 #include "factory.h"
 #include "ui_deckpro_port.h"
 #include "peripheral.h"
 #include <Preferences.h>
 #include <freertos/semphr.h>
-#include "esp_pm.h"
-
-Preferences preferences;
 
 TinyGsm modem(SerialAT);
 TaskHandle_t a7682_handle;
@@ -44,7 +38,6 @@ static constexpr uint16_t FACTORY_BQ25896_SYS_POWER_DOWN_MV = 3300;
 static constexpr uint32_t FACTORY_BQ25896_RUNTIME_CHECK_MS = 5000;
 static constexpr uint32_t FACTORY_BQ25896_RECOVERY_COOLDOWN_MS = 30000;
 static constexpr uint32_t FACTORY_EPD_SPI_HZ = 20000000;
-TouchDrvCSTXXX touch;
 // Page height is HEIGHT/8 (40 rows, 1,200 B) rather than HEIGHT (9,600 B).
 // The normal flush path bypasses the page buffer entirely — flush_epd_bitmap()
 // calls display.epd2.writeImage() directly. The paged buffer is only used by
@@ -52,8 +45,8 @@ TouchDrvCSTXXX touch;
 // over 8 pages of 40 rows each with no visible difference to the user.
 GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT / 8> display(GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)); // GDEQ031T10 240x320, UC8253, (no inking, backside mark KEGMO 3100)
 
-uint8_t *decodebuffer = NULL;
-int disp_refr_mode = DISP_REFR_MODE_PART;
+static uint8_t *decodebuffer = NULL;
+static int disp_refr_mode = DISP_REFR_MODE_PART;
 // Tracks whether LVGL is rendering in landscape (320x240 logical). We do the
 // 90° rotation ourselves during bitmap packing instead of using LVGL's
 // sw_rotate, which would split a full-screen rotated flush into ~6-8 strips
@@ -61,9 +54,7 @@ int disp_refr_mode = DISP_REFR_MODE_PART;
 // triggering its own ~700 ms EPD refresh.
 static bool s_landscape = false;
 
-bool isT_Deck_Pro_v1_0 = false;
-const char Version_str1[] = "T-Deck-Pro V1.0";
-const char Version_str2[] = "T-Deck-Pro V1.1";
+static bool isT_Deck_Pro_v1_0 = false;
 
 bool peri_init_st[E_PERI_NUM_MAX] = {0};
 static SemaphoreHandle_t shared_spi_mutex = nullptr;
@@ -98,9 +89,6 @@ void shared_spi_bus_init(void)
 
 void shared_spi_lock(void)
 {
-    if (shared_spi_mutex == nullptr) {
-        shared_spi_bus_init();
-    }
     if (shared_spi_mutex != nullptr) {
         xSemaphoreTakeRecursive(shared_spi_mutex, portMAX_DELAY);
         // Depth is updated only after the mutex is acquired, so it is
@@ -122,16 +110,29 @@ void shared_spi_unlock(void)
     }
 }
 
-// Deasserts all CS lines so each driver can assert only its own pin before
-// beginning a transaction. Does NOT assert cs_pin LOW — drivers manage their
-// own chip-select timing. The cs_pin argument is retained for call-site
-// clarity (callers pass the pin they are about to use) but is not driven here.
-// Rename to shared_spi_deselect_all() is a follow-up: callers in other files
-// would need updating and are owned by a different agent.
-void shared_spi_prepare_device(int cs_pin)
+// Power-rail and modem-powerkey pins held across deep sleep.
+static const uint8_t k_rail_pins[] = {
+    BOARD_6609_EN,
+    BOARD_LORA_EN,
+    BOARD_GPS_EN,
+    BOARD_1V8_EN,
+    BOARD_A7682E_PWRKEY,
+};
+
+void board_rails_hold(bool hold)
 {
-    (void)cs_pin;  /* see comment above — pin is not driven here */
-    shared_spi_release_all_cs();
+    for (uint8_t pin : k_rail_pins) {
+        if (hold) {
+            gpio_hold_en((gpio_num_t)pin);
+        } else {
+            gpio_hold_dis((gpio_num_t)pin);
+        }
+    }
+    if (hold) {
+        gpio_deep_sleep_hold_en();
+    } else {
+        gpio_deep_sleep_hold_dis();
+    }
 }
 
 /*********************************************************************************
@@ -139,18 +140,12 @@ void shared_spi_prepare_device(int cs_pin)
  * *******************************************************************************/
 static bool ink_screen_init()
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
+    SpiGuard spi;
 
-    // SPI.begin(BOARD_SPI_SCK, -1, BOARD_SPI_MOSI, BOARD_EPD_CS);
     display.epd2.selectSPI(SPI, SPISettings(FACTORY_EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
     display.init(115200, true, 2, false);
     display.setRotation(0);
-    display.setFont(&FreeMonoBold9pt7b);
-    if (display.epd2.WIDTH < 104) display.setFont(0);
-    display.setTextColor(GxEPD_BLACK);
     display.powerOff();
-    shared_spi_unlock();
     return true;
 }
 
@@ -241,10 +236,29 @@ static void epd_poweroff_timer_cb(lv_timer_t *t)
 {
     (void)t;
     s_epd_poweroff_timer = NULL;  /* mark as expired before the SPI call */
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
+    SpiGuard spi;
     display.epd2.powerOff();
-    shared_spi_unlock();
+}
+
+// Cancel the deferred power-down timer before explicitly powering off.
+// Both this function and the timer callback run from the LVGL task so
+// there is no concurrency, but we must not leave a stale timer that
+// fires after the panel has already been powered off for sleep/shutdown.
+static void epd_cancel_poweroff_timer(void)
+{
+    if (s_epd_poweroff_timer != NULL) {
+        lv_timer_del(s_epd_poweroff_timer);
+        s_epd_poweroff_timer = NULL;
+    }
+}
+
+// Fill the whole panel with one colour. The caller owns setFullWindow().
+static void epd_fill(uint16_t color)
+{
+    display.firstPage();
+    do {
+        display.fillScreen(color);
+    } while (display.nextPage());
 }
 
 static void flush_epd_bitmap(const lv_area_t *panel_area)
@@ -256,29 +270,28 @@ static void flush_epd_bitmap(const lv_area_t *panel_area)
         return;
     }
 
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
+    {
+        SpiGuard spi;
 
-    // Direct write to controller memory + refresh, skipping the
-    // firstPage()/nextPage() Adafruit_GFX raster path. decodebuffer is already
-    // in panel-native polarity and orientation; the rounder_cb enforces the
-    // 8-pixel x-alignment writeImage requires.
-    //
-    // writeImageAgain after refresh updates the controller's "previous"
-    // buffer — UC8253 partial refresh diffs current vs. previous, so without
-    // this step the next partial flush would overlay onto a stale baseline,
-    // causing ghosting on page turns. writeImageForFullRefresh seeds both
-    // buffers in one call, so the full path doesn't need writeImageAgain.
-    if (disp_refr_mode == DISP_REFR_MODE_PART) {
-        display.epd2.writeImage(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
-        display.epd2.refresh(panel_area->x1, panel_area->y1, width, height);
-        display.epd2.writeImageAgain(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
-    } else {
-        display.epd2.writeImageForFullRefresh(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
-        display.epd2.refresh(false);
+        // Direct write to controller memory + refresh, skipping the
+        // firstPage()/nextPage() Adafruit_GFX raster path. decodebuffer is already
+        // in panel-native polarity and orientation; the rounder_cb enforces the
+        // 8-pixel x-alignment writeImage requires.
+        //
+        // writeImageAgain after refresh updates the controller's "previous"
+        // buffer — UC8253 partial refresh diffs current vs. previous, so without
+        // this step the next partial flush would overlay onto a stale baseline,
+        // causing ghosting on page turns. writeImageForFullRefresh seeds both
+        // buffers in one call, so the full path doesn't need writeImageAgain.
+        if (disp_refr_mode == DISP_REFR_MODE_PART) {
+            display.epd2.writeImage(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
+            display.epd2.refresh(panel_area->x1, panel_area->y1, width, height);
+            display.epd2.writeImageAgain(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
+        } else {
+            display.epd2.writeImageForFullRefresh(decodebuffer, panel_area->x1, panel_area->y1, width, height, false);
+            display.epd2.refresh(false);
+        }
     }
-
-    shared_spi_unlock();
 
     // Defer powerOff() rather than doing it on every flush. Rapid UI changes
     // (typing, settings navigation) pay the panel power-on cost only once
@@ -341,42 +354,14 @@ static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_colo
     lv_disp_flush_ready(disp_drv);
 }
 
-static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
-{
-    static lv_coord_t last_x = 0;
-    static lv_coord_t last_y = 0;
-
-    if (!ui_setting_get_touch_status()) {
-        data->state = LV_INDEV_STATE_REL;
-        data->point.x = last_x;
-        data->point.y = last_y;
-        return;
-    }
-
-    // uint8_t touched = touch.getPoint(&last_x, &last_y, 1);
-    uint8_t touched = hyn_touch_get_point(&last_x, &last_y, 1);
-    if(touched) {
-        data->state = LV_INDEV_STATE_PR;
-
-        Serial.printf("x = %d, y = %d\n", last_x, last_y);
-    } else {
-        data->state = LV_INDEV_STATE_REL;
-    }
-    // Serial.printf("touch=%d, x = %d, y = %d\n", touched, last_x, last_y);
-    /*Set the last pressed coordinates*/
-    data->point.x = last_x;
-    data->point.y = last_y;
-}
-
 static void lvgl_init(void)
 {
     lv_init();
 
     static lv_disp_draw_buf_t draw_buf_dsc_1;
     lv_color_t *buf_1 = (lv_color_t *)ps_calloc(sizeof(lv_color_t), DISP_BUF_SIZE);
-    lv_disp_draw_buf_init(&draw_buf_dsc_1, buf_1, NULL, LCD_HOR_SIZE * LCD_VER_SIZE);
+    lv_disp_draw_buf_init(&draw_buf_dsc_1, buf_1, NULL, DISP_BUF_SIZE);
     decodebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_BITMAP_BUF_SIZE);
-    // lv_disp_draw_buf_init(&draw_buf, lv_disp_buf_p, NULL, DISP_BUF_SIZE);
 
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
@@ -393,16 +378,6 @@ static void lvgl_init(void)
     disp_drv.full_refresh = 0;
 
     lv_disp_drv_register(&disp_drv);
-
-    /*------------------
-     * Touchpad
-     * -----------------*/
-    /*Register a touchpad input device*/
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = touchpad_read;
-    lv_indev_drv_register(&indev_drv);
 }
 
 void ink_screen_prepare_shutdown(void)
@@ -411,19 +386,10 @@ void ink_screen_prepare_shutdown(void)
         return;
     }
 
-    // Cancel the deferred power-down timer before explicitly powering off.
-    // Both this function and the timer callback run from the LVGL task so
-    // there is no concurrency, but we must not leave a stale timer that
-    // fires after the panel has already been powered off for sleep/shutdown.
-    if (s_epd_poweroff_timer != NULL) {
-        lv_timer_del(s_epd_poweroff_timer);
-        s_epd_poweroff_timer = NULL;
-    }
+    epd_cancel_poweroff_timer();
 
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
+    SpiGuard spi;
     display.powerOff();
-    shared_spi_unlock();
 }
 
 static bool bq25896_apply_factory_profile(void)
@@ -451,19 +417,16 @@ static bool bq25896_init(void)
     // The keypad task runs at priority 19 and will preempt this init,
     // corrupting multi-byte I2C transactions. Hold i2c0_lock for the whole
     // probe + init path.
-    i2c0_lock();
+    I2C0Guard g;
+
     Wire.beginTransmission(BOARD_I2C_ADDR_BQ25896);
     if (Wire.endTransmission() != 0) {
-        i2c0_unlock();
         return false;
     }
     if (!PPM.init(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_ADDR_BQ25896)) {
-        i2c0_unlock();
         return false;
     }
-    bool ok = bq25896_apply_factory_profile();
-    i2c0_unlock();
-    return ok;
+    return bq25896_apply_factory_profile();
 }
 
 static bool bq27220_init(void)
@@ -472,17 +435,20 @@ static bool bq27220_init(void)
     // probe, unseal, CFGUPDATE entry, data-memory writes, CFGUPDATE exit). A
     // keypad preempt mid-sequence has been observed to return 0xFFFF on the
     // chip-ID read, aborting init and leaving battery_percent stuck at 0.
-    i2c0_lock();
-    bq27220.setDefaultCapacity(FACTORY_BATTERY_DESIGN_CAPACITY_MAH);
-    bool ret = bq27220.init();
+    bool ret;
     uint16_t soc = 0, vbat = 0;
     int16_t curr = 0;
-    if (ret) {
-        soc  = bq27220.getStateOfCharge();
-        vbat = bq27220.getVoltage();
-        curr = bq27220.getCurrent();
+    {
+        I2C0Guard g;
+
+        bq27220.setDefaultCapacity(FACTORY_BATTERY_DESIGN_CAPACITY_MAH);
+        ret = bq27220.init();
+        if (ret) {
+            soc  = bq27220.getStateOfCharge();
+            vbat = bq27220.getVoltage();
+            curr = bq27220.getCurrent();
+        }
     }
-    i2c0_unlock();
     Serial.printf("[BQ27220] init=%s soc=%u%% vbat=%umV curr=%dmA\n",
                   ret ? "ok" : "FAIL", soc, vbat, curr);
     return ret;
@@ -501,35 +467,33 @@ static void bq25896_runtime_maintain(void)
     }
     last_check_ms = millis();
 
-    i2c0_lock();
-    if (!PPM.isVbusIn()) {
-        i2c0_unlock();
-        return;
-    }
+    {
+        I2C0Guard g;
 
-    bool need_recover = !PPM.isCharging();
-    if (!need_recover && peri_init_st[E_PERI_BQ27220]) {
-        need_recover = (bq27220.getAverageCurrent() < 0);
-    }
-    if (!need_recover) {
-        i2c0_unlock();
-        return;
-    }
-    if (millis() - last_recovery_ms < FACTORY_BQ25896_RECOVERY_COOLDOWN_MS) {
-        i2c0_unlock();
-        return;
-    }
+        if (!PPM.isVbusIn()) {
+            return;
+        }
 
-    Serial.println("[BQ25896] Restore charge path");
-    bq25896_apply_factory_profile();
-    i2c0_unlock();
+        bool need_recover = !PPM.isCharging();
+        if (!need_recover && peri_init_st[E_PERI_BQ27220]) {
+            need_recover = (bq27220.getAverageCurrent() < 0);
+        }
+        if (!need_recover) {
+            return;
+        }
+        if (millis() - last_recovery_ms < FACTORY_BQ25896_RECOVERY_COOLDOWN_MS) {
+            return;
+        }
+
+        Serial.println("[BQ25896] Restore charge path");
+        bq25896_apply_factory_profile();
+    }
     last_recovery_ms = millis();
 }
 
 static bool sd_care_init(void)
 {
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_SD_CS);
+    SpiGuard spi;
 
     // SD spec requires >=74 clocks with CS HIGH after power-up before the
     // first command. On a shared bus the card may also have seen unrelated
@@ -562,7 +526,6 @@ static bool sd_care_init(void)
                       (unsigned)(i + 1), (unsigned)freqs[i]);
     }
     if (!ok) {
-        shared_spi_unlock();
         Serial.println("[SD CARD] Card Mount Failed");
         return false;
     }
@@ -570,7 +533,6 @@ static bool sd_care_init(void)
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("[SD CARD] No card detected after mount");
-        shared_spi_unlock();
         return false;
     }
     Serial.printf("[SD CARD] type=%s\n",
@@ -586,7 +548,6 @@ static bool sd_care_init(void)
 
     uint64_t usedSize = SD.usedBytes() / (1024 * 1024);
     Serial.printf("SD Card Used: %lluMB\n", usedSize);
-    shared_spi_unlock();
     return true;
 }
 
@@ -614,10 +575,14 @@ static void a7682_task(void *param)
 
 static bool A7682E_init(void)
 {
-    Serial.println("Place your board outside to catch satelite signal");
-
     // Set module baud rate and UART pins
     SerialAT.begin(115200, SERIAL_8N1, BOARD_A7682E_TXD, BOARD_A7682E_RXD);
+
+    if (!ui_setting_get_a7682_status()) {
+        Serial.println("[A7682E] rail off, skipping probe");
+        xTaskCreate(a7682_task, "a7682_handle", 1024 * 3, NULL, A7682E_PRIORITY, &a7682_handle);
+        return false;
+    }
 
     Serial.println("Start modem...");
 
@@ -629,32 +594,34 @@ static bool A7682E_init(void)
     digitalWrite(BOARD_A7682E_PWRKEY, LOW);
     delay(10);
 
-    int retry_cnt = 5;
-    int retry = 0;
-    while (!modem.testAT(1000)) {
-        Serial.println(".");
-        if (retry++ > retry_cnt) {
-            digitalWrite(BOARD_A7682E_PWRKEY, LOW);
-            delay(100);
-            digitalWrite(BOARD_A7682E_PWRKEY, HIGH);
-            delay(1000);
-            digitalWrite(BOARD_A7682E_PWRKEY, LOW);
-
-            Serial.println("[A7682E] Init Fail");
-            break;
-        }
+    const int retries = 7;
+    bool ok = false;
+    for (int i = 0; i < retries && !ok; i++) {
+        ok = modem.testAT(1000);
+        if (!ok) Serial.println(".");
     }
-    
+    if (!ok) {
+        digitalWrite(BOARD_A7682E_PWRKEY, LOW);
+        delay(100);
+        digitalWrite(BOARD_A7682E_PWRKEY, HIGH);
+        delay(1000);
+        digitalWrite(BOARD_A7682E_PWRKEY, LOW);
+
+        Serial.println("[A7682E] Init Fail");
+    }
+
     Serial.println();
     delay(200);
 
     xTaskCreate(a7682_task, "a7682_handle", 1024 * 3, NULL, A7682E_PRIORITY, &a7682_handle);
 
-    return (retry < retry_cnt);
+    return ok;
 }
 
 #ifdef BOARD_HAS_PCM5102A
-static bool pcm5102a_init(void)
+// Not static: the .ino prototype generator would otherwise emit a static
+// declaration outside the #ifdef and warn on the 4G build.
+bool pcm5102a_init(void)
 {
     bool ret = audio.setPinout(BOARD_I2S_BCLK, BOARD_I2S_LRC, BOARD_I2S_DOUT);
 
@@ -666,47 +633,16 @@ static bool pcm5102a_init(void)
     pinMode(BOARD_6609_EN, OUTPUT);
     digitalWrite(BOARD_6609_EN, HIGH);
 
-    // audio_paly_flag = audio.connecttoFS(SD, "/voice_time/BBIBBI.mp3");
-
     return true;
 }
 #endif /* BOARD_HAS_PCM5102A */
 
-static void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
-    Serial.printf("Listing spiffs directory: %s\n", dirname);
-
-    File root = fs.open(dirname);
-    if(!root){
-        Serial.println("- failed to open directory");
-        return;
-    }
-    if(!root.isDirectory()){
-        Serial.println(" - not a directory");
-        return;
-    }
-
-    File file = root.openNextFile();
-    while(file){
-        if(file.isDirectory()){
-            Serial.print("  DIR : ");
-            Serial.println(file.name());
-            if(levels){
-                listDir(fs, file.path(), levels -1);
-            }
-        } else {
-            Serial.print("  FILE: ");
-            Serial.print(file.name());
-            Serial.print("\tSIZE: ");
-            Serial.println(file.size());
-        }
-        file = root.openNextFile();
-    }
-}
-
 static void peripheral_init_task(void *param)
 {
     // SPI must be initialized before this task starts
-    peri_init_st[E_PERI_LORA]       = lora_init();
+    if (ui_setting_get_lora_status()) {
+        peri_init_st[E_PERI_LORA] = lora_init();
+    }
     peri_init_st[E_PERI_BQ25896]    = bq25896_init();
     peri_init_st[E_PERI_BQ27220]    = bq27220_init();
     peri_init_st[E_PERI_SD]         = sd_care_init();
@@ -718,6 +654,9 @@ static void peripheral_init_task(void *param)
     // boot UX is not blocked. gps_task starts itself suspended; resume it
     // explicitly here so NMEA sentences actually flow.
     if (ui_setting_get_gps_status()) {
+        // Keep the settings toggle from starting a second baud scan while
+        // this one is in flight (and vice versa).
+        gps_init_running = true;
         peri_init_st[E_PERI_GPS] = gps_init();
         if (peri_init_st[E_PERI_GPS]) {
             gps_task_resume();
@@ -728,19 +667,10 @@ static void peripheral_init_task(void *param)
             pinMode(BOARD_RED_LED, OUTPUT);
             digitalWrite(BOARD_RED_LED, ui_setting_get_red_led());
         }
-    } else {
-        peri_init_st[E_PERI_GPS] = false;
+        gps_init_running = false;
     }
-    // Gyro — only attempt init when the BHI260AP driver is compiled in.
-    // On this V1.1 board the chip-ID readback returns 0xFFFF and SensorLib
-    // retries with 1 s delays generating Wire.cpp:499 Error 263 spam.
-    // BOARD_1V8_EN (IO38) powers BOTH the gyro AND the CST328 touch IC; it
-    // stays HIGH at boot (setup()) regardless of this flag.
-#ifdef BOARD_HAS_BHI260AP
+    // Gyro — peripheral.h stubs this as a no-op when the BHI260AP driver isn't compiled in.
     peri_init_st[E_PERI_BHI260AP]   = BHI260AP_init();
-#else
-    peri_init_st[E_PERI_BHI260AP]   = false;
-#endif
     peri_init_st[E_PERI_LTR_553ALS] = LTR553_init();
     peri_init_st[E_PERI_A7682E]     = A7682E_init();
 
@@ -760,13 +690,7 @@ static void peripheral_init_task(void *param)
 
 void setup()
 {
-    gpio_hold_dis((gpio_num_t)BOARD_6609_EN);
-    gpio_hold_dis((gpio_num_t)BOARD_LORA_EN);
-    gpio_hold_dis((gpio_num_t)BOARD_GPS_EN);
-    gpio_hold_dis((gpio_num_t)BOARD_1V8_EN);
-    gpio_hold_dis((gpio_num_t)BOARD_A7682E_PWRKEY);
-
-    gpio_deep_sleep_hold_dis();
+    board_rails_hold(false);
 
     Serial.begin(115200);
 
@@ -781,59 +705,50 @@ void setup()
     // intent (wifi_en pref) rather than just "SSID present" — otherwise
     // toggling WiFi off in the UI would silently come back on after reboot.
     if (ui_wifi_get_enabled()) {
-        ui_wifi_set_enabled(true);
+        ui_wifi_radio_set(true);
     }
 
-    // IO
-    pinMode(BOARD_KEYBOARD_LED, OUTPUT);
-    pinMode(BOARD_RED_LED, OUTPUT);
-    pinMode(BOARD_MOTOR_PIN, OUTPUT);
-    pinMode(BOARD_6609_EN, OUTPUT);         
-    pinMode(BOARD_LORA_EN, OUTPUT);         
-    pinMode(BOARD_GPS_EN, OUTPUT);          
-    pinMode(BOARD_1V8_EN, OUTPUT);          
-    pinMode(BOARD_A7682E_PWRKEY, OUTPUT);
-
-    digitalWrite(BOARD_KEYBOARD_LED, ui_setting_get_keypad_light());
-    digitalWrite(BOARD_RED_LED, ui_setting_get_red_led());
-    digitalWrite(BOARD_MOTOR_PIN, ui_setting_get_motor_status());
-    digitalWrite(BOARD_6609_EN, ui_setting_get_a7682_status());
-    digitalWrite(BOARD_LORA_EN, ui_setting_get_lora_status());
-    digitalWrite(BOARD_GPS_EN, ui_setting_get_gps_status());
-    digitalWrite(BOARD_1V8_EN, HIGH);
-    digitalWrite(BOARD_A7682E_PWRKEY, ui_setting_get_a7682_status());
+    // Output rails and indicators, driven from the persisted settings.
+    struct { uint8_t pin; bool level; } outs[] = {
+        {BOARD_KEYBOARD_LED,  ui_setting_get_keypad_light()},
+        {BOARD_RED_LED,       ui_setting_get_red_led()},
+        {BOARD_MOTOR_PIN,     ui_setting_get_motor_status()},
+        {BOARD_6609_EN,       ui_setting_get_a7682_status()},
+        {BOARD_LORA_EN,       ui_setting_get_lora_status()},
+        {BOARD_GPS_EN,        ui_setting_get_gps_status()},
+        // BOARD_1V8_EN powers both the BHI260AP gyro and the CST328 touch IC.
+        {BOARD_1V8_EN,        HIGH},
+        {BOARD_A7682E_PWRKEY, ui_setting_get_a7682_status()},
+    };
+    for (auto &out : outs) {
+        pinMode(out.pin, OUTPUT);
+        digitalWrite(out.pin, out.level);
+    }
 
     // SPI Pins
-    pinMode(BOARD_LORA_CS, OUTPUT); 
-    digitalWrite(BOARD_LORA_CS, HIGH);
-    pinMode(BOARD_LORA_RST, OUTPUT); 
-    digitalWrite(BOARD_LORA_RST, HIGH);
-    pinMode(BOARD_SD_CS, OUTPUT); 
-    digitalWrite(BOARD_SD_CS, HIGH);
-    pinMode(BOARD_EPD_CS, OUTPUT); 
-    digitalWrite(BOARD_EPD_CS, HIGH);
+    // CS lines idle HIGH from the start so no device sees a select before
+    // shared_spi_bus_init() runs.
+    for (uint8_t pin : {BOARD_LORA_CS, BOARD_LORA_RST, BOARD_SD_CS, BOARD_EPD_CS}) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
+    }
 
     // Optimized I2C Check
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
     Serial.printf(" ------------- I2C ------------- \n");
-    const uint8_t known_addresses[] = {
-        BOARD_I2C_ADDR_TOUCH,
-        BOARD_I2C_ADDR_LTR_553ALS,
-        BOARD_I2C_ADDR_GYROSCOPDE,
-        BOARD_I2C_ADDR_KEYBOARD,
-        BOARD_I2C_ADDR_BQ27220,
-        BOARD_I2C_ADDR_BQ25896
+    static const struct { uint8_t addr; const char *name; } k_i2c_devs[] = {
+        {BOARD_I2C_ADDR_TOUCH,      "TOUCH"},
+        {BOARD_I2C_ADDR_LTR_553ALS, "LTR_553ALS"},
+        {BOARD_I2C_ADDR_GYROSCOPDE, "GYROSCOPDE"},
+        {BOARD_I2C_ADDR_KEYBOARD,   "KEYBOARD"},
+        {BOARD_I2C_ADDR_BQ27220,    "BQ27220"},
+        {BOARD_I2C_ADDR_BQ25896,    "BQ25896"},
     };
 
-    for (uint8_t address : known_addresses) {
-        Wire.beginTransmission(address);
+    for (const auto &dev : k_i2c_devs) {
+        Wire.beginTransmission(dev.addr);
         if (Wire.endTransmission() == 0) {
-            if (address == BOARD_I2C_ADDR_TOUCH) Serial.printf("[0x%x] TOUCH find!\n", address);
-            else if (address == BOARD_I2C_ADDR_LTR_553ALS) Serial.printf("[0x%x] LTR_553ALS find!\n", address);
-            else if (address == BOARD_I2C_ADDR_GYROSCOPDE) Serial.printf("[0x%x] GYROSCOPDE find!\n", address);
-            else if (address == BOARD_I2C_ADDR_KEYBOARD) Serial.printf("[0x%x] KEYBOARD find!\n", address);
-            else if (address == BOARD_I2C_ADDR_BQ27220) Serial.printf("[0x%x] BQ27220 find!\n", address);
-            else if (address == BOARD_I2C_ADDR_BQ25896) Serial.printf("[0x%x] BQ25896 find!\n", address);
+            Serial.printf("[0x%x] %s find!\n", dev.addr, dev.name);
         }
     }
 
@@ -841,19 +756,10 @@ void setup()
     Wire.beginTransmission(0x5A);
     isT_Deck_Pro_v1_0 = (Wire.endTransmission() != 0);
 
-#ifdef T_DECK_PRO_V1_0
-    if(!isT_Deck_Pro_v1_0){
-        Serial.printf(" ------------- ERROR ------------- \n");
-        Serial.printf("Firmware mismatch\n");
-        Serial.printf("Your hardware might be the T-Deck-Pro V1.1, but please download the H693_factory_v1.x.bin firmware.\n");
-        Serial.printf("T-Deck-Pro V1.0   ---   H693_factory_v1.x.bin \n");
-        Serial.printf("T-Deck-Pro V1.1   ---   H693_factory_v2.x.bin\n");
-    }
-#endif
+    Serial.printf("[board] T-Deck-Pro %s detected\n", isT_Deck_Pro_v1_0 ? "V1.0" : "V1.1");
 
     if(!SPIFFS.begin(true)){
         Serial.println("SPIFFS Mount Failed");
-        return;
     }
 
     // SPI
@@ -863,9 +769,6 @@ void setup()
     // Critical Peripheral Init (Required for UI/Input)
     peri_init_st[E_PERI_INK_SCREEN] = ink_screen_init();
     peri_init_st[E_PERI_KYEPAD]     = keypad_init(BOARD_I2C_ADDR_KEYBOARD);
-    // Touch driver disabled — the CST328 isn't responding on this V1.1 board
-    // and its init/probe was driving I2C error spam. Keypad input only.
-    peri_init_st[E_PERI_TOUCH]      = false;
 
     lvgl_init();
     ui_deckpro_entry();
@@ -887,8 +790,6 @@ void setup()
 }
 
 
-uint32_t tick = 0;
-
 void loop()
 {
     lv_task_handler();
@@ -903,17 +804,6 @@ void loop()
 #endif /* BOARD_HAS_PCM5102A */
     
     vTaskDelay(1);
-
-
-    if(millis() - tick > 3000) {
-        tick = millis();
-        // printf("BOARD_LORA_CS=%d\n", digitalRead(BOARD_LORA_CS));
-        // printf("BOARD_LORA_RST=%d\n", digitalRead(BOARD_LORA_RST));
-        // printf("BOARD_LORA_BUSY=%d\n", digitalRead(BOARD_LORA_BUSY));
-        // printf("BOARD_LORA_EN=%d\n", digitalRead(BOARD_LORA_EN));
-
-        // printf("BOARD_EPD_CS=%d\n", digitalRead(BOARD_EPD_CS));
-    }
 }
 
 /*********************************************************************************
@@ -930,23 +820,15 @@ void disp_hard_refresh(void)
     // panel — a single pair leaves visible ghosting of the prior frame.
     const int cycles = 3;
 
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
-    display.setFullWindow();
+    {
+        SpiGuard spi;
+        display.setFullWindow();
 
-    for (int i = 0; i < cycles; i++) {
-        display.firstPage();
-        do {
-            display.fillScreen(GxEPD_BLACK);
-        } while (display.nextPage());
-
-        display.firstPage();
-        do {
-            display.fillScreen(GxEPD_WHITE);
-        } while (display.nextPage());
+        for (int i = 0; i < cycles; i++) {
+            epd_fill(GxEPD_BLACK);
+            epd_fill(GxEPD_WHITE);
+        }
     }
-
-    shared_spi_unlock();
 
     // Flag next LVGL flush as FULL so it draws the UI on a clean slate
     disp_full_refr();
@@ -956,20 +838,12 @@ void disp_white_clear(void)
 {
     // Cancel the deferred power-down timer — we are about to power off
     // explicitly at the end of this function.
-    if (s_epd_poweroff_timer != NULL) {
-        lv_timer_del(s_epd_poweroff_timer);
-        s_epd_poweroff_timer = NULL;
-    }
+    epd_cancel_poweroff_timer();
 
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
+    SpiGuard spi;
     display.setFullWindow();
-    display.firstPage();
-    do {
-        display.fillScreen(GxEPD_WHITE);
-    } while (display.nextPage());
+    epd_fill(GxEPD_WHITE);
     display.powerOff();
-    shared_spi_unlock();
 }
 
 // Switch the display+LVGL into landscape (320x240 logical) or portrait
@@ -997,10 +871,10 @@ void factory_set_landscape(bool landscape)
     disp->driver->ver_res = want_h;
     s_landscape = landscape;
 
-    shared_spi_lock();
-    shared_spi_prepare_device(BOARD_EPD_CS);
-    display.setRotation(0);
-    shared_spi_unlock();
+    {
+        SpiGuard spi;
+        display.setRotation(0);
+    }
 
     lv_disp_drv_update(disp, disp->driver);
 

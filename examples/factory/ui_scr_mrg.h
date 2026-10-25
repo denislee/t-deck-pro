@@ -7,16 +7,10 @@ extern "C" {
 
 #include "lvgl.h"
 
-#define SCR_MGR_ANIM_TIME 300
-#define SCR_MGR_SCR_SWITCH_ANIM    LV_SCR_LOAD_ANIM_NONE
-#define SCR_MGR_SCR_PUSH_ANIM      LV_SCR_LOAD_ANIM_MOVE_LEFT
-#define SCR_MGR_SCR_POP_ANIM       LV_SCR_LOAD_ANIM_MOVE_RIGHT
 typedef enum scr_mgr_state {
     SCR_MGR_STATE_IDLE = 0,  /* Not in use */
-    SCR_MGR_STATE_DESTROYED, /* Not active and having been destroyed */
     SCR_MGR_STATE_CREATED,   /* Created */
     SCR_MGR_STATE_INACTIVE,  /* Not active */
-    SCR_MGR_STATE_ACTIVE_BG, /* Active but at the background */
     SCR_MGR_STATE_ACTIVE,    /* Active and at the foreground */
 } scr_mgr_state_e;
 
@@ -53,11 +47,8 @@ bool scr_mgr_pop(bool anim);
 
 int scr_mgr_get_curr_scr_id(void);
 scr_lifecycle_t *scr_mgr_get_curr_life(void);
-
-// set anim
-void scr_mgr_set_anim(lv_scr_load_anim_t sw, lv_scr_load_anim_t push, lv_scr_load_anim_t pop);
-// set bg color
-void scr_mgr_set_bg_color(uint32_t c);
+/* Screen object of the current top card, or NULL if the stack is empty. */
+lv_obj_t *scr_mgr_get_curr_obj(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

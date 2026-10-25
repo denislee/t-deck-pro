@@ -12,6 +12,9 @@
 #define UI_T_DECK_PRO_VERSION    "v1.6-260401"  // Software version
 #define BOARD_T_DECK_PRO_VERSION "v1.0-241106"  // Hardware version
 
+// Default time zone (America/Sao_Paulo, UTC-3, no DST)
+#define UI_DEFAULT_TZ "<-03>3"
+
 // Serial
 #define SerialMon   Serial      // 
 #define SerialAT    Serial1     // 
@@ -40,19 +43,11 @@
 #define BOARD_KEYBOARD_LED 42
 
 // Touch
-#define BOARD_TOUCH_SCL BOARD_I2C_SCL
-#define BOARD_TOUCH_SDA BOARD_I2C_SDA
-#define BOARD_TOUCH_INT 12
 #define BOARD_TOUCH_RST 45
 
 // LTR-553ALS-WA  beam sensor
-#define BOARD_ALS_SCL BOARD_I2C_SCL
-#define BOARD_ALS_SDA BOARD_I2C_SDA
-#define BOARD_ALS_INT 16
 
 // Gyroscope
-#define BOARD_GYROSCOPDE_SCL BOARD_I2C_SCL
-#define BOARD_GYROSCOPDE_SDA BOARD_I2C_SDA
 #define BOARD_GYROSCOPDE_INT 21
 #define BOARD_GYROSCOPDE_RST -1
 
@@ -66,8 +61,6 @@
 #define LCD_VER_SIZE 320
 #define DISP_BUF_SIZE (LCD_HOR_SIZE * LCD_VER_SIZE)
 
-#define BOARD_EPD_SCK  BOARD_SPI_SCK
-#define BOARD_EPD_MOSI BOARD_SPI_MOSI
 #define BOARD_EPD_DC   35
 #define BOARD_EPD_CS   34
 #define BOARD_EPD_BUSY 37
@@ -75,14 +68,8 @@
 
 // SD card
 #define BOARD_SD_CS   48
-#define BOARD_SD_SCK  BOARD_SPI_SCK
-#define BOARD_SD_MOSI BOARD_SPI_MOSI
-#define BOARD_SD_MISO BOARD_SPI_MISO
 
 // Lora
-#define BOARD_LORA_SCK  BOARD_SPI_SCK
-#define BOARD_LORA_MOSI BOARD_SPI_MOSI
-#define BOARD_LORA_MISO BOARD_SPI_MISO
 #define BOARD_LORA_CS   3
 #define BOARD_LORA_BUSY 6
 #define BOARD_LORA_RST  4
@@ -101,9 +88,6 @@
 #define BOARD_RED_LED 1
 
 // A7682E Modem
-#define BOARD_A7682E_RI     7
-#define BOARD_A7682E_ITR    8
-#define BOARD_A7682E_RST    9
 #define BOARD_A7682E_RXD    10
 #define BOARD_A7682E_TXD    11
 #define BOARD_A7682E_PWRKEY 40
@@ -116,13 +100,34 @@
 
 // EN
 #define BOARD_GPS_EN  39  // enable GPS module
-#define BOARD_1V8_EN  38  // enable gyroscope module
+#define BOARD_1V8_EN  38  // VDD1V8: powers the BHI260AP gyro AND the CST328 touch IC — keep HIGH
 #define BOARD_6609_EN 41  // enable 7682 module
 #define BOARD_LORA_EN 46  // enable LORA module
 
 // Mic
-#define BOARD_MIC_DATA        17
-#define BOARD_MIC_CLOCK       18
+
+// The following pins are documented for reference, not used by the firmware.
+// #define BOARD_TOUCH_SCL       BOARD_I2C_SCL
+// #define BOARD_TOUCH_SDA       BOARD_I2C_SDA
+// #define BOARD_TOUCH_INT       12
+// #define BOARD_ALS_SCL         BOARD_I2C_SCL
+// #define BOARD_ALS_SDA         BOARD_I2C_SDA
+// #define BOARD_ALS_INT         16
+// #define BOARD_GYROSCOPDE_SCL  BOARD_I2C_SCL
+// #define BOARD_GYROSCOPDE_SDA  BOARD_I2C_SDA
+// #define BOARD_EPD_SCK         BOARD_SPI_SCK
+// #define BOARD_EPD_MOSI        BOARD_SPI_MOSI
+// #define BOARD_SD_SCK          BOARD_SPI_SCK
+// #define BOARD_SD_MOSI         BOARD_SPI_MOSI
+// #define BOARD_SD_MISO         BOARD_SPI_MISO
+// #define BOARD_LORA_SCK        BOARD_SPI_SCK
+// #define BOARD_LORA_MOSI       BOARD_SPI_MOSI
+// #define BOARD_LORA_MISO       BOARD_SPI_MISO
+// #define BOARD_A7682E_RI       7
+// #define BOARD_A7682E_ITR      8
+// #define BOARD_A7682E_RST      9
+// #define BOARD_MIC_DATA        17
+// #define BOARD_MIC_CLOCK       18
 // -------------------------------------------------
 
 

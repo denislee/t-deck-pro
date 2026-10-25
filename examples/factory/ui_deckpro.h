@@ -20,26 +20,11 @@ extern "C" {
 /*********************************************************************************
  *                                   DEFINES
  * *******************************************************************************/
-// #ifdef __has_include
-//     #if __has_include("lv_i18n.h")
-//         #ifndef LV_i18N_INCLUDE_SIMPLE
-//             #define LV_i18N_INCLUDE_SIMPLE
-//         #endif
-//     #endif
-// #endif
-
-// #if defined(LV_i18N_INCLUDE_SIMPLE)
-//     #include "lv_i18n.h"
-// #else
-//     #define _(text) (text)
-//     #define _p(text, num) (text, num)
-// #endif
 /*********************************************************************************
  *                                   MACROS
  * *******************************************************************************/
 #define DECKPRO_COLOR_BG        lv_color_white()
 #define DECKPRO_COLOR_FG        lv_color_black()
-#define UI_SLIDING_DISTANCE     40
 #define UI_WIFI_SCAN_ITEM_MAX   13
 
 /*********************************************************************************
@@ -52,11 +37,9 @@ enum {
     SCREEN1_2_ID,
     SCREEN2_ID,
     SCREEN2_1_ID,
-    SCREEN2_2_ID,
     SCREEN3_ID,
     SCREEN4_ID,
     SCREEN4_1_ID,
-    SCREEN4_2_ID,
     SCREEN5_ID,
     SCREEN6_ID,
     SCREEN6_1_ID,
@@ -68,7 +51,6 @@ enum {
     SCREEN9_ID,
     SCREEN10_ID,
     SCREEN11_ID,
-    SCREEN12_ID,
     SCREEN12_1_ID,
     SCREEN13_ID,
     SCREEN13_1_ID,
@@ -78,20 +60,12 @@ enum {
     SCREEN_DICT_ID,
 };
 
-typedef void (*ui_indev_read_cb)(int);
-
 enum {
     TASKBAR_ID_CHARGE,
     TASKBAR_ID_CHARGE_FINISH,
     TASKBAR_ID_BATTERY_PERCENT,
     TASKBAR_ID_WIFI,
     TASKBAR_ID_MAX,
-};
-
-struct menu_btn {
-    uint16_t idx;
-    const lv_img_dsc_t *icon;
-    const char *name;
 };
 
 enum{
@@ -114,27 +88,18 @@ typedef struct _ui_setting
 typedef struct _ui_test {
     const char *name;
     int peri_id;
-    lv_obj_t *obj;
     lv_obj_t *st;
     bool (*cb)(int);
     char shortcut;
 } ui_test_handle;
 
-typedef struct _ui_a7682 {
+/* A7682 / PCM5102 submenu row: click runs cb(name). */
+typedef struct _ui_action {
     const char *name;
     lv_obj_t *obj;
-    lv_obj_t *st;
-    bool (*cb)(const char *at_cmd);
+    bool (*cb)(const char *arg);
     char shortcut;
-} ui_a7682_handle;
-
-typedef struct _ui_pcm5102 {
-    const char *name;
-    lv_obj_t *obj;
-    lv_obj_t *st;
-    bool (*cb)(const char *at_cmd);
-    char shortcut;
-} ui_pcm5102_handle;
+} ui_action_handle;
 
 
 typedef struct {

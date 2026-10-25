@@ -13,18 +13,17 @@ static bool GPS_Recovery();
 static bool gps_try_baud(uint32_t baud);
 static void gps_power_cycle();
 static void gps_try_apply_time_sync();
-bool setupGPS();
-void displayInfo();
+static void gps_update_cache(void);
+static void gps_task(void *param);
+static void gps_task_create(void);
 
 static TaskHandle_t gps_handle = nullptr;
-static double gps_lat=0, gps_lng=0, gps_altitude=0, gps_speed=0;
+static double gps_lat=0, gps_lng=0, gps_speed=0;
 static uint16_t gps_year=0;
 static uint8_t gps_month=0, gps_day=0;
 static uint8_t gps_hour=0, gps_minute=0, gps_second=0;
 static uint32_t gps_vsat=0;
 static uint32_t gps_active_baud = 0;
-
-uint8_t buffer[256];
 
 static constexpr uint32_t GPS_BAUD_CANDIDATES[] = {
     9600,
@@ -92,8 +91,6 @@ bool gps_init(void)
     gps_active_baud = 0;
 
     gps_power_cycle();
-    // L76K GPS USE 9600 BAUDRATE
-    // result = setupGPS();
     if (!result) {
         for (size_t i = 0; i < (sizeof(GPS_BAUD_CANDIDATES) / sizeof(GPS_BAUD_CANDIDATES[0])); ++i) {
             result = gps_try_baud(GPS_BAUD_CANDIDATES[i]);
@@ -113,7 +110,7 @@ bool gps_init(void)
     return result;
 }
 
-void gps_task(void *param)
+static void gps_task(void *param)
 {
     // Suspend ourselves immediately. gps_handle is still NULL here because
     // this task runs before xTaskCreate() has returned and written the global.
@@ -134,9 +131,8 @@ void gps_task(void *param)
 
         while (SerialGPS.available()) {
             int c = SerialGPS.read();
-            // Serial.write(c);
             if (gps.encode(c)) {
-                displayInfo();
+                gps_update_cache();
                 gps_try_apply_time_sync();
             }
         }
@@ -154,10 +150,9 @@ void gps_task(void *param)
     }
 }
 
-void gps_task_create(void)
+static void gps_task_create(void)
 {
     xTaskCreate(gps_task, "gps_task", 1024 * 3, NULL, GPS_PRIORITY, &gps_handle);
-    // vTaskSuspend(gps_handle);
 }
 
 void gps_task_suspend(void)
@@ -254,7 +249,7 @@ static void gps_try_apply_time_sync(void)
     tzset();
     time_t t = mktime(&tm_utc);
 
-    setenv("TZ", "<-03>3", 1);
+    setenv("TZ", UI_DEFAULT_TZ, 1);
     tzset();
 
     if (t <= 0) return;
@@ -272,143 +267,48 @@ static void gps_try_apply_time_sync(void)
 }
 
 /* clang-format on */
-void displayInfo()
+// Copy the latest valid fields out of the NMEA parser. Runs once per sentence,
+// so it stays silent to avoid spamming the console forever at 1 Hz.
+static void gps_update_cache(void)
 {
-    Serial.print(F("Location: "));
     if (gps.location.isValid())
     {
         gps_lat = gps.location.lat();
         gps_lng = gps.location.lng();
-        Serial.print(gps_lat, 6);
-        Serial.print(F(","));
-        Serial.print(gps_lng, 6);
-    }
-    else
-    {
-        Serial.print(F("INVALID"));
     }
 
-    Serial.print(F("  Date/Time: "));
     if (gps.date.isValid())
     {
         gps_year = gps.date.year();
         gps_month = gps.date.month();
         gps_day = gps.date.day();
-        Serial.print(gps_month);
-        Serial.print(F("/"));
-        Serial.print(gps_day);
-        Serial.print(F("/"));
-        Serial.print(gps_year);
-    }
-    else
-    {
-        Serial.print(F("INVALID"));
     }
 
-    Serial.print(F(" "));
     if (gps.time.isValid())
     {
         gps_hour = gps.time.hour();
         gps_minute = gps.time.minute();
         gps_second = gps.time.second();
-
-        if (gps_hour < 10)
-            Serial.print(F("0"));
-        Serial.print(gps_hour);
-        Serial.print(F(":"));
-        if (gps_minute < 10)
-            Serial.print(F("0"));
-        Serial.print(gps_minute);
-        Serial.print(F(":"));
-        if (gps_second < 10)
-            Serial.print(F("0"));
-        Serial.print(gps_second);
-        Serial.print(F("."));
-    }
-    else
-    {
-        Serial.print(F("INVALID"));
     }
 
-    Serial.print(F("  Satellites: "));
-    if(gps.satellites.isValid())
+    if (gps.satellites.isValid())
     {
         gps_vsat = gps.satellites.value();
-        Serial.print(gps_vsat);
-        Serial.print(F(" "));
     }
 
-    Serial.print(F("  Speed: "));
-    if(gps.speed.isValid())
+    if (gps.speed.isValid())
     {
         gps_speed = gps.speed.kmph();
-        Serial.print(gps_speed);
-        Serial.print(F(" "));
     }
-
-    Serial.println();
 }
 /* clang-format off */
-
-bool setupGPS()
-{
-    // L76K GPS USE 9600 BAUDRATE
-    SerialGPS.begin(9600, SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
-    bool result = false;
-    uint32_t startTimeout ;
-    for (int i = 0; i < 3; ++i) {
-        SerialGPS.write("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
-        delay(5);
-        // Get version information
-        startTimeout = millis() + 3000;
-        Serial.print("Try to init L76K . Wait stop .");
-        while (SerialGPS.available()) {
-            Serial.print(".");
-            SerialGPS.readString();
-            if (millis() > startTimeout) {
-                Serial.println("Wait L76K stop NMEA timeout!");
-                return false;
-            }
-        };
-        Serial.println();
-        SerialGPS.flush();
-        delay(200);
-
-        SerialGPS.write("$PCAS06,0*1B\r\n");
-        startTimeout = millis() + 500;
-        String ver = "";
-        while (!SerialGPS.available()) {
-            if (millis() > startTimeout) {
-                Serial.println("Get L76K timeout!");
-                return false;
-            }
-        }
-        SerialGPS.setTimeout(10);
-        ver = SerialGPS.readStringUntil('\n');
-        if (ver.startsWith("$GPTXT,01,01,02")) {
-            Serial.println("L76K GNSS init succeeded, using L76K GNSS Module\n");
-            result = true;
-            break;
-        }
-        delay(500);
-    }
-    // Initialize the L76K Chip, use GPS + GLONASS
-    SerialGPS.write("$PCAS04,5*1C\r\n");
-    delay(250);
-    SerialGPS.write("$PCAS03,1,1,1,1,1,1,1,1,1,1,,,0,0*26\r\n");
-    delay(250);
-    // Switch to Vehicle Mode, since SoftRF enables Aviation < 2g
-    SerialGPS.write("$PCAS11,3*1E\r\n");
-    return result;
-}
 
 
 static int getAck(uint8_t *buffer, uint16_t size, uint8_t requestedClass, uint8_t requestedID)
 {
     uint16_t    ubxFrameCounter = 0;
-    bool        ubxFrame = 0;
     uint32_t    startTime = millis();
-    uint16_t    needRead;
+    uint16_t    needRead = 0;
 
     while (millis() - startTime < 800) {
         while (SerialGPS.available()) {
@@ -470,21 +370,17 @@ static int getAck(uint8_t *buffer, uint16_t size, uint8_t requestedClass, uint8_
 
 static bool GPS_Recovery()
 {
-    uint8_t cfg_clear1[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x1C, 0xA2};
-    uint8_t cfg_clear2[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x1B, 0xA1};
-    uint8_t cfg_clear3[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x03, 0x1D, 0xB3};
-    SerialGPS.write(cfg_clear1, sizeof(cfg_clear1));
+    uint8_t buffer[256];
+    static const uint8_t cfg_clear1[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x1C, 0xA2};
+    static const uint8_t cfg_clear2[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x1B, 0xA1};
+    static const uint8_t cfg_clear3[] = {0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x03, 0x1D, 0xB3};
+    static const uint8_t *const cfg_clear[] = {cfg_clear1, cfg_clear2, cfg_clear3};
 
-    if (getAck(buffer, 256, 0x05, 0x01)) {
-        Serial.println("Get ack successes!");
-    }
-    SerialGPS.write(cfg_clear2, sizeof(cfg_clear2));
-    if (getAck(buffer, 256, 0x05, 0x01)) {
-        Serial.println("Get ack successes!");
-    }
-    SerialGPS.write(cfg_clear3, sizeof(cfg_clear3));
-    if (getAck(buffer, 256, 0x05, 0x01)) {
-        Serial.println("Get ack successes!");
+    for (size_t i = 0; i < sizeof(cfg_clear) / sizeof(cfg_clear[0]); ++i) {
+        SerialGPS.write(cfg_clear[i], sizeof(cfg_clear1));
+        if (getAck(buffer, 256, 0x05, 0x01)) {
+            Serial.println("Get ack successes!");
+        }
     }
 
     // UBX-CFG-RATE, Size 8, 'Navigation/measurement rate settings'

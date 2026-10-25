@@ -6,6 +6,7 @@
 #include "freertos/semphr.h"
 #include "utilities.h"
 #include "peripheral.h"
+#include <ctype.h>
 
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 10
@@ -23,19 +24,20 @@
 const char keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
     // Index 9 of row 1 is the physical backspace key (right of L). Use the
-    // standard ASCII BS code (0x08) so text consumers delete a character
+    // shared KEY_BACKSPACE code (0x08) so text consumers delete a character
     // instead of inserting the digit '0'.
-    {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 0x08},
+    {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', KEY_BACKSPACE},
     // Index 0 of row 2 is the physical key left of Z. Acts as a sym modifier
     // (swapped with the bottom-row left-shift slot for thumb ergonomics).
-    {KEY_SYM_SENTINEL, 'z', 'x', 'c', 'v', 'b', 'n', 'm', '$', 'E'},
+    {KEY_SYM_SENTINEL, 'z', 'x', 'c', 'v', 'b', 'n', 'm', '$', KEY_ENTER},
     // Bottom row has a left-shift, mic, wide spacebar, sym, and right-shift.
-    // Left-shift (index 5) is a held modifier that selects shift_keymap. The
-    // mic key (index 6) emits ASCII ESC (0x1B) so it doubles as Escape. The
-    // wide spacebar (index 7, col 2 after the col reversal) emits a literal
+    // Left-shift (index 5) is a held modifier that upper-cases letters at
+    // lookup time (shift takes precedence over sym when both are held). The
+    // mic key (index 6) emits KEY_ESC so it doubles as Escape. The wide
+    // spacebar (index 7, col 2 after the col reversal) emits a literal
     // space. Sym at index 8 is a held modifier; the top-of-z-row slot also
     // acts as sym so either thumb can reach it.
-    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
+    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, KEY_ESC, ' ', KEY_SYM_SENTINEL, ' '},
 };
 
 // Symbol overlay applied while the sym key is held. Reads off each key's
@@ -44,23 +46,12 @@ const char keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
 // held.
 const char sym_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'#', '1', '2', '3', '(', ')', '_', '-', '+', '@'},
-    {'*', '4', '5', '6', '/', ':', ';', '\'', '"', 0x08},
-    {KEY_SYM_SENTINEL, '7', '8', '9', '?', '!', ',', '.', '$', 'E'},
-    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
-};
-
-// Uppercase overlay applied while the shift key is held. Non-letter slots
-// match keymap so backspace, enter, ESC, and modifiers behave normally with
-// shift held. Shift takes precedence over sym when both are held.
-const char shift_keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
-    {'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'},
-    {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0x08},
-    {KEY_SYM_SENTINEL, 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '$', 'E'},
-    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, 0x1B, ' ', KEY_SYM_SENTINEL, ' '},
+    {'*', '4', '5', '6', '/', ':', ';', '\'', '"', KEY_BACKSPACE},
+    {KEY_SYM_SENTINEL, '7', '8', '9', '?', '!', ',', '.', '$', KEY_ENTER},
+    {' ', ' ', ' ', ' ', ' ', KEY_SHIFT_SENTINEL, KEY_ESC, ' ', KEY_SYM_SENTINEL, ' '},
 };
 
 Adafruit_TCA8418 keypad;
-keypad_cb keypad_listener = NULL;
 
 // Binary semaphore given by the INT ISR and taken by keypad_task. Created in
 // keypad_task_create(); safe to check for NULL before any xSemaphore call.
@@ -83,7 +74,7 @@ static void IRAM_ATTR keypad_irq_handler(void)
 // inside the TwoWire object would corrupt across threads.
 static SemaphoreHandle_t i2c0_mutex = NULL;
 
-void i2c0_lock_init(void)
+static void i2c0_lock_init(void)
 {
     if (!i2c0_mutex) {
         i2c0_mutex = xSemaphoreCreateMutex();
@@ -104,8 +95,8 @@ void i2c0_unlock(void)
     }
 }
 
-// Ring buffer of pressed-key characters. The producer (keypad_loop) runs at
-// roughly 1 kHz from the main loop; consumers (UI polls) often run at 10-50 Hz
+// Ring buffer of pressed-key characters. The producer (keypad_loop) runs from
+// the IRQ-driven keypad task; consumers (UI polls) often run at 10-50 Hz
 // so without a buffer fast typing drops keys. Keep this a power-of-two for
 // cheap masking, and large enough to absorb a quick burst (~32 chars).
 #define KEYPAD_BUF_SIZE 32
@@ -127,8 +118,6 @@ static inline void keypad_buf_push(char c)
     keypad_buf_head = next;
 }
 
-int keypad_state = KEYPAD_RELEASE;
-
 // Tracks whether the sym/shift modifiers are currently held. Updated from
 // keypad_loop on press/release of the corresponding modifier key.
 static volatile bool sym_held = false;
@@ -139,12 +128,6 @@ bool keypad_init(int address)
     i2c0_lock_init();
 
     i2c0_lock();
-    if(!i2cIsInit(0)){
-        Wire.begin(BOARD_KEYBOARD_SDA, BOARD_KEYBOARD_SCL);
-        Wire.beginTransmission(address);
-        Wire.endTransmission(true);
-    }
-
     if (!keypad.begin(address, &Wire)) {
         i2c0_unlock();
         // Serial.println("keypad not found, check wiring & pullups!");
@@ -191,7 +174,7 @@ void keypad_set_flag(void)
     }
 }
 
-void keypad_loop(void)
+static void keypad_loop(void)
 {
     // Drain every event the TCA8418 has queued. Held under the I2C bus mutex so
     // a concurrent main-loop Wire user (PMU, gauge, touch) cannot interleave
@@ -232,10 +215,9 @@ void keypad_loop(void)
         }
 
         char c;
-        if (shift_held)    c = shift_keymap[row][col];
+        if (shift_held)    c = toupper((unsigned char)keymap[row][col]);
         else if (sym_held) c = sym_keymap[row][col];
         else               c = keymap[row][col];
-        keypad_state = state;
         keypad_buf_push(c);
     }
 
@@ -295,9 +277,4 @@ void keypad_task_create(void)
     // shared peripherals) the Wire error-handling path eats hundreds of
     // additional bytes — 2 KB tripped the stack canary in practice.
     xTaskCreate(keypad_task, "keypad", 4096, NULL, KEYPAD_PRIORITY, &keypad_task_handle);
-}
-
-void keypad_regetser_cb(keypad_cb cb)
-{
-    keypad_listener = cb;
 }

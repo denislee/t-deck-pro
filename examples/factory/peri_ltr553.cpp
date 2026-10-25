@@ -9,41 +9,14 @@ SensorLTR553 als;
 
 bool LTR553_init(void)
 {
+    I2C0Guard g;
+
     if (!als.begin(Wire, LTR553_SLAVE_ADDRESS, BOARD_I2C_SDA, BOARD_I2C_SCL)) {
         Serial.println("Failed to find LTR553 - check your wiring!");
         return false;
     }
 
     Serial.println("Init LTR553 Sensor success!");
-
-    // Set the ambient light high and low thresholds.
-    // If the value exceeds or falls below the set value, an interrupt will be triggered.
-    als.setLightSensorThreshold(10, 200);
-
-    // Set the high and low thresholds of the proximity sensor.
-    // If the value exceeds or falls below the set value, an interrupt will be triggered.
-    als.setProximityThreshold(10, 30);
-
-    // Controls the Light Sensor N number of times the measurement data is outside the range
-    // defined by the upper and lower threshold limits before asserting the interrupt.
-    als.setLightSensorPersists(5);
-
-    // Controls the Proximity  N number of times the measurement data is outside the range
-    // defined by the upper and lower threshold limits before asserting the interrupt.
-    als.setProximityPersists(5);
-
-    /*
-    *  ALS_IRQ_ACTIVE_LOW, // INT pin is considered active when it is a logic 0 (default)
-    *  ALS_IRQ_ACTIVE_HIGH // INT pin is considered active when it is a logic 1
-    * * */
-    als.setIRQLevel(SensorLTR553::ALS_IRQ_ACTIVE_LOW);
-
-    /*
-    *  ALS_IRQ_ONLY_PS,    // Only PS measurement can trigger interrupt
-    *  ALS_IRQ_ONLY_ALS,   // Only ALS measurement can trigger interrupt
-    *  ALS_IRQ_BOTH,       // Both ALS and PS measurement can trigger interrupt
-    * * * */
-    als.enableIRQ(SensorLTR553::ALS_IRQ_BOTH);
 
     /*
     *   ALS_GAIN_1X  ,   -> 1 lux to 64k lux (default)
@@ -109,21 +82,4 @@ bool LTR553_init(void)
     als.enableProximity();
 
     return true;
-}
-
-uint16_t LTR_553ALS_get_channel(int ch) // ch 0~1
-{
-    i2c0_lock();
-    uint16_t v = als.getLightSensor(ch);
-    i2c0_unlock();
-    return v;
-}
-
-uint16_t LTR_553ALS_get_ps(void)
-{
-    bool saturated = false;
-    i2c0_lock();
-    uint16_t v = als.getProximity(&saturated);
-    i2c0_unlock();
-    return v;
 }

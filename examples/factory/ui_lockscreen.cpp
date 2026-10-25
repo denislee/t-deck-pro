@@ -9,8 +9,11 @@
  * initialiser that references it. */
 static void on_key_lock(void);
 
+/* Forward declaration: create_lock lays the freshly built screen out through
+ * lock_apply_orientation(), which is defined below it. */
+static void lock_apply_orientation(bool landscape);
+
 // ******************************** [ screen LOCK ] ********************************
-#if 1
 #define LOCK_UNLOCK_REQUIRED 3
 
 static lv_obj_t *lock_time_label = NULL;
@@ -20,7 +23,6 @@ static lv_obj_t *lock_cal_label = NULL;
 static lv_obj_t *lock_today_box = NULL;
 static lv_obj_t *lock_today_label = NULL;
 static lv_obj_t *lock_dots_label = NULL;
-static lv_obj_t *lock_hint_label = NULL;
 static lv_obj_t *lock_wk_label = NULL;
 static lv_obj_t *lock_rule = NULL;
 static lv_timer_t *lock_clock_timer = NULL;
@@ -215,39 +217,31 @@ static void create_lock(lv_obj_t *parent)
     // ── Huge clock (32×64 pixel font) ──
     lock_time_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_time_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
     lv_label_set_text(lock_time_label, "--:--");
-    lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
 
     // ── Date subtitle ──
     lock_date_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_date_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_text_font(lock_date_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_date_label, " ");
-    lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
 
     // ── Divider above the calendar ──
     lock_rule = lv_obj_create(parent);
     lv_obj_remove_style_all(lock_rule);
     lv_obj_set_size(lock_rule, 200, 1);
-    lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
     lv_obj_set_style_bg_color(lock_rule, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(lock_rule, LV_OPA_COVER, LV_PART_MAIN);
 
     // ── Calendar: month name ──
     lock_month_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_month_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lock_month_label, 1, LV_PART_MAIN);
     lv_label_set_text(lock_month_label, "");
-    lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
 
     // ── Calendar: weekday header (Su Mo Tu We Th Fr Sa) ──
     lock_wk_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_wk_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
     lv_label_set_text(lock_wk_label, "Su Mo Tu We Th Fr Sa");
-    lv_obj_set_pos(lock_wk_label, lock_cal_x(), lock_cal_y() - 22);
 
     // ── Today highlight: black box (drawn before label so label sits above) ──
     lock_today_box = lv_obj_create(parent);
@@ -260,14 +254,11 @@ static void create_lock(lv_obj_t *parent)
     // ── Calendar: date grid ──
     lock_cal_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_cal_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_cal_label, "");
-    lv_obj_set_pos(lock_cal_label, lock_cal_x(), lock_cal_y());
 
     // White today number (drawn above the grid + box)
     lock_today_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_today_label, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lock_today_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
     lv_label_set_text(lock_today_label, "");
     lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
 
@@ -275,8 +266,12 @@ static void create_lock(lv_obj_t *parent)
     lock_dots_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_dots_label, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_text_font(lock_dots_label, &lv_font_spleen_5x8, LV_PART_MAIN);
-    lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
     lock_render_dots();
+
+    // Fonts, alignments and positions for every widget above are applied by
+    // lock_apply_orientation() — lay out the portrait (boot) form now so the
+    // screen is coherent even before entry_lock runs.
+    lock_apply_orientation(false);
 }
 
 // Lay out the lock screen for the current orientation.
@@ -285,11 +280,12 @@ static void create_lock(lv_obj_t *parent)
 //   date subtitle, divider, then the calendar in tamzen_10x20 with 30×20
 //   cells.
 //
-// Landscape (320×240): smaller spleen_16x32 clock at top-left, date
-//   right of it on the same row, and a *bigger* spleen_12x24 calendar
-//   filling the rest of the panel with 36×24 cells. The divider is
-//   dropped and the unlock-progress dots move to the top-right so the
-//   6-row grid can extend almost to the panel bottom without overlap.
+// Landscape (320×240): a smaller spleen_12x24 clock at the top-left, the
+//   date label hidden (there is no room for it next to the clock), and a
+//   *bigger* spleen_12x24 calendar filling the rest of the panel with
+//   36×24 cells. The divider is dropped and the unlock-progress dots move
+//   to the top-right so the 6-row grid can extend almost to the panel
+//   bottom without overlap.
 static void lock_apply_orientation(bool landscape)
 {
     if (landscape) {
@@ -327,9 +323,9 @@ static void lock_apply_orientation(bool landscape)
         if (lock_today_label) {
             lv_obj_set_style_text_font(lock_today_label, &lv_font_spleen_12x24, LV_PART_MAIN);
         }
-        // today_box size + today_box/today_label positions are reset by
-        // lock_render_calendar on the next clock tick (caller invalidates
-        // lock_last_yday).
+        // today_box size + today_box/today_label positions are recomputed by
+        // lock_render_calendar on the next clock tick (the caller follows this
+        // with lock_update_clock(true), which forces that redraw).
     } else {
         if (lock_time_label) {
             lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_32x64, LV_PART_MAIN);
@@ -392,7 +388,7 @@ static void entry_lock(void)
 
     lock_saved_wifi_was_enabled = ui_wifi_get_enabled();
     if (lock_saved_wifi_was_enabled) {
-        ui_wifi_set_enabled(false);
+        ui_wifi_radio_set(false);
     }
     ui_setting_apply_keypad_light(false);
 
@@ -406,7 +402,7 @@ static void exit_lock(void)
     }
 
     if (lock_saved_wifi_was_enabled) {
-        ui_wifi_set_enabled(true);
+        ui_wifi_radio_set(true);
         lock_saved_wifi_was_enabled = false;
     }
     ui_setting_apply_keypad_light(ui_setting_get_keypad_light());
@@ -434,7 +430,6 @@ static void destroy_lock(void)
     lock_today_box = NULL;
     lock_today_label = NULL;
     lock_dots_label = NULL;
-    lock_hint_label = NULL;
     lock_wk_label = NULL;
     lock_rule = NULL;
 }
@@ -455,18 +450,13 @@ static void lock_handle_key(char key)
         // tap (see reader-screen 'r' handler) — debounce so a single
         // press doesn't toggle rotation twice.
         static uint32_t last_rot_ms = 0;
-        uint32_t now = lv_tick_get();
-        if (now - last_rot_ms < 300) return;
-        last_rot_ms = now;
+        if (!ui_debounce(&last_rot_ms, 300)) return;
 
         lock_landscape = !lock_landscape;
         factory_set_landscape(lock_landscape);
         lock_apply_orientation(lock_landscape);
         // Persist so the choice survives reboot.
         ui_lock_landscape_set(lock_landscape ? 1 : 0);
-        // Force the calendar / today-box positions to be recomputed
-        // against the new resolution on the next clock tick.
-        lock_last_yday = -1;
         lock_update_clock(true);
         ui_disp_full_refr();
         return;
@@ -485,8 +475,6 @@ static void lock_handle_key(char key)
             lock_unlock_progress = 0;
             lock_render_dots();
         }
-        // Force the renderer to redraw the grid even though tm_yday is unchanged.
-        lock_last_yday = -1;
         lock_update_clock(true);
         ui_disp_full_refr();
         return;
@@ -518,4 +506,3 @@ static void on_key_lock(void)
         if (scr_mgr_get_curr_scr_id() != SCREEN_LOCK_ID) break;
     }
 }
-#endif
