@@ -31,6 +31,9 @@ extern "C" {
 #endif
 
 void ui_disp_full_refr(void);
+// Always a full (flashing) refresh — for ghost clean-up points.
+// ui_disp_full_refr() is the transition refresh.
+void ui_disp_force_full_refr(void);
 void ui_disp_hard_refr(void);
 void ui_disp_white_clear(void);
 void ui_set_reader_landscape(bool landscape);
@@ -38,6 +41,8 @@ void ui_set_reader_landscape(bool landscape);
 // settings persistence
 void ui_settings_load(void);
 void ui_settings_save(void);
+// True while a debounced NVS write is still queued.
+bool ui_settings_pending(void);
 
 bool ui_setting_get_keypad_light(void);
 bool ui_setting_get_red_led(void);
@@ -75,6 +80,7 @@ void ui_gps_get_data(uint16_t *year, uint8_t *month, uint8_t *day);
 void ui_gps_get_time(uint8_t *hour, uint8_t *minute, uint8_t *second);
 void ui_gps_get_satellites(uint32_t *vsat);
 void ui_gps_get_speed(double *speed);
+void ui_gps_set_continuous(bool on);
 
 // [ screen 4 ] --- Wifi Scan
 // Async variants used by screen4 so an Esc press can interrupt without
@@ -149,6 +155,9 @@ float ui_batt_25896_get_pre_curr(void);
 const char * ui_batt_25896_get_chg_st(void);
 const char * ui_batt_25896_get_vbus_st(void);
 const char * ui_batt_25896_get_ntc_st(void);
+// Continuous (1 s) ADC conversions on the BQ25896 — on while the BQ25896
+// screen is open, back to a single conversion on exit.
+void ui_batt_25896_set_adc_continuous(bool on);
 
 /* 27220 */
 bool ui_battery_27220_is_vaild(void);
@@ -170,6 +179,8 @@ bool ui_battery_is_external_power_present(void);
 // [ screen 7 ] --- Input
 int ui_input_get_keypad_val(char *val);
 void ui_input_set_keypad_flag(void);
+// Milliseconds since the last keypad key arrived.
+uint32_t ui_input_idle_ms(void);
 #ifdef BOARD_HAS_BHI260AP
 int ui_other_get_gyro(float *x, float *y, float *z);
 #endif
@@ -188,6 +199,7 @@ void ui_lora_send(const char *str);
 void ui_lora_recv_loop(void);
 bool ui_lora_get_recv(const char **str, int *rssi);
 void ui_lora_set_recv_flag(void);
+void ui_lora_sleep(void);
 
 // shutdown
 void ui_shutdown_on(void);
@@ -202,13 +214,16 @@ bool ui_pcm5102_cb(const char *at_cmd);
 void ui_pcm5102_stop(void);
 
 // [ screen 12 ] --- Notes
+// printf-free fixed-point formatter: "%.<decimals>f<suffix>", decimals 0..3.
+int ui_fmt_fixed(char *buf, size_t n, float v, int decimals, const char *suffix);
 /* Copy only printable ASCII from src into dst (size n), strip trailing spaces; returns the length. */
 size_t ui_ascii_trim(char *dst, size_t n, const char *src);
 bool ui_notes_write(const char *filename, const char *content);
 
 // [ screen 13 ] --- Ebook Reader
-#define UI_READER_MAX_COUNT 20
-void ui_reader_get_list(char list[UI_READER_MAX_COUNT][32], int *count);
+#define UI_READER_NAME_MAX 96  // FAT long names; was 32
+#define UI_READER_MAX_COUNT 64
+void ui_reader_get_list(char list[UI_READER_MAX_COUNT][UI_READER_NAME_MAX], int *count);
 // Reads up to buf_size-1 bytes starting at `offset`, null-terminates buf,
 // returns bytes actually read (0 on failure / EOF).
 size_t ui_reader_read_range(const char *filename, size_t offset, char *buf, size_t buf_size);
@@ -243,6 +258,16 @@ char* ui_dict_lookup(const char *word);
 // Used to distinguish "word not in dictionary" from "dictionary file missing"
 // when ui_dict_lookup returns NULL.
 bool ui_dict_available(void);
+
+// Opens /dict/eng-pob.tsv once and (if present) loads the sparse sidecar
+// index /dict/eng-pob.idx next to it into PSRAM, so lookups are a handful of
+// block reads instead of an open + ~18 bisection seeks each. The dictionary
+// screen calls this on entry and ui_dict_close() on exit; ui_dict_lookup()
+// opens/closes on demand when it is called from anywhere else. Safe to call
+// twice, and a no-op while the SD card is exported over USB. Build the index
+// with tools/build_dict_index.py and copy eng-pob.idx next to the .tsv.
+void ui_dict_open(void);
+void ui_dict_close(void);
 
 // System font selection (persisted via Preferences).
 //
@@ -312,6 +337,13 @@ bool ui_reader_bookmark_get(const char *filename, size_t *offset);
 // settings change).
 void ui_reader_bookmark_page_set(const char *filename, int page_index);
 bool ui_reader_bookmark_page_get(const char *filename, int *page_index_out);
+
+// Per-file geometry cookie: the cookie computed at save time by
+// reader_geo_cookie() in ui_reader.cpp, persisted beside the page-index
+// bookmark so the O(1) resume fast path also survives a reboot. Returns
+// false when no cookie was saved for this book.
+void ui_reader_geo_cookie_set(const char *filename, uint32_t cookie);
+bool ui_reader_geo_cookie_get(const char *filename, uint32_t *cookie);
 
 // USB MSC
 void ui_usb_msc_begin(void);

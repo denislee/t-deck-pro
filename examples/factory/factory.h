@@ -35,6 +35,10 @@
 
 extern TinyGsm modem;
 extern TaskHandle_t a7682_handle;
+bool a7682_probe(void);
+void a7682_pump_resume(void);
+void a7682_pump_suspend(void);
+bool sd_care_init(void);
 /*********************************************************************************
  *                                   MACROS
  * *******************************************************************************/
@@ -58,6 +62,7 @@ extern "C" {
 
 void board_rails_hold(bool hold);
 void disp_full_refr(void); // Next global refresh
+void disp_transition_refr(void); // Screen-change refresh: partial, full every Nth
 void disp_hard_refresh(void); // Thorough B/W cycle refresh
 void disp_white_clear(void); // Single full-screen white frame
 void factory_set_landscape(bool landscape); // Reader-view rotation hook

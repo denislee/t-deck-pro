@@ -89,7 +89,6 @@ typedef struct _ui_test {
     const char *name;
     int peri_id;
     lv_obj_t *st;
-    bool (*cb)(int);
     char shortcut;
 } ui_test_handle;
 
@@ -111,6 +110,12 @@ typedef struct {
  *                              GLOBAL PROTOTYPES
  * *******************************************************************************/
 void ui_deckpro_entry(void);
+// Dispatch the current screen's on_key() hook. Called from loop() each time the
+// keypad task wakes it (event-driven; no polling timer).
+void ui_deckpro_dispatch_keys(void);
+// Refresh the lock-screen clock after a timed light-sleep wake, which may land
+// before the 15 s clock timer is due.
+void ui_lock_clock_refresh(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

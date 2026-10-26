@@ -10,6 +10,9 @@ below is a measured link-time value, not an estimate.
 - Analysis method: `nm --size-sort -S`, `size -A`, and a map-file parser summing
   `.text/.rodata/.data/.bss` per input object (debug sections excluded).
 
+> **2026-10-25 (night) — §9 records the implementation of every §8 item**
+> (build-verified only; the hardware checks still to do are listed at its end).
+>
 > **2026-10-25 (evening) — read §8 first.** It re-audits the current working tree:
 > nearly all of §1–§7 is now fixed (status scoreboard in §8.1), the image is
 > 1,226,608 B, and it adds 10 new bugs (§8.2) plus power, e-paper, storage and memory
@@ -2075,6 +2078,120 @@ entirely** (hyn_* removed), D-F1 variant UI **#ifdef'd** behind `BOARD_HAS_PCM51
   It also found an older bug, now fixed: the reader popped the screen from inside `scr_mgr_push` when
   PSRAM allocation failed.
 - Still needs on-device verification (there is no test suite).
+
+---
+
+## 9. Fourth pass: §8 implemented (2026-10-25, night)
+
+Every §8 item is now handled, either in code or below with a reason it was not.
+All of this is **verified by compiling only; no hardware test was possible**:
+- `pio run -e T-Deck-Pro` builds with no `-Wunused-*` warnings in `examples/factory`.
+- The gated variant (`-DBOARD_HAS_PCM5102A -DBOARD_HAS_BHI260AP`) builds.
+- The tethering env (`T-Deck-Pro-modem`) builds.
+
+Flash each tier and watch serial before trusting it on battery.
+
+| Metric | §8.0 | **Now** |
+| --- | --- | --- |
+| `firmware.bin` | 1,226,608 B | **1,175,488 B** |
+| `.dram0.data` + `.dram0.bss` | 114,876 B | **65,908 B** (25,004 + 40,904). The LVGL pool moved to PSRAM (M1) |
+| `.flash.text` / `.flash.rodata` | 792,359 / 329,896 B | 775,739 / 294,980 B |
+
+**Host-side test:** `python3 -I tools/test_dict_lookup.py eng-pob.tsv` checks lookups against the real 108 MB TSV.
+- The fixed bisection and the new indexed lookup miss 0 of 400 sampled words.
+- The old algorithm misses 135, which is the negative control.
+
+### 9.1 Status per §8 item
+
+**Bugs (§8.2)**
+- **N1 ✅** Scan `[lo, hi]` inclusive, with no skip at `lo`, and never let `hi` grow.
+- **N2 ✅** Was already fixed (deferred pop via `lv_async_call`).
+- **N3/P5 ✅** No boot TX. The radio warm-sleeps after init and on leaving screens 1.1/1.2. Turning LoRa off now forces a re-init on the next power-on (`lora_power_off`).
+- **N4 ✅** MSC closes the reader and dictionary handles. `sd_fs_ready()` fences every FatFs entry point while the card is exported. `ui_usb_msc_end` remounts the card fresh.
+- **N5 ✅** Notes are capped at 4,096 characters. `LV_ASSERT_HANDLER` is now `abort()`.
+- **N6 ✅** Turning the modem on runs a lazy probe task. Turning it off clears `peri_init_st`. GPS and LoRa were already done.
+- **N7 ✅** `WiFi.persistent(false)` in `setup()`.
+- **N8 ✅** `INT_STAT` is cleared before draining, and the drain re-runs while INT stays low. The priority comment is fixed (the keypad is 19).
+- **N9 ✅** Names are 96 B (`UI_READER_NAME_MAX`). The list holds 64 entries, allocated in PSRAM.
+- **N10 ✅** An LRU blob of 48 books (`bm_lru`). Evicting a book removes its `b_`/`p_`/`c_` keys.
+
+**Power (§8.3)**
+- **P1 ✅ (steps 1–3).**
+  - The event-driven `loop()` drops to 80 MHz while waiting at least 100 ms.
+  - Auto-lock after 10 min without a key. It skips the USB, AT, LoRa-test and reader screens: the reader's `entry()` would restart the book.
+  - Light sleep on the lock screen, on battery only, until the next minute or a key.
+  - `-DFACTORY_IDLE_POWER_SAVE=0` reverts all of this.
+  - Step 4 (custom sdkconfig, DFS + auto light sleep) is not done; it needs a custom core.
+- **P2 ✅** All five textareas have a solid cursor.
+- **P3 ✅** The GPS rail drops once the clock is set. The module powers up hourly with a 5 min fix window, and runs continuously while screen 3 is open. GLL/GSA/GSV/VTG are disabled.
+- **P4 ✅**
+  - The modem defaults to off, which only affects fresh NVS.
+  - The rail drops when the probe fails.
+  - The pump task is created lazily, only on the AT-test screen, and polls every 10 ms. The call screen no longer runs the pump, which raced TinyGSM.
+- **P6 ✅** LTR553 is probed only, then left in standby.
+- **P7 ✅** One-shot ADC, switched to continuous only on screen 6.1. Gauge reads every 30 s and charger presence every 5 s. The low-voltage check runs every 10 s, and every 1 s while latched. The keypad safety net is 5 s. I²C runs at 400 kHz.
+- **P8 ✅** The keypad task notifies the loop task. Both key-polling timers are gone; the home screen has an `on_key` like every other screen. `bq25896_runtime_maintain` runs on a 5 s `lv_timer`.
+- **P9 ◐** `WIFI_PS_MAX_MODEM` after connect. Disconnect-after-NTP was **not** done: it would fight the WiFi on/off state shown in the taskbar and used by ping.
+- **P10**
+  - **✅** The clock is saved every 15 min, plus on lock, deep sleep and shutdown.
+  - **✅** Deep sleep also wakes on a key, using ext1 on the keypad INT with an RTC pull-up.
+  - **⬜ by design:** `BOARD_1V8_EN` gating is measure-first.
+  - **⬜ hardware:** EPD hibernate needs the RST line wired.
+
+**E-paper (§8.4)**
+- **D1 ✅** `decodebuffer` is now a persistent full-panel mirror. The areas of a frame are unioned and refreshed once, on `lv_disp_flush_is_last`, and FULL vs PART is decided per frame.
+- **D2 ✅ (needs hardware check)** `_Update_Part` no longer clears `_init_display_done`. `-DGDEQ031T10_REINIT_AFTER_PARTIAL=1` restores the upstream behaviour.
+- **D3 ✅** The busy callback lends the SPI bus out during BUSY waits when the task holds it at depth 1. `disp_hard_refresh` takes the guard per fill, and the boot `SD.usedBytes()` is gone.
+- **D4 ✅** Bulk `writeBytes` per row in `_writeImage` / `_writeImagePart`.
+- **D5 ✅** `ui_disp_full_refr()` is now a transition refresh: partial, with every 6th transition full (`DISP_FULL_EVERY_N_TRANSITIONS`, tune on hardware). `ui_disp_force_full_refr()` covers the ghost clean-up points. The shared `ui_entry_taskbar` / `ui_exit_taskbar` hooks replace 9 identical entry/exit pairs.
+- **D6 ✅** A `c_%08x` cookie per book.
+
+**Storage (§8.5)**
+- **IO1 ✅** Mount at 20 → 10 → 4 → 1 MHz.
+- **IO2 ✅**
+  - `setBufferSize(0)` on the dictionary file.
+  - The file stays open while the dictionary screen is up.
+  - A sparse sidecar index (`tools/build_dict_index.py`, one record per 64 lines, about 760 KB) is loaded into PSRAM. If the index is missing or stale, the lookup falls back to bisection.
+- **IO3 ✅** The SPIFFS mount happens only in the audio build, without format-on-fail. The LittleFS switch is not done; nothing in the 4G build uses the partition.
+- **IO4 ✅** `Serial.setTxTimeoutMs(0)`.
+- **IO5 ✅** `max_files = 3`, and the reader file buffer is 1 KB.
+
+**Memory and flash (§8.6)**
+- **M1 ✅** The pool is `ps_malloc`'d, 128 KB. A `[lvgl-mem]` line is logged on every screen change; size the pool from a real session's `max_used`.
+- **M2 ◐** Our code has no float formats left (`ui_fmt_fixed`), and `__ssvfiscanf_r` dropped out. `_vfprintf_r`, `_svfprintf_r` and `_dtoa_r` are still linked, because the core and IDF logging use full newlib printf. Removing them needs nano specs or a custom core.
+- **M3 ✅** Sizes 17/19 now map to 16/18, and those font files are deleted. `spleen_32x64` is subset to U+002D–U+003A by the new `tools/subset_lvgl_font.py`.
+- **M4 ✅ (helpers)** Shared `lv_style_t` for list rows, the inverted focus state and menu items. Fonts stay local because they change at runtime. Most of the remaining ~240 one-off calls are layout and were left alone.
+- **M5 —** Note only (prebuilt TinyUSB).
+
+**Leftovers (§8.7)** ✅
+- S1 (shared action-list helpers), S9 (`ui_edit_nav_key`), S19, S23 (`NvsPrefs`) and S4.
+- `scr_mgr_*` lost the `anim` parameter and now return `void`.
+- The redundant forward declarations and resets are deleted, as are the PCM5102 `#else` branches.
+- C4: the tethering sketch includes the factory pin map.
+- The back button is replaced by `scr_title_create`. `E_PERI_TOUCH`, `T_DECK_PRO_V1_0`, `isT_Deck_Pro_v1_0`, `entry11`/`exit11` and `ui_test_handle.cb` are gone.
+- Screens 1 and 6 use the `ui_shortcut_menu_*` tables.
+- Includes are cleaned up, and `gps`, `als` and `bhy` are static. `taskbar_statue` is now `int taskbar_state[]`.
+- `*.ino.cpp` is gitignored, and `EEPROM` and the `LOG_PORT` line are gone.
+- The GPS log spam and the stale comments are fixed.
+- BHI260AP: a weak SensorLib hook lets `BHI260AP_init` yield i2c0 between BHY2 transfers.
+- `TASKBAR_ID_BATTERY_PERCENT` is used; §8.7 was wrong about it.
+- §1.8 `lib_ldf_mode = chain+` was tried and reverted: it cannot evaluate ESP-IDF `SOC_*` macros and breaks the audio build.
+
+**Still open: hardware verification.**
+1. D1/D2/D5 refresh quality and ghosting.
+2. P1 light sleep and wake: keypad INT re-arm, and the clock on a timer wake.
+3. P3 GPS resync.
+4. P10 key wake from deep sleep: does the keypad INT have a usable pull-up?
+5. IO1 SD at 20 MHz on the shared bus.
+6. Measure battery current before and after with `-DFACTORY_IDLE_POWER_SAVE=0/1`.
+
+**Re-verified 2026-10-25 (late), from a clean build directory; no board attached:**
+- Default env with the `-Wunused-*` flags: SUCCESS, 0 unused warnings, `firmware.bin` 1,175,488 B (matches the table above).
+- Variant `-DBOARD_HAS_PCM5102A -DBOARD_HAS_BHI260AP`: SUCCESS.
+- `T-Deck-Pro-modem` with `PLATFORMIO_SRC_DIR=examples/tethering` (as `make upload-modem` sets it): SUCCESS.
+  Without that variable it compiles `examples/factory` and fails, which is expected.
+- `tools/test_dict_lookup.py eng-pob.tsv --expect-old-failures`: 302 words; fixed 0 misses, indexed 0, old 108 (negative control).
+- The six hardware checks above are still open: they need the board on USB and, for item 6, a power meter.
 
 ---
 

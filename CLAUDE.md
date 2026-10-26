@@ -78,7 +78,15 @@ Custom LVGL flush callback drives `GxEPD2`. Two refresh modes (`DISP_REFR_MODE_F
 
 ## Libraries
 
-`lib/` contains vendored copies of all third-party libs (GxEPD2, RadioLib, lvgl 8.3.x, SensorLib, TinyGPSPlus, TinyGSM, XPowersLib, ESP32-audioI2S, etc.). PlatformIO uses these directly — `lib_deps` in `platformio.ini` lists only the core ESP32 libraries (SPI, Wire, FS, SPIFFS, EEPROM), and third-party libs are vendored under `lib/`. **Edit cautiously**: changes to `lib/` are local forks, not upstream.
+`lib/` contains vendored copies of all third-party libs (GxEPD2, RadioLib, lvgl 8.3.x, SensorLib, TinyGPSPlus, TinyGSM, XPowersLib, ESP32-audioI2S, etc.). PlatformIO uses these directly — `lib_deps` in `platformio.ini` lists only the core ESP32 libraries (SPI, Wire, FS, SPIFFS), and third-party libs are vendored under `lib/`. **Edit cautiously**: changes to `lib/` are local forks, not upstream. Known local changes (search for "Local fork change"): `GxEPD2_310_GDEQ031T10.cpp` keeps the controller initialised after partial updates (`-DGDEQ031T10_REINIT_AFTER_PARTIAL=1` restores upstream) and writes rows with bulk SPI; SensorLib's `bosch_interfaces.cpp` calls a weak `sensorlib_i2c_transfer_done()` hook after each BHY2 transfer.
+
+## Dictionary data (SD card)
+
+The dictionary screen reads `/dict/eng-pob.tsv` from the SD card (sorted by ASCII-lowercased headword). Build it with `tools/kaikki_to_tsv.py`, then build the optional sparse index with `python3 -I tools/build_dict_index.py eng-pob.tsv` and copy `eng-pob.idx` next to the TSV. Without the index the firmware falls back to bisection. `python3 -I tools/test_dict_lookup.py eng-pob.tsv` checks both lookup paths host-side against the real file.
+
+## Power behaviour
+
+`loop()` is event-driven: the keypad task notifies the loop task, the CPU drops to 80 MHz while waiting, the UI auto-locks after 10 min without a key, and the lock screen light-sleeps on battery until the next minute or a key. Build with `-DFACTORY_IDLE_POWER_SAVE=0` to restore always-240 MHz, never-sleep behaviour (e.g. for current measurements). GPS is duty-cycled once the clock is set; the modem defaults to off.
 
 ## Conventions
 

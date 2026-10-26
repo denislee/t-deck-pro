@@ -1,5 +1,6 @@
 ﻿
 #include "ui_scr_mrg.h"
+#include <stdio.h>
 
 /* 记录所有的屏幕卡片 */ 
 static scr_card_t *scr_mgr_head;
@@ -67,6 +68,15 @@ static void scr_mgr_remove(scr_card_t *card)
     card->st = SCR_MGR_STATE_IDLE;
 }
 
+/* One line per screen change so a session of normal use shows the real peak
+ * (OPTIMIZATION.md M1). */
+static void scr_mgr_log_mem(int id)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    printf("[lvgl-mem] scr=%d used=%u%% max_used=%u free=%u biggest=%u frag=%u%%\n", id, (unsigned)mon.used_pct, (unsigned)mon.max_used, (unsigned)mon.free_size, (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
+}
+
 /*********************************************************************************
  *                              GLOBAL FUNCTION
  *********************************************************************************/
@@ -107,16 +117,15 @@ bool scr_mgr_register(int id, scr_lifecycle_t *card_life) // 注册一个屏幕�
     return true;
 }
 
-bool scr_mgr_switch(int id, bool anim)  // 清空栈，然后切换到指定 id的屏幕卡片上
+void scr_mgr_switch(int id)  // 清空栈，然后切换到指定 id的屏幕卡片上
 {
     scr_card_t *tgt_card = scr_mgr_find_by_id(id);
     scr_card_t *stack_scr = NULL;
     lv_obj_t *old_top_obj;
 
-    (void)anim;
 
     if(tgt_card == NULL) // 没有找到该屏幕
-        return false;
+        return;
 
     old_top_obj = scr_stack_top ? scr_stack_top->obj : NULL;
     while(scr_stack_top != NULL) { // 清除所有卡片
@@ -143,22 +152,21 @@ bool scr_mgr_switch(int id, bool anim)  // 清空栈，然后切换到指定 id�
     lv_scr_load(stack_scr->obj);
     if (old_top_obj)
         lv_obj_del(old_top_obj);   // the previously active screen
-    return true;
+    scr_mgr_log_mem(tgt_card->id);
 }
 
-bool scr_mgr_push(int id, bool anim)
+void scr_mgr_push(int id)
 {
     scr_card_t *tgt_card = scr_mgr_find_by_id(id);
     scr_card_t *stack_scr = NULL;
 
-    (void)anim;
 
     if(tgt_card == NULL){ // 没有找到该屏幕
-        return false;
+        return;
     }
 
     if((scr_stack_top != NULL) && (tgt_card->id == scr_stack_top->id)){ // 当前push屏幕和最顶层屏幕一样
-        return false;
+        return;
     }
 
     stack_scr = lv_mem_alloc(sizeof(scr_card_t));
@@ -182,18 +190,17 @@ bool scr_mgr_push(int id, bool anim)
     scr_mgr_active(stack_scr);
 
     lv_scr_load(stack_scr->obj);
-    return true;
+    scr_mgr_log_mem(tgt_card->id);
 }
 
-bool scr_mgr_pop(bool anim)
+void scr_mgr_pop(void)
 {
     scr_card_t *dst_item = NULL;
     lv_obj_t *cur_obj;
 
-    (void)anim;
 
     if(scr_stack_top == NULL || scr_stack_top == scr_stack_root){
-        return false;
+        return;
     }
 
     cur_obj = scr_stack_top->obj;
@@ -208,7 +215,6 @@ bool scr_mgr_pop(bool anim)
     if (cur_obj) {
         lv_obj_del(cur_obj);
     }
-    return true;
 }
 
 int scr_mgr_get_curr_scr_id(void)

@@ -6,8 +6,6 @@
  * cross-TU font helpers that all split TUs share:
  *   ui_get_font()     — resolves the UI_FONT / UI_FONT_MONO() macros everywhere
  *   topbar_font_get() — used by ui_taskbar_create() in ui_deckpro.cpp
- *
- * Pure move from ui_deckpro.cpp.  No behaviour change.
  */
 #include "ui_deckpro_int.h"
 
@@ -49,7 +47,7 @@ static void on_key_dict(void)
         } else if (key == KEY_BACKSPACE) {      // Backspace
             lv_textarea_del_char(dict_query_ta);
         } else if (key == KEY_ESC) {            // Esc -> back home
-            scr_mgr_switch(SCREEN0_ID, false);
+            scr_mgr_switch(SCREEN0_ID);
             return;
         } else if (key >= 32 && key <= 126) {
             lv_textarea_add_char(dict_query_ta, key);
@@ -62,6 +60,7 @@ static void create_dict(lv_obj_t *parent)
     ui_taskbar_create(parent);
 
     dict_query_ta = lv_textarea_create(parent);
+    lv_obj_set_style_anim_time(dict_query_ta, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);  // solid cursor: a blinking one keeps the e-paper refreshing nonstop
     lv_textarea_set_one_line(dict_query_ta, true);
     lv_textarea_set_placeholder_text(dict_query_ta, "type word, press Enter");
     lv_obj_set_size(dict_query_ta, lv_pct(100), 36);
@@ -81,22 +80,26 @@ static void create_dict(lv_obj_t *parent)
     lv_label_set_text(dict_result_lab, "EN -> PT-BR\n\nType a word and press Enter.");
 }
 
-static void entry_dict(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-
-static void exit_dict(void)
-{
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
-
 static void destroy_dict(void)
 {
     dict_query_ta = NULL;
     dict_result_lab = NULL;
+}
+
+// Keep the 108 MB dictionary file (and its sidecar index) open while the
+// screen is up: each Enter is then a seek + short scan instead of an
+// open/close pair that walks the FAT over SPI. Closed on the way out so the
+// card is free for the reader and for USB mass storage.
+static void entry_dict(void)
+{
+    ui_dict_open();
+    ui_entry_taskbar();
+}
+
+static void exit_dict(void)
+{
+    ui_dict_close();
+    ui_exit_taskbar();
 }
 
 scr_lifecycle_t screen_dict = {
@@ -124,20 +127,15 @@ static lv_obj_t *reader_list_obj;
 // defined earlier in the file so the home-screen 'c' shortcut can reach them.
 static lv_group_t *reader_group = NULL;
 
-static void reader_apply_focus_style(lv_obj_t *btn)
-{
-    // Inverted (black bg + white text) when the row is focused via j/k.
-    lv_obj_set_style_bg_color(btn, lv_color_black(), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_opa(btn,   LV_OPA_COVER,    LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(btn, lv_color_white(), LV_PART_MAIN | LV_STATE_FOCUSED);
-}
-
 static void reader_list_update(void)
 {
     lv_obj_clean(reader_list_obj);
     if (reader_group) lv_group_remove_all_objs(reader_group);
 
-    char list[UI_READER_MAX_COUNT][32];
+    // 64 * 96 = 6 KB — too big for the LVGL task stack, so it lives in PSRAM.
+    char (*list)[UI_READER_NAME_MAX] =
+        (char (*)[UI_READER_NAME_MAX])ps_malloc(UI_READER_MAX_COUNT * UI_READER_NAME_MAX);
+    if (!list) return;
     int count = 0;
     ui_reader_get_list(list, &count);
 
@@ -145,18 +143,21 @@ static void reader_list_update(void)
         if (ends_with(list[i], ".txt") || ends_with(list[i], ".TXT")) {
             lv_obj_t * btn = lv_list_add_btn(reader_list_obj, NULL, list[i]);
             lv_obj_set_style_text_font(btn, UI_FONT, LV_PART_MAIN);
-            reader_apply_focus_style(btn);
+            // Inverted (black bg + white text) when the row is focused via j/k;
+            // shares the style with the settings/list rows in ui_deckpro.cpp.
+            ui_style_add_focus_inverted(btn);
             if (reader_group) lv_group_add_obj(reader_group, btn);
         }
     }
+    free(list);  // lv_list_add_btn copies the text
 }
 
 // Pulls the per-file bookmark for `name` and seeds the resume state so
 // SCREEN13_1 lands on the saved page instead of page 1.
 static void reader_seed_resume_for(const char *name)
 {
-    strncpy(reader_selected_file, name, 31);
-    reader_selected_file[31] = '\0';
+    strncpy(reader_selected_file, name, UI_READER_NAME_MAX - 1);
+    reader_selected_file[UI_READER_NAME_MAX - 1] = '\0';
     size_t saved_off = 0;
     if (ui_reader_bookmark_get(reader_selected_file, &saved_off)) {
         reader_resume_offset = saved_off;
@@ -173,7 +174,7 @@ static void reader_list_btn_event_cb(lv_event_t * e)
     const char * name = lv_list_get_btn_text(reader_list_obj, obj);
     if (name) {
         reader_seed_resume_for(name);
-        scr_mgr_push(SCREEN13_1_ID, false);
+        scr_mgr_push(SCREEN13_1_ID);
     }
 }
 
@@ -197,12 +198,12 @@ static void on_key_reader(void)
                 const char *name = lv_list_get_btn_text(reader_list_obj, f);
                 if (name && name[0]) {
                     reader_seed_resume_for(name);
-                    scr_mgr_push(SCREEN13_1_ID, false);
+                    scr_mgr_push(SCREEN13_1_ID);
                     return;
                 }
             }
         } else if (key == KEY_ESC) {
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
     }
@@ -375,13 +376,15 @@ const lv_font_t* ui_get_font(int pt, bool force_mono)
 {
     if (force_mono) {
         // Find the best Mono Bold font for the requested size.
-        // We have 14, 15, 16, 17, 18, 19, 20.
+        // We have 14, 15, 16, 18, 20.
         if (pt <= 14) return &Font_Mono_Bold_14;
         if (pt == 15) return &Font_Mono_Bold_15;
         if (pt == 16) return &Font_Mono_Bold_16;
-        if (pt == 17) return &Font_Mono_Bold_17;
+        // No caller asks for 17/19 pt; map them to the neighbouring sizes so
+        // the two fonts (~12 KB) are not linked.
+        if (pt == 17) return &Font_Mono_Bold_16;
         if (pt == 18) return &Font_Mono_Bold_18;
-        if (pt == 19) return &Font_Mono_Bold_19;
+        if (pt == 19) return &Font_Mono_Bold_18;
         return &Font_Mono_Bold_20;
     }
 
@@ -768,7 +771,7 @@ static void on_key_reader_view(void)
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
         if (key == KEY_ESC) { // Esc -> back to list
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         } else if (key == 'j') { // next page
             size_t next_off = (reader_page_idx + 1 < reader_pages_known)
@@ -843,7 +846,7 @@ static void on_key_reader_view(void)
         const int FULL_REFRESH_EVERY = 8;
         if (++partial_pages_since_full >= FULL_REFRESH_EVERY) {
             partial_pages_since_full = 0;
-            ui_disp_full_refr();
+            ui_disp_force_full_refr();
         }
     }
 }
@@ -877,17 +880,11 @@ static void create13_1(lv_obj_t *parent)
 // saved index that was computed under different font/rotation/bar settings.
 //
 // The cookie is a compact encoding of every setting that affects page wrapping.
-// It is stored in a file-scope static: within the same session this is exact;
-// across a reboot the cookie is always 0 (initial value), which will never
-// match a non-zero saved cookie (they differ unless ALL settings are at their
-// default values).  A mismatch falls back to the full O(N) walk — correct but
-// slow.  For full cross-reboot cookie persistence a "c_%08x" NVS key alongside
-// the "p_%08x" page key in ui_deckpro_port.cpp would be needed; see the
-// note in ui_deckpro_port.h near ui_reader_bookmark_page_set() for the slot.
+// It is persisted per book under the "c_%08x" NVS key (ui_reader_geo_cookie_set
+// / _get in ui_deckpro_port.cpp), alongside the "p_%08x" page-index key, so the
+// O(1) resume fast path survives a reboot. A mismatch falls back to the full
+// O(N) walk — correct but slow.  Keys are pruned LRU-style in NVS.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Last geo cookie written at exit13_1; 0 means "unknown / not yet set".
-static uint32_t s_last_saved_cookie = 0;
 
 // Computes a 32-bit cookie that captures every setting that affects page
 // boundaries (font face, font size, rotation, bar visibility, line spacing).
@@ -909,7 +906,7 @@ static uint32_t reader_geo_cookie(void)
 // next LVGL tick, when the push has returned.
 static void reader_pop_async(void *)
 {
-    scr_mgr_pop(false);
+    scr_mgr_pop();
 }
 
 static void entry13_1(void)
@@ -982,10 +979,14 @@ static void entry13_1(void)
         // back to the correct-but-slow full walk.
         int      saved_page   = -1;
         uint32_t curr_cookie  = reader_geo_cookie();
+        uint32_t saved_cookie = 0;
+        bool     cookie_ok    = ui_reader_geo_cookie_get(reader_selected_file,
+                                                         &saved_cookie);
         bool     page_ok      = ui_reader_bookmark_page_get(reader_selected_file,
                                                             &saved_page);
 
-        if (page_ok && saved_page >= 0 && curr_cookie == s_last_saved_cookie) {
+        if (page_ok && cookie_ok && saved_page >= 0 &&
+            curr_cookie == saved_cookie) {
             // Geometry matches the session that saved this index.  Seed the
             // window directly at the resume offset; the user can still read
             // forward normally.  Pressing 'k' past slot 0 triggers a lazy
@@ -1041,8 +1042,8 @@ static void exit13_1(void)
         // next entry can seed offsets[0] at the resume offset without walking.
         ui_reader_bookmark_page_set(reader_selected_file, abs_page);
         // Remember the geometry under which this index was valid; the next
-        // entry13_1 compares this cookie against the current settings.
-        s_last_saved_cookie = cookie;
+        // entry13_1 compares the persisted cookie against the current settings.
+        ui_reader_geo_cookie_set(reader_selected_file, cookie);
     }
     reader_resume_page_base = 0;
     // ─────────────────────────────────────────────────────────────────────
@@ -1083,7 +1084,8 @@ static lv_obj_t *system_font_preview = NULL;
 // if active, otherwise pops the screen. The Slot button picks which font
 // slot the Face/Size buttons (and the live preview) operate on. The Line
 // space button is reader-only and adjusts the gap between text lines in
-// the reader body label.
+// the reader body label.  The shared ui_edit_nav_t drives both this screen
+// and LoRa Setting (screen1_2).
 typedef enum {
     SF_FOCUS_SLOT = 0,
     SF_FOCUS_FACE = 1,
@@ -1091,9 +1093,8 @@ typedef enum {
     SF_FOCUS_LSP  = 3,
     SF_FOCUS_COUNT = 4,
 } system_font_focus_t;
-static system_font_focus_t system_font_focus = SF_FOCUS_SLOT;
+static ui_edit_nav_t system_font_nav = { SF_FOCUS_SLOT, SF_FOCUS_COUNT, false };
 static int  system_font_slot = UI_FONT_SLOT_GENERAL;
-static bool system_font_editing = false;
 
 static const char* system_font_slot_label(int slot)
 {
@@ -1122,8 +1123,8 @@ static void system_font_apply_focus_style(void)
         system_font_size_btn, system_font_lsp_btn
     };
     for (int i = 0; i < SF_FOCUS_COUNT; i++) {
-        bool focused = (i == (int)system_font_focus);
-        ui_edit_focus_style(btns[i], focused, focused && system_font_editing);
+        bool focused = (i == system_font_nav.focus);
+        ui_edit_focus_style(btns[i], focused, focused && system_font_nav.editing);
     }
 }
 
@@ -1168,10 +1169,10 @@ static void system_font_step_line_space(int dir)
 static void system_font_step_focused(int dir)
 {
     int slot = system_font_slot;
-    if      (system_font_focus == SF_FOCUS_SLOT) system_font_step_slot(dir);
-    else if (system_font_focus == SF_FOCUS_FACE) reader_font_step_face(slot, dir);
-    else if (system_font_focus == SF_FOCUS_SIZE) reader_font_step_size(slot, dir);
-    else                                         system_font_step_line_space(dir);
+    if      (system_font_nav.focus == SF_FOCUS_SLOT) system_font_step_slot(dir);
+    else if (system_font_nav.focus == SF_FOCUS_FACE) reader_font_step_face(slot, dir);
+    else if (system_font_nav.focus == SF_FOCUS_SIZE) reader_font_step_size(slot, dir);
+    else                                             system_font_step_line_space(dir);
 }
 
 static void on_key_system_font(void)
@@ -1179,33 +1180,18 @@ static void on_key_system_font(void)
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc
-            if (system_font_editing) {
-                system_font_editing = false;
-                system_font_apply_focus_style();
-            } else {
-                scr_mgr_pop(false);
-                return;
-            }
-        } else if (key == KEY_ENTER) { // Enter -> toggle edit mode
-            system_font_editing = !system_font_editing;
+        int dir = 0;
+        switch (ui_edit_nav_key(&system_font_nav, key, &dir)) {
+        case UI_EDIT_POP:
+            scr_mgr_pop();
+            return;
+        case UI_EDIT_RESTYLE:
             system_font_apply_focus_style();
-        } else if (key == 'j') {
-            if (system_font_editing) {
-                system_font_step_focused(+1);
-                system_font_refresh_labels();
-            } else if ((int)system_font_focus < SF_FOCUS_COUNT - 1) {
-                system_font_focus = (system_font_focus_t)((int)system_font_focus + 1);
-                system_font_apply_focus_style();
-            }
-        } else if (key == 'k') {
-            if (system_font_editing) {
-                system_font_step_focused(-1);
-                system_font_refresh_labels();
-            } else if ((int)system_font_focus > 0) {
-                system_font_focus = (system_font_focus_t)((int)system_font_focus - 1);
-                system_font_apply_focus_style();
-            }
+            break;
+        case UI_EDIT_STEP:
+            system_font_step_focused(dir);
+            system_font_refresh_labels();
+            break;
         }
     }
 }
@@ -1282,9 +1268,9 @@ static void create13_2(lv_obj_t *parent)
 static void entry13_2(void)
 {
     ui_taskbar_enter();
-    system_font_focus = SF_FOCUS_SLOT;
+    system_font_nav.focus = SF_FOCUS_SLOT;
     system_font_slot = UI_FONT_SLOT_GENERAL;
-    system_font_editing = false;
+    system_font_nav.editing = false;
     system_font_refresh_labels();
 }
 

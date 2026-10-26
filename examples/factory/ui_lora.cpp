@@ -6,61 +6,32 @@
 
 //************************************[ screen 1 ]****************************************** lora
 // --------------------- screen 1 --------------------- lora
-static lv_obj_t * scr1_list;
+static const ui_shortcut_item_t scr1_shortcuts[] = {
+    { 'a', "Auto Test",    SCREEN1_1_ID },
+    { 's', "Lora Setting", SCREEN1_2_ID },
+};
+#define SCR1_SHORTCUT_N (int)(sizeof(scr1_shortcuts) / sizeof(scr1_shortcuts[0]))
 
 static void create1(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "Lora <" title bar. ESC on the keypad pops back to
-    // Settings via its on_key() handler.
+    // Settings via its on_key() handler. Letter prefixes on the items double
+    // as keypad shortcuts handled by the same table.
     ui_taskbar_create(parent);
 
-    scr1_list = lv_list_create(parent);
-    lv_obj_set_size(scr1_list, lv_pct(93), LV_VER_RES - UI_TASKBAR_H - 8);
-    lv_obj_align(scr1_list, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H + 4);
-    lv_obj_set_style_pad_top(scr1_list, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(scr1_list, 15, LV_PART_MAIN);
-    lv_obj_set_style_radius(scr1_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scr1_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(scr1_list, 0, LV_PART_MAIN);
-
-    ui_menu_item_create(scr1_list, "a  Auto Test", SCREEN1_1_ID);
-    ui_menu_item_create(scr1_list, "s  Lora Setting", SCREEN1_2_ID);
+    ui_shortcut_menu_create(parent, scr1_shortcuts, SCR1_SHORTCUT_N);
 }
 
 static void on_key_scr1(void)
 {
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc -> back to Settings
-            scr_mgr_pop(false);
-            return;
-        }
-        if (key == 'a') { // Auto Test
-            scr_mgr_push(SCREEN1_1_ID, false);
-            return;
-        }
-        if (key == 's') { // Lora Setting
-            scr_mgr_push(SCREEN1_2_ID, false);
-            return;
-        }
-    }
+    ui_shortcut_menu_on_key(scr1_shortcuts, SCR1_SHORTCUT_N);
 }
 
-static void entry1(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit1(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 scr_lifecycle_t screen1 = {
     .create = create1,
-    .entry = entry1,
-    .exit  = exit1,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .on_key    = on_key_scr1,
 };
 // --------------------- screen 1.1 --------------------- Auto Send
@@ -181,7 +152,9 @@ static void create1_1(lv_obj_t *parent)
 
     lv_obj_t *lab = lv_label_create(parent);
     lv_obj_set_style_text_font(lab, UI_FONT, LV_PART_MAIN);
-    lv_label_set_text_fmt(lab, "%.1fM", ui_lora_get_freq());
+    char fbuf[16];
+    ui_fmt_fixed(fbuf, sizeof(fbuf), ui_lora_get_freq(), 1, "M");
+    lv_label_set_text(lab, fbuf);
     lv_obj_align(lab, LV_ALIGN_TOP_RIGHT, -10, 33);
 
     ui_lora_set_mode(LORA_MODE_SEND);
@@ -206,6 +179,8 @@ static void exit1_1(void) {
         lv_timer_del(lora_recv_timer);
         lora_recv_timer = NULL;
     }
+    // Back to warm sleep (~1 uA) instead of idling in STDBY/RX.
+    ui_lora_sleep();
 }
 scr_lifecycle_t screen1_1 = {
     .create = create1_1,
@@ -227,20 +202,20 @@ static lv_obj_t *dropdown_power;
 // Keyboard nav mirrors the System Font screen (screen13_2): j/k moves
 // focus between the dropdowns, Enter toggles edit mode, in edit mode j/k
 // cycles the focused dropdown's selection, Esc exits edit mode (or pops
-// the screen back to Settings when not editing).
+// the screen back to Settings when not editing).  The shared ui_edit_nav_t
+// drives both screens.
 typedef enum {
     LS_FOCUS_FREQ  = 0,
     LS_FOCUS_BAND  = 1,
     LS_FOCUS_POWER = 2,
     LS_FOCUS_COUNT = 3,
 } scr1_2_focus_t;
-static scr1_2_focus_t scr1_2_focus = LS_FOCUS_FREQ;
-static bool scr1_2_editing = false;
+static ui_edit_nav_t scr1_2_nav = { LS_FOCUS_FREQ, LS_FOCUS_COUNT, false };
 
 static lv_obj_t *scr1_2_focused_dropdown(void)
 {
-    if (scr1_2_focus == LS_FOCUS_FREQ)  return dropdown_freq;
-    if (scr1_2_focus == LS_FOCUS_BAND)  return dropdown_band;
+    if (scr1_2_nav.focus == LS_FOCUS_FREQ)  return dropdown_freq;
+    if (scr1_2_nav.focus == LS_FOCUS_BAND)  return dropdown_band;
     return dropdown_power;
 }
 
@@ -249,8 +224,8 @@ static void scr1_2_apply_focus_style(void)
     lv_obj_t *dds[LS_FOCUS_COUNT] = { dropdown_freq, dropdown_band, dropdown_power };
     for (int i = 0; i < LS_FOCUS_COUNT; i++) {
         if (!dds[i]) continue;
-        bool focused = (i == (int)scr1_2_focus);
-        ui_edit_focus_style(dds[i], focused, focused && scr1_2_editing);
+        bool focused = (i == scr1_2_nav.focus);
+        ui_edit_focus_style(dds[i], focused, focused && scr1_2_nav.editing);
     }
 }
 
@@ -273,31 +248,17 @@ static void on_key_scr1_2(void)
     char key;
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc
-            if (scr1_2_editing) {
-                scr1_2_editing = false;
-                scr1_2_apply_focus_style();
-            } else {
-                scr_mgr_pop(false);
-                return;
-            }
-        } else if (key == KEY_ENTER) { // Enter -> toggle edit mode
-            scr1_2_editing = !scr1_2_editing;
+        int dir = 0;
+        switch (ui_edit_nav_key(&scr1_2_nav, key, &dir)) {
+        case UI_EDIT_POP:
+            scr_mgr_pop();
+            return;
+        case UI_EDIT_RESTYLE:
             scr1_2_apply_focus_style();
-        } else if (key == 'j') {
-            if (scr1_2_editing) {
-                scr1_2_step_focused(+1);
-            } else if ((int)scr1_2_focus < LS_FOCUS_COUNT - 1) {
-                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus + 1);
-                scr1_2_apply_focus_style();
-            }
-        } else if (key == 'k') {
-            if (scr1_2_editing) {
-                scr1_2_step_focused(-1);
-            } else if ((int)scr1_2_focus > 0) {
-                scr1_2_focus = (scr1_2_focus_t)((int)scr1_2_focus - 1);
-                scr1_2_apply_focus_style();
-            }
+            break;
+        case UI_EDIT_STEP:
+            scr1_2_step_focused(dir);
+            break;
         }
     }
 }
@@ -311,10 +272,14 @@ static void lora_setting_event_handler(lv_event_t * e)
     switch (*flag)
     {
     case 'f':
+    {
         if (select < 0 || select >= (int)GET_BUFF_LEN(lora_freq_list)) return;
-        printf("set freq %.1fMHz\n", lora_freq_list[select]);
+        char fbuf[16];
+        ui_fmt_fixed(fbuf, sizeof(fbuf), lora_freq_list[select], 1, "MHz");
+        printf("set freq %s\n", fbuf);
         ui_lora_set_freq(lora_freq_list[select]);
         break;
+    }
     case 'b':
         if (select < 0 || select >= (int)GET_BUFF_LEN(lora_band_list)) return;
         printf("set bandwidth %dKhz\n", (int)lora_band_list[select]);
@@ -375,15 +340,16 @@ static void dd_select_matching(lv_obj_t *dd, const float *vals, int n, float cur
     }
 }
 
-/* Build the option list from vals, one line each, formatted with fmt. */
-static void dd_set_options_fmt(lv_obj_t *dd, const float *vals, int n, const char *fmt)
+/* Build the option list from vals, one line each, formatted as
+ * "<integer><suffix>" (printf-free, no float conversions). */
+static void dd_set_options_unit(lv_obj_t *dd, const float *vals, int n, const char *suffix)
 {
     char opts[128];
     size_t off = 0;
     opts[0] = '\0';
     for (int i = 0; i < n; i++) {
         char item[16];
-        lv_snprintf(item, sizeof(item), fmt, vals[i]);
+        ui_fmt_fixed(item, sizeof(item), vals[i], 0, suffix);
         off += lv_snprintf(opts + off, sizeof(opts) - off, "%s%s", i ? "\n" : "", item);
     }
     lv_dropdown_set_options(dd, opts);
@@ -409,15 +375,15 @@ static void create1_2(lv_obj_t *parent)
     lv_obj_set_align(scr1_2_cont, LV_ALIGN_BOTTOM_MID);
 
     dropdown_freq = scr1_2_lora_setting_create(scr1_2_cont, "Freq: ");
-    dd_set_options_fmt(dropdown_freq, lora_freq_list, GET_BUFF_LEN(lora_freq_list), "%.0fMHz");
+    dd_set_options_unit(dropdown_freq, lora_freq_list, GET_BUFF_LEN(lora_freq_list), "MHz");
     dd_select_matching(dropdown_freq, lora_freq_list, GET_BUFF_LEN(lora_freq_list), ui_lora_get_freq());
 
     dropdown_band = scr1_2_lora_setting_create(scr1_2_cont, "Band: ");
-    dd_set_options_fmt(dropdown_band, lora_band_list, GET_BUFF_LEN(lora_band_list), "%.0fKHz");
+    dd_set_options_unit(dropdown_band, lora_band_list, GET_BUFF_LEN(lora_band_list), "KHz");
     dd_select_matching(dropdown_band, lora_band_list, GET_BUFF_LEN(lora_band_list), ui_lora_get_bandwidth());
 
     dropdown_power = scr1_2_lora_setting_create(scr1_2_cont, "Power:");
-    dd_set_options_fmt(dropdown_power, lora_power_list, GET_BUFF_LEN(lora_power_list), "%.0fdBm");
+    dd_set_options_unit(dropdown_power, lora_power_list, GET_BUFF_LEN(lora_power_list), "dBm");
     dd_select_matching(dropdown_power, lora_power_list, GET_BUFF_LEN(lora_power_list), ui_lora_get_power());
     static const char freq_flag = 'f';
     static const char band_flag = 'b';
@@ -429,8 +395,8 @@ static void create1_2(lv_obj_t *parent)
 static void entry1_2(void)
 {
     ui_taskbar_enter();
-    scr1_2_focus = LS_FOCUS_FREQ;
-    scr1_2_editing = false;
+    scr1_2_nav.focus = LS_FOCUS_FREQ;
+    scr1_2_nav.editing = false;
     scr1_2_apply_focus_style();
     ui_disp_full_refr();
 }
@@ -438,6 +404,8 @@ static void exit1_2(void) {
     ui_taskbar_leave();
     ui_disp_full_refr();
     ui_lora_param_set();
+    // Back to warm sleep (~1 uA) instead of idling in STDBY/RX.
+    ui_lora_sleep();
 }
 scr_lifecycle_t screen1_2 = {
     .create = create1_2,

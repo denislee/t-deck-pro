@@ -15,9 +15,7 @@ LV_IMG_DECLARE(img_start)
 LV_FONT_DECLARE(Font_Mono_Bold_14)
 LV_FONT_DECLARE(Font_Mono_Bold_15)
 LV_FONT_DECLARE(Font_Mono_Bold_16)
-LV_FONT_DECLARE(Font_Mono_Bold_17)
 LV_FONT_DECLARE(Font_Mono_Bold_18)
-LV_FONT_DECLARE(Font_Mono_Bold_19)
 LV_FONT_DECLARE(Font_Mono_Bold_20)
 
 // Bitmap (1bpp) reader fonts converted from BDF — see src/fonts_bitmap/

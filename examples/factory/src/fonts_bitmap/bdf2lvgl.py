@@ -102,6 +102,7 @@ def pack_glyph_bits(g):
 
 def emit(font_name: str, props: dict, glyphs: list, out_path: Path, pixel_size: int):
     # Sort by encoding, only ASCII printable 0x20-0x7E (95 glyphs).
+    # For fewer glyphs, post-process the output with tools/subset_lvgl_font.py IN.c OUT.c FIRST LAST.
     by_enc = {g["enc"]: g for g in glyphs if "enc" in g}
     glyphs_in = [by_enc.get(c) for c in range(0x20, 0x7F)]
     # If a glyph is missing, synthesize an empty one with width=fontwidth.

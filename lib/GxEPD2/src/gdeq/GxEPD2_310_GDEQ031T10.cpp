@@ -13,6 +13,17 @@
 
 #include "GxEPD2_310_GDEQ031T10.h"
 
+// Local fork change (t-deck-pro OPTIMIZATION.md D2): upstream clears
+// _init_display_done after every partial update ('needed, reason unknown'),
+// so the next write soft-resets the controller and every flush pays PON +
+// BUSY again, which also defeats the caller's deferred power-off. Partial
+// updates rewrite every register they depend on (CCSET/TSSET/0x50), so the
+// re-init is skipped after partial updates. Build with
+// -DGDEQ031T10_REINIT_AFTER_PARTIAL=1 to restore the upstream behaviour.
+#ifndef GDEQ031T10_REINIT_AFTER_PARTIAL
+#define GDEQ031T10_REINIT_AFTER_PARTIAL 0
+#endif
+
 GxEPD2_310_GDEQ031T10::GxEPD2_310_GDEQ031T10(int16_t cs, int16_t dc, int16_t rst, int16_t busy) :
   GxEPD2_EPD(cs, dc, rst, busy, LOW, 10000000, WIDTH, HEIGHT, panel, hasColor, hasPartialUpdate, hasFastPartialUpdate)
 {
@@ -89,27 +100,40 @@ void GxEPD2_310_GDEQ031T10::_writeImage(uint8_t command, const uint8_t bitmap[],
   _setPartialRamArea(x1, y1, w1, h1);
   _writeCommand(command);
   _startTransfer();
-  for (int16_t i = 0; i < h1; i++)
+#if defined(ESP32)
+  if (!invert && !mirror_y)
   {
-    for (int16_t j = 0; j < w1 / 8; j++)
+    // Local fork change (OPTIMIZATION.md D4): one SPI call per row instead of per byte.
+    for (int16_t i = 0; i < h1; i++)
     {
-      uint8_t data;
-      // use wb, h of bitmap for index!
-      uint16_t idx = mirror_y ? j + dx / 8 + uint16_t((h - 1 - (i + dy))) * wb : j + dx / 8 + uint16_t(i + dy) * wb;
-      if (pgm)
-      {
-#if defined(__AVR) || defined(ESP8266) || defined(ESP32)
-        data = pgm_read_byte(&bitmap[idx]);
-#else
-        data = bitmap[idx];
+      _pSPIx->writeBytes(&bitmap[dx / 8 + uint16_t(i + dy) * wb], w1 / 8);
+    }
+  }
+  else
 #endif
-      }
-      else
+  {
+    for (int16_t i = 0; i < h1; i++)
+    {
+      for (int16_t j = 0; j < w1 / 8; j++)
       {
-        data = bitmap[idx];
+        uint8_t data;
+        // use wb, h of bitmap for index!
+        uint16_t idx = mirror_y ? j + dx / 8 + uint16_t((h - 1 - (i + dy))) * wb : j + dx / 8 + uint16_t(i + dy) * wb;
+        if (pgm)
+        {
+#if defined(__AVR) || defined(ESP8266) || defined(ESP32)
+          data = pgm_read_byte(&bitmap[idx]);
+#else
+          data = bitmap[idx];
+#endif
+        }
+        else
+        {
+          data = bitmap[idx];
+        }
+        if (invert) data = ~data;
+        _transfer(data);
       }
-      if (invert) data = ~data;
-      _transfer(data);
     }
   }
   _endTransfer();
@@ -158,27 +182,40 @@ void GxEPD2_310_GDEQ031T10::_writeImagePart(uint8_t command, const uint8_t bitma
   _setPartialRamArea(x1, y1, w1, h1);
   _writeCommand(command);
   _startTransfer();
-  for (int16_t i = 0; i < h1; i++)
+#if defined(ESP32)
+  if (!invert && !mirror_y)
   {
-    for (int16_t j = 0; j < w1 / 8; j++)
+    // Local fork change (OPTIMIZATION.md D4): one SPI call per row instead of per byte.
+    for (int16_t i = 0; i < h1; i++)
     {
-      uint8_t data;
-      // use wb_bitmap, h_bitmap of bitmap for index!
-      uint16_t idx = mirror_y ? x_part / 8 + j + dx / 8 + uint16_t((h_bitmap - 1 - (y_part + i + dy))) * wb_bitmap : x_part / 8 + j + dx / 8 + uint16_t(y_part + i + dy) * wb_bitmap;
-      if (pgm)
-      {
-#if defined(__AVR) || defined(ESP8266) || defined(ESP32)
-        data = pgm_read_byte(&bitmap[idx]);
-#else
-        data = bitmap[idx];
+      _pSPIx->writeBytes(&bitmap[x_part / 8 + dx / 8 + uint16_t(y_part + i + dy) * wb_bitmap], w1 / 8);
+    }
+  }
+  else
 #endif
-      }
-      else
+  {
+    for (int16_t i = 0; i < h1; i++)
+    {
+      for (int16_t j = 0; j < w1 / 8; j++)
       {
-        data = bitmap[idx];
+        uint8_t data;
+        // use wb_bitmap, h_bitmap of bitmap for index!
+        uint16_t idx = mirror_y ? x_part / 8 + j + dx / 8 + uint16_t((h_bitmap - 1 - (y_part + i + dy))) * wb_bitmap : x_part / 8 + j + dx / 8 + uint16_t(y_part + i + dy) * wb_bitmap;
+        if (pgm)
+        {
+#if defined(__AVR) || defined(ESP8266) || defined(ESP32)
+          data = pgm_read_byte(&bitmap[idx]);
+#else
+          data = bitmap[idx];
+#endif
+        }
+        else
+        {
+          data = bitmap[idx];
+        }
+        if (invert) data = ~data;
+        _transfer(data);
       }
-      if (invert) data = ~data;
-      _transfer(data);
     }
   }
   _endTransfer();
@@ -383,5 +420,7 @@ void GxEPD2_310_GDEQ031T10::_Update_Part()
   _PowerOn();
   _writeCommand(0x12); //display refresh
   _waitWhileBusy("_Update_Part", partial_refresh_time);
+#if GDEQ031T10_REINIT_AFTER_PARTIAL
   _init_display_done = false; // needed, reason unknown
+#endif
 }

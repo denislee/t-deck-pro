@@ -9,7 +9,6 @@
 #include "SPI.h"
 #include "USB.h"
 #include "USBMSC.h"
-#include <TinyGPS++.h>
 #include "peripheral.h"
 #include "WiFi.h"
 #include <ctype.h>
@@ -22,30 +21,40 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-static bool default_keypad_light = false;
-static bool default_red_led_status = false;
-static bool default_motor_status = false;
-static bool default_gps_status = true;
-static bool default_lora_status = true;
+// Defaults live in k_settings[] below; ui_settings_load() runs first thing in
+// setup() and fills every one of these.
+static bool default_keypad_light;
+static bool default_red_led_status;
+static bool default_motor_status;
+static bool default_gps_status;
+static bool default_lora_status;
 #ifdef BOARD_HAS_BHI260AP
-static bool default_gyro_status = true;
+static bool default_gyro_status;
 #endif
-static bool default_a7682_status = true;
+static bool default_a7682_status;
 
 // System font preferences. face: 0=Mono Bold (built-in), 1=Sans (Montserrat),
 // 2=Serif, 3=Pixel, 4=Spleen, 5=Tamzen, 6=Tiny — see reader_faces[] in
-// ui_deckpro.cpp. The size index picks from the per-face size table there.
+// ui_reader.cpp. The size index picks from the per-face size table there.
 //
 // One (face, size) pair per slot. Defaults: General/Topbar use Mono Bold 16
 // (size index 1); reader body uses size 2 (18 pt) for comfortable reading;
 // reader footer uses the smallest available size for a discreet status line.
 static int default_font_face[UI_FONT_SLOT_COUNT] = {0, 0, 0, 0};
 static int default_font_size[UI_FONT_SLOT_COUNT] = {1, 1, 2, 0};
-static int default_reader_rotation  = 0; // 0=portrait, 1=landscape
-static int default_reader_line_space = 4; // px between text lines in reader
-static bool default_topbar_show_battery = true; // show battery icon+% on topbar
-static bool default_reader_bars_hidden  = false; // reader view: hide top/bottom bars
-static int default_lock_landscape   = 0; // lock screen: 0=portrait, 1=landscape
+static int default_reader_rotation; // 0=portrait, 1=landscape
+static int default_reader_line_space; // px between text lines in reader
+static bool default_topbar_show_battery; // show battery icon+% on topbar
+static bool default_reader_bars_hidden;  // reader view: hide top/bottom bars
+static int default_lock_landscape;   // lock screen: 0=portrait, 1=landscape
+
+// True while the SD card's raw sectors are exported to a USB host. Defined
+// unconditionally (the MSC code itself is compiled in only with TinyUSB MSC)
+// so the FatFs callers below can always fence themselves off.
+static bool msc_active = false;
+
+// FatFs may only touch the card when it is mounted and not exported over USB.
+static bool sd_fs_ready(void) { return peri_init_st[E_PERI_SD] && !msc_active; }
 
 static int reader_line_space_clamp(int px)
 {
@@ -66,7 +75,7 @@ static int font_slot_clamp(int slot)
 static char default_wifi_ssid[33] = {0};
 static char default_wifi_password[65] = {0};
 static char default_wifi_tz[48] = "UTC0";
-static bool default_wifi_enabled = false;
+static bool default_wifi_enabled;
 // Live radio state: true while the WiFi stack is up (or coming up). Defined
 // up here (rather than next to the connect helpers) so ui_settings_load() can
 // seed it from the persisted intent during boot.
@@ -81,9 +90,9 @@ static volatile bool ntp_synced = false;
 static volatile bool clock_valid = false;
 
 // LoRa modem defaults, persisted via Settings (lr_freq / lr_bw / lr_pwr).
-static float lora_default_freq  = 850.0f;
-static int   lora_default_band  = 125;
-static int   lora_default_power = 22;
+static float lora_default_freq;
+static int   lora_default_band;
+static int   lora_default_power;
 
 // Forward declaration — defined after ui_settings_save() below.
 static void settings_mark_dirty(void);
@@ -106,6 +115,13 @@ void ui_lock_landscape_set(int r)            { default_lock_landscape = r ? 1 : 
 // NVS namespace shared by every persisted setting and bookmark.
 static const char kNvsNs[] = "t-deck-pro";
 
+// Opens the shared NVS namespace for the enclosing scope.
+struct NvsPrefs {
+    Preferences p;
+    explicit NvsPrefs(bool read_only) { p.begin(kNvsNs, read_only); }
+    ~NvsPrefs() { p.end(); }
+};
+
 // strncpy() + explicit NUL terminator, so dst is always terminated.
 static void copy_str(char *dst, size_t n, const char *src)
 {
@@ -114,12 +130,23 @@ static void copy_str(char *dst, size_t n, const char *src)
     dst[n - 1] = '\0';
 }
 
-// FNV-1a 32-bit hash of the filename, formatted as "<prefix>_xxxxxxxx"
-// (10 chars). Per-file bookmarks live under a per-filename NVS key derived
-// this way because NVS keys are capped at 15 chars but filenames can be up
-// to 32. 'b' = byte-offset bookmark, 'p' = page-index bookmark.
-// Output buffer must be at least 11 bytes.
-static void fnv_key(char prefix, const char *filename, char out[11])
+// printf-free fixed-point: '%.<decimals>f<suffix>' without pulling in
+// newlib's float printf (~35 KB). decimals 0..3.
+int ui_fmt_fixed(char *buf, size_t n, float v, int decimals, const char *suffix)
+{
+    static const long k_scale[] = {1, 10, 100, 1000};
+    if (decimals < 0) decimals = 0;
+    if (decimals > 3) decimals = 3;
+    long scale = k_scale[decimals];
+    long x = (long)(v * scale + (v < 0 ? -0.5f : 0.5f));
+    const char *sign = (x < 0) ? "-" : "";
+    if (x < 0) x = -x;
+    if (!suffix) suffix = "";
+    if (decimals == 0) return snprintf(buf, n, "%s%ld%s", sign, x, suffix);
+    return snprintf(buf, n, "%s%ld.%0*ld%s", sign, x / scale, decimals, x % scale, suffix);
+}
+
+static uint32_t fnv_hash(const char *filename)
 {
     uint32_t h = 2166136261u;
     if (filename) {
@@ -128,17 +155,79 @@ static void fnv_key(char prefix, const char *filename, char out[11])
             h *= 16777619u;
         }
     }
+    return h;
+}
+
+// Formats a precomputed hash as "<prefix>_xxxxxxxx" (10 chars).
+// Output buffer must be at least 11 bytes.
+static void fnv_key_h(char prefix, uint32_t h, char out[11])
+{
     snprintf(out, 11, "%c_%08x", prefix, (unsigned)h);
+}
+
+// FNV-1a 32-bit hash of the filename, formatted as "<prefix>_xxxxxxxx"
+// (10 chars). Per-file bookmarks live under a per-filename NVS key derived
+// this way because NVS keys are capped at 15 chars but filenames can be up
+// to UI_READER_NAME_MAX. 'b' = byte-offset bookmark, 'p' = page-index
+// bookmark, 'c' = geometry cookie.
+static void fnv_key(char prefix, const char *filename, char out[11])
+{
+    fnv_key_h(prefix, fnv_hash(filename), out);
+}
+
+// Per-book keys (b_/p_/c_) are pruned LRU-style so NVS (~500 entries in
+// 20 KB) cannot fill up after a few hundred books.
+#define BOOKMARK_LRU_MAX 48
+static void bookmark_touch(Preferences &prefs, const char *filename)
+{
+    if (!filename || !filename[0]) return;
+
+    uint32_t lru[BOOKMARK_LRU_MAX + 1];
+    size_t   n = 0;
+
+    size_t blob_len = prefs.getBytesLength("bm_lru");
+    if (blob_len >= sizeof(uint32_t)) {
+        if (blob_len > BOOKMARK_LRU_MAX * sizeof(uint32_t)) {
+            blob_len = BOOKMARK_LRU_MAX * sizeof(uint32_t);
+        }
+        prefs.getBytes("bm_lru", lru, blob_len);
+        n = blob_len / sizeof(uint32_t);
+        if (n > BOOKMARK_LRU_MAX) n = BOOKMARK_LRU_MAX;
+    }
+
+    // Drop the touched book from wherever it was (MRU order after this pass).
+    uint32_t h = fnv_hash(filename);
+    size_t   w = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (lru[i] != h) lru[w++] = lru[i];
+    }
+    n = w;
+
+    // Insert it at index 0 = most recently used.
+    for (size_t i = n; i > 0; i--) lru[i] = lru[i - 1];
+    lru[0] = h;
+    n++;
+
+    // Over the cap: the last entry is the least recently used — evict it.
+    if (n > BOOKMARK_LRU_MAX) {
+        uint32_t evict = lru[n - 1];
+        char key[11];
+        fnv_key_h('b', evict, key); prefs.remove(key);
+        fnv_key_h('p', evict, key); prefs.remove(key);
+        fnv_key_h('c', evict, key); prefs.remove(key);
+        n--;
+    }
+
+    prefs.putBytes("bm_lru", lru, n * sizeof(uint32_t));
 }
 
 bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset)
 {
     if (!filename || fn_size == 0) return false;
-    Preferences prefs;
-    prefs.begin(kNvsNs, true);
+    NvsPrefs nvs(true);
+    Preferences &prefs = nvs.p;
     String s = prefs.getString("rd_last", "");
     uint32_t off = prefs.getUInt("rd_off", 0);
-    prefs.end();
     if (s.length() == 0) { filename[0] = '\0'; return false; }
     copy_str(filename, fn_size, s.c_str());
     if (offset) *offset = off;
@@ -147,16 +236,16 @@ bool ui_reader_resume_get(char *filename, size_t fn_size, size_t *offset)
 
 void ui_reader_resume_set(const char *filename, size_t offset)
 {
-    Preferences prefs;
-    prefs.begin(kNvsNs, false);
+    NvsPrefs nvs(false);
+    Preferences &prefs = nvs.p;
     prefs.putString("rd_last", filename ? filename : "");
     prefs.putUInt("rd_off", (uint32_t)offset);
     if (filename && filename[0]) {
         char key[11];
         fnv_key('b', filename, key);
         prefs.putUInt(key, (uint32_t)offset);
+        bookmark_touch(prefs, filename);
     }
-    prefs.end();
 }
 
 bool ui_reader_bookmark_get(const char *filename, size_t *offset)
@@ -164,11 +253,10 @@ bool ui_reader_bookmark_get(const char *filename, size_t *offset)
     if (!filename || !filename[0]) return false;
     char key[11];
     fnv_key('b', filename, key);
-    Preferences prefs;
-    prefs.begin(kNvsNs, true);
+    NvsPrefs nvs(true);
+    Preferences &prefs = nvs.p;
     bool present = prefs.isKey(key);
     uint32_t off = prefs.getUInt(key, 0);
-    prefs.end();
     if (!present) return false;
     if (offset) *offset = off;
     return true;
@@ -191,10 +279,10 @@ void ui_reader_bookmark_page_set(const char *filename, int page_index)
     if (!filename || !filename[0]) return;
     char key[11];
     fnv_key('p', filename, key);
-    Preferences prefs;
-    prefs.begin(kNvsNs, false);
+    NvsPrefs nvs(false);
+    Preferences &prefs = nvs.p;
     prefs.putInt(key, page_index);
-    prefs.end();
+    bookmark_touch(prefs, filename);
 }
 
 // Returns true and fills *page_index_out if a page bookmark was previously
@@ -206,13 +294,42 @@ bool ui_reader_bookmark_page_get(const char *filename, int *page_index_out)
     if (!filename || !filename[0]) return false;
     char key[11];
     fnv_key('p', filename, key);
-    Preferences prefs;
-    prefs.begin(kNvsNs, true);
+    NvsPrefs nvs(true);
+    Preferences &prefs = nvs.p;
     bool present = prefs.isKey(key);
     int  page    = prefs.getInt(key, 0);
-    prefs.end();
     if (!present) return false;
     if (page_index_out) *page_index_out = page;
+    return true;
+}
+
+// Per-book geometry cookie persistence (companion to the page-index key).
+//
+// The cookie captures every setting that affects page wrapping (font face,
+// font size, rotation, bar visibility, line spacing). Stored under
+// "c_xxxxxxxx" — the same FNV-1a hash used by the "b_"/"p_" keys — so the
+// O(1) resume fast path still validates after a reboot.
+void ui_reader_geo_cookie_set(const char *filename, uint32_t cookie)
+{
+    if (!filename || !filename[0]) return;
+    char key[11];
+    fnv_key('c', filename, key);
+    NvsPrefs nvs(false);
+    Preferences &prefs = nvs.p;
+    prefs.putUInt(key, cookie);
+}
+
+bool ui_reader_geo_cookie_get(const char *filename, uint32_t *cookie)
+{
+    if (!filename || !filename[0]) return false;
+    char key[11];
+    fnv_key('c', filename, key);
+    NvsPrefs nvs(true);
+    Preferences &prefs = nvs.p;
+    bool     present = prefs.isKey(key);
+    uint32_t c       = prefs.getUInt(key, 0);
+    if (!present) return false;
+    if (cookie) *cookie = c;
     return true;
 }
 
@@ -241,7 +358,8 @@ static const setting_def_t k_settings[] = {
 #ifdef BOARD_HAS_BHI260AP
     {"gyro", ST_BOOL, &default_gyro_status, 1},
 #endif
-    {"a7682", ST_BOOL, &default_a7682_status, 1},
+    // Off by default; an idle registered modem draws 10-20 mA.
+    {"a7682", ST_BOOL, &default_a7682_status, 0},
     {"rd_rot", ST_INT, &default_reader_rotation, 0}, {"rd_lsp", ST_INT, &default_reader_line_space, 4},
     {"tb_batt", ST_BOOL, &default_topbar_show_battery, 1}, {"rd_bars", ST_BOOL, &default_reader_bars_hidden, 0},
     {"lk_rot", ST_INT, &default_lock_landscape, 0}, {"wifi_en", ST_BOOL, &default_wifi_enabled, 0},
@@ -271,6 +389,12 @@ static void settings_mark_dirty(void)
     }
 }
 
+// True while a debounced NVS write is still queued.
+bool ui_settings_pending(void)
+{
+    return s_settings_dirty;
+}
+
 void ui_settings_save(void)
 {
     // Cancel any pending deferred write — we are doing the flush right now.
@@ -280,8 +404,8 @@ void ui_settings_save(void)
     }
     s_settings_dirty = false;
 
-    Preferences prefs;
-    prefs.begin(kNvsNs, false);
+    NvsPrefs nvs(false);
+    Preferences &prefs = nvs.p;
     for (size_t i = 0; i < sizeof(k_settings) / sizeof(k_settings[0]); i++) {
         const setting_def_t *s = &k_settings[i];
         switch (s->type) {
@@ -304,13 +428,12 @@ void ui_settings_save(void)
     prefs.putString("wifi_ssid", default_wifi_ssid);
     prefs.putString("wifi_pass", default_wifi_password);
     prefs.putString("wifi_tz",   default_wifi_tz);
-    prefs.end();
 }
 
 void ui_settings_load(void)
 {
-    Preferences prefs;
-    prefs.begin(kNvsNs, true);
+    NvsPrefs nvs(true);
+    Preferences &prefs = nvs.p;
     for (size_t i = 0; i < sizeof(k_settings) / sizeof(k_settings[0]); i++) {
         const setting_def_t *s = &k_settings[i];
         switch (s->type) {
@@ -355,8 +478,6 @@ void ui_settings_load(void)
     // returns the right value before factory_setup() actually brings WiFi up.
     wifi_enabled = default_wifi_enabled;
 
-    prefs.end();
-
     // Apply TZ now so any later localtime() call (before NTP completes) at
     // least uses the correct offset once the clock is set.
     setenv("TZ", default_wifi_tz, 1);
@@ -365,6 +486,15 @@ void ui_settings_load(void)
 // ----
 
 void ui_disp_full_refr(void)
+{
+    disp_transition_refr();
+    lv_obj_invalidate(lv_scr_act());
+}
+
+// Always a full (flashing) refresh — for ghost clean-up points. The plain
+// ui_disp_full_refr() is the transition refresh: fast partial update, with a
+// full one only every Nth screen change.
+void ui_disp_force_full_refr(void)
 {
     disp_full_refr();
     lv_obj_invalidate(lv_scr_act());
@@ -424,6 +554,7 @@ void ui_lora_set_recv_flag(void)
 {
     lora_set_recv_flag();
 }
+void ui_lora_sleep(void) { lora_sleep(); }
 //************************************[ screen 2 ]****************************************** setting
 // set function
 void ui_setting_set_keypad_light(bool on)
@@ -515,8 +646,10 @@ void ui_setting_set_lora_status(bool on)
             xTaskCreate(lora_lazy_init_task, "lora_init", 4096, NULL, 1, NULL);
         }
     } else {
-        lora_sleep();
+        lora_power_off();
         digitalWrite(BOARD_LORA_EN, LOW);
+        // rail cut loses the radio config; re-init on next power-on
+        peri_init_st[E_PERI_LORA] = false;
     }
     default_lora_status = on;
     settings_mark_dirty();
@@ -531,16 +664,35 @@ void ui_setting_set_gyro_status(bool on)
     settings_mark_dirty();
 }
 #endif
+// Lazy A7682E bring-up. The AT probe blocks for up to ~7 s, so it must not
+// run on the LVGL task that called ui_setting_set_a7682_status().
+static volatile bool s_a7682_probe_running = false;
+
+static void a7682_lazy_probe_task(void *)
+{
+    peri_init_st[E_PERI_A7682E] = a7682_probe();
+    s_a7682_probe_running = false;
+    vTaskDelete(NULL);
+}
+
 void ui_setting_set_a7682_status(bool on)
 {
     if (on) {
+        // a7682_probe() reads ui_setting_get_a7682_status() to decide whether
+        // the rail should be up, so publish the new intent before the probe
+        // task can start.
+        default_a7682_status = on;
         digitalWrite(BOARD_6609_EN, HIGH);
         digitalWrite(BOARD_A7682E_PWRKEY, HIGH);
-        if (a7682_handle) vTaskResume(a7682_handle);
+        if (!peri_init_st[E_PERI_A7682E] && !s_a7682_probe_running) {
+            s_a7682_probe_running = true;
+            xTaskCreate(a7682_lazy_probe_task, "a7682_probe", 4096, NULL, 1, NULL);
+        }
     } else {
-        if (a7682_handle) vTaskSuspend(a7682_handle);
+        ui_a7682_loop_suspend();
         digitalWrite(BOARD_6609_EN, LOW);
         digitalWrite(BOARD_A7682E_PWRKEY, LOW);
+        peri_init_st[E_PERI_A7682E] = false; // rail cut, so the next power-on must probe again
     }
     default_a7682_status = on;
     settings_mark_dirty();
@@ -596,7 +748,7 @@ static bool ui_test_sd_card(void)
 
 void ui_setting_get_sd_capacity(uint64_t *total, uint64_t *used)
 {
-    if (!ui_test_sd_card()) return;
+    if (!sd_fs_ready()) return;
 
     uint64_t totalBytes = 0;
     uint64_t usedBytes  = 0;
@@ -639,6 +791,10 @@ void ui_gps_get_satellites(uint32_t *vsat)
 void ui_gps_get_speed(double *speed)
 {
     gps_get_speed(speed);
+}
+void ui_gps_set_continuous(bool on)
+{
+    gps_set_continuous(on);
 }
 //************************************[ screen 4 ]****************************************** Wifi Scan
 static int is_chinese_utf8(const char *str) {
@@ -800,10 +956,9 @@ void ui_time_persist_save(void)
     localtime_r(&now, &tm_now);
     if ((tm_now.tm_year + 1900) < 2024) return;
 
-    Preferences prefs;
-    prefs.begin(kNvsNs, false);
+    NvsPrefs nvs(false);
+    Preferences &prefs = nvs.p;
     prefs.putULong("tlast", (uint32_t)now);
-    prefs.end();
 }
 
 // Compile-time epoch derived from __DATE__/__TIME__. Acts as a floor for the
@@ -842,10 +997,12 @@ static time_t compile_time_epoch(void)
 
 void ui_time_persist_restore(void)
 {
-    Preferences prefs;
-    prefs.begin(kNvsNs, true);
-    uint32_t saved = prefs.getULong("tlast", 0);
-    prefs.end();
+    uint32_t saved = 0;
+    {
+        NvsPrefs nvs(true);
+        Preferences &prefs = nvs.p;
+        saved = prefs.getULong("tlast", 0);
+    }
 
     time_t floor_t = compile_time_epoch();
     // Pick the more recent of (NVS stamp) and (compile time). Compile time
@@ -981,6 +1138,7 @@ static void wifi_connect_task(void *arg)
     if (WiFi.status() == WL_CONNECTED) {
         wifi_status = UI_WIFI_STATUS_CONNECTED;
         wifi_enabled = true;
+        WiFi.setSleep(WIFI_PS_MAX_MODEM);  // WiFi only serves NTP/ping: doze between beacons at the listen interval instead of waking for every DTIM
         ui_ntp_resync();
         Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
     } else {
@@ -1087,7 +1245,14 @@ bool ui_battery_25896_is_vbus_in(void)
 
 bool ui_batt_25896_is_chg(void)
 {
-    return PPM.isCharging();
+    return bq25896_read(false, [] { return PPM.isCharging(); });
+}
+
+// One conversion at init; continuous mode (1 s conversions) only while the
+// BQ25896 screen is open.
+void ui_batt_25896_set_adc_continuous(bool on)
+{
+    bq25896_read(false, [on] { return PPM.enableMeasure(on ? XPowersPPM::CONTINUOUS : XPowersPPM::ONE_SHORT); });
 }
 float ui_batt_25896_get_vbus(void)
 {
@@ -1228,6 +1393,12 @@ void ui_input_set_keypad_flag(void)
     keypad_set_flag();
 }
 
+// Milliseconds since the keypad last produced a key (grows past start-up).
+uint32_t ui_input_idle_ms(void)
+{
+    return millis() - keypad_last_activity_ms();
+}
+
 #ifdef BOARD_HAS_BHI260AP
 int ui_other_get_gyro(float *gyro_x, float *gyro_y, float *gyro_z)
 {
@@ -1275,27 +1446,26 @@ void ui_a7682_hang_up(void)
 
 void ui_a7682_loop_resume(void)
 {
-    if (a7682_handle != nullptr) {
-        vTaskResume(a7682_handle);
-    }
+    a7682_pump_resume();
 }
 
 void ui_a7682_loop_suspend(void)
 {
-    if (a7682_handle != nullptr) {
-        vTaskSuspend(a7682_handle);
-    }
+    a7682_pump_suspend();
 }
 
-//************************************[ screen 9 ]****************************************** Input
+//************************************[ screen 9 ]****************************************** Shutdown
 
 void ui_shutdown_on(void)
 {
+    // Stamp the clock before power drops: the next cold boot has no
+    // battery-backed RTC and restores whatever is in NVS.
+    ui_time_persist_save();
     // Flush any pending debounced settings write before we cut power.
     // The deferred timer will never fire once the device is off.
     ui_settings_save();
     ink_screen_prepare_shutdown();
-    PPM.shutdown();
+    { if (peri_init_st[E_PERI_BQ25896]) { I2C0Guard g; PPM.shutdown(); } }
     Serial.println("Shutdown .....");
 }
 
@@ -1318,12 +1488,6 @@ void ui_pcm5102_stop(void)
 void audio_info(const char *info){
     Serial.print("info        "); Serial.println(info);
 }
-#else
-// Stubs for builds without the PCM5102A audio stack. The surrounding
-// feature (screen 10) degrades quietly: the callback returns false to
-// signal unavailability, and stop is a no-op.
-bool ui_pcm5102_cb(const char * /*at_cmd*/) { return false; }
-void ui_pcm5102_stop(void) {}
 #endif /* BOARD_HAS_PCM5102A */
 
 //************************************[ screen 12 ]****************************************** Notes
@@ -1331,7 +1495,6 @@ void ui_pcm5102_stop(void) {}
 
 #if CONFIG_TINYUSB_MSC_ENABLED
 static USBMSC msc;
-static bool msc_active = false;
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
     uint32_t count = bufsize / 512;
@@ -1364,6 +1527,13 @@ void ui_usb_msc_begin(void) {
     
     if (!ui_test_sd_card()) return;
 
+    // From here on the host owns the raw sectors; FatFs is fenced off by
+    // sd_fs_ready() and remounted fresh in ui_usb_msc_end(). Drop the only
+    // long-lived File handles (the reader's and the dictionary's) before
+    // handing the card over.
+    ui_reader_close_view();
+    ui_dict_close();
+
     uint32_t sectorCount = 0;
     {
         SpiGuard spi;
@@ -1392,6 +1562,14 @@ void ui_usb_msc_end(void) {
     delay(200);
     msc.end();
     msc_active = false;
+
+    // The host may have rewritten the FAT; drop FatFs's cached window/FSINFO
+    // and mount again.
+    {
+        SpiGuard spi;
+        SD.end();
+    }
+    peri_init_st[E_PERI_SD] = sd_care_init();
 }
 #else
 void ui_usb_msc_begin(void) {}
@@ -1416,6 +1594,8 @@ size_t ui_ascii_trim(char *dst, size_t n, const char *src)
 
 bool ui_notes_write(const char *filename, const char *content)
 {
+    if (!sd_fs_ready()) return false;
+
     // Strip leading/trailing whitespace and any embedded control chars from
     // the filename — the on-screen keypad sends '\n' on Enter, which would
     // otherwise leak into the path and make SD.open() fail.
@@ -1578,6 +1758,31 @@ static int dict_strcasecmp_word(const char *line, const char *query)
     return 1;
 }
 
+static uint32_t dict_le32(const uint8_t *p)
+{
+    // Index records are little-endian; read explicitly rather than aliasing a
+    // uint32_t so the layout stays defined even if the struct changes.
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Layout of one /dict/eng-pob.idx record: u32 LE line offset followed by a
+// 28-byte NUL-padded key (see tools/build_dict_index.py).
+#define DICT_IDX_KEY_LEN 28
+
+// Compare a 28-byte index key (NUL-padded) to a NUL-terminated query:
+// unsigned byte-wise, shorter prefix is less.
+static int dict_key_cmp(const uint8_t *key, const char *query)
+{
+    for (int i = 0; i < DICT_IDX_KEY_LEN; i++) {
+        int ca = key[i];
+        int cb = (unsigned char)query[i];
+        if (ca != cb) return ca - cb;  // key's NUL pad sorts below any byte
+        if (ca == 0) return 0;
+    }
+    return 0;
+}
+
 static char* dict_decode_definition(const char *src)
 {
     // Convert literal "\\n" (backslash + 'n') sequences to real newlines so
@@ -1599,70 +1804,193 @@ static char* dict_decode_definition(const char *src)
     return out;
 }
 
-char* ui_dict_lookup(const char *word)
+// ---------------------------------------------------------------------------
+// Long-lived dictionary handle
+//
+// The 108 MB TSV used to be opened and closed around every lookup, and the
+// bisection seeked ~18 times inside it. Both are FAT/SPI round-trips. The
+// dictionary screen now keeps the file open while it is on screen, plus the
+// sparse sidecar index (/dict/eng-pob.idx, built by tools/build_dict_index.py)
+// in PSRAM, so a lookup is a handful of block reads.
+//
+// Callers that are not the dictionary screen still work: ui_dict_lookup()
+// opens the file itself when nobody has, and closes it again before returning.
+// ---------------------------------------------------------------------------
+static File     s_dict_file;
+static bool     s_dict_open = false;
+static uint8_t *s_dict_idx = NULL;      // raw records: u32 LE offset + 28-byte key
+static uint32_t s_dict_idx_count = 0;
+
+#define DICT_TSV_PATH  "/dict/eng-pob.tsv"
+#define DICT_IDX_PATH  "/dict/eng-pob.idx"
+#define DICT_IDX_REC   (4 + DICT_IDX_KEY_LEN)  // u32 offset + key
+#define DICT_IDX_KEY   4                       // key offset inside a record
+
+void ui_dict_open(void)
 {
-    if (!word || !*word) return NULL;
+    if (s_dict_open) return;
+    if (!sd_fs_ready()) return;
 
     SpiGuard spi;
 
-    File f = SD.open("/dict/eng-pob.tsv", FILE_READ);
-    if (!f) {
-        return NULL;
-    }
+    s_dict_file = SD.open(DICT_TSV_PATH, FILE_READ);
+    if (!s_dict_file) return;
+    s_dict_file.setBufferSize(0);  // dict_buf_t already reads 512-B chunks
 
-    long lo = 0;
-    long hi = (long)f.size();
-    char line[512];
+    s_dict_idx = NULL;
+    s_dict_idx_count = 0;
 
-    // dict_buf provides ~512-byte block reads so the binary search issues
-    // ~40 SD transactions instead of ~20,000 single-byte VFS calls.
-    dict_buf_t buf;
-    dict_buf_init(&buf, &f);
-
-    while (hi - lo > 512) {
-        long mid = lo + (hi - lo) / 2;
-        dict_buf_seek(&buf, mid);
-        if (mid != 0) {
-            // Discard the partial line we landed in the middle of.
-            dict_buf_skip_line(&buf);
+    File idx = SD.open(DICT_IDX_PATH, FILE_READ);
+    if (idx) {
+        uint8_t hdr[16];
+        if (idx.read(hdr, sizeof(hdr)) == sizeof(hdr) && memcmp(hdr, "DIX1", 4) == 0) {
+            uint32_t stride  = dict_le32(hdr + 4);  // informational: offsets are absolute
+            uint32_t count   = dict_le32(hdr + 8);
+            uint32_t tsv_sz  = dict_le32(hdr + 12);
+            (void)stride;
+            // Only trust the index if it was built from this exact file; a
+            // stale index would send the scan to the wrong line entirely.
+            if (count > 0 && count <= (0xFFFFFFFFu / DICT_IDX_REC) &&
+                tsv_sz == (uint32_t)s_dict_file.size()) {
+                uint32_t bytes = count * DICT_IDX_REC;
+                uint8_t *recs = (uint8_t *)ps_malloc(bytes);
+                if (recs && idx.read(recs, bytes) == bytes) {
+                    s_dict_idx = recs;
+                    s_dict_idx_count = count;
+                } else {
+                    free(recs);  // short read or no PSRAM: fall back to bisection
+                }
+            }
         }
-        long line_start = dict_buf_tell(&buf);
-        // A long line straddling mid can push line_start to or past hi;
-        // never let hi grow — fall through to the linear scan instead.
-        if (line_start >= hi) break;
-        int len = dict_buf_read_line(&buf, line, sizeof(line));
-        if (len < 0) { hi = line_start; continue; }
-        int cmp = dict_strcasecmp_word(line, word);
-        if (cmp < 0) lo = dict_buf_tell(&buf);
-        else         hi = line_start;
+        idx.close();
     }
 
-    // Invariant: lo and hi are both line starts, and the first line whose
-    // headword is >= word starts in [lo, hi] — inclusive, since an exact hit
-    // sets hi to the matching line's start. So scan from lo without skipping
-    // and include the line that starts at hi.
-    dict_buf_seek(&buf, lo);
+    s_dict_open = true;
+    if (s_dict_idx) Serial.printf("[dict] index: %u records\n", s_dict_idx_count);
+    else           Serial.println("[dict] no index, bisection");
+}
 
-    char *result = NULL;
-    while (dict_buf_tell(&buf) <= hi) {
-        int len = dict_buf_read_line(&buf, line, sizeof(line));
+void ui_dict_close(void)
+{
+    if (s_dict_file) s_dict_file.close();
+    if (s_dict_idx) {
+        free(s_dict_idx);
+        s_dict_idx = NULL;
+    }
+    s_dict_idx_count = 0;
+    s_dict_open = false;
+}
+
+// Linear scan from the reader's current position. `hi` is the bisection's
+// upper bound (inclusive, -1 = unbounded for the indexed path): the bisection
+// stops once tell() has passed hi, the indexed path just runs to EOF.
+static char* dict_scan(dict_buf_t *buf, const char *word, long hi)
+{
+    char line[512];
+    while (hi < 0 || dict_buf_tell(buf) <= hi) {
+        int len = dict_buf_read_line(buf, line, sizeof(line));
         if (len < 0) break;
         int cmp = dict_strcasecmp_word(line, word);
         if (cmp == 0) {
             const char *tab = strchr(line, '\t');
             const char *def = tab ? tab + 1 : "";
-            result = dict_decode_definition(def);
-            break;
+            return dict_decode_definition(def);
         }
         if (cmp > 0) break; // file is sorted — we've passed the target
     }
+    return NULL;
+}
 
-    f.close();
+char* ui_dict_lookup(const char *word)
+{
+    if (!word || !*word) return NULL;
+    if (!sd_fs_ready()) return NULL;
+
+    // Out of the dictionary screen the file is normally closed between
+    // lookups; open it here and close it before returning.
+    bool opened_here = false;
+    if (!s_dict_open) {
+        ui_dict_open();
+        if (!s_dict_open) return NULL;
+        opened_here = true;
+    }
+
+    char *result = NULL;
+    {
+        SpiGuard spi;
+
+        long hi = (long)s_dict_file.size();
+
+        // dict_buf provides ~512-byte block reads so the bisection issues
+        // ~40 SD transactions instead of ~20,000 single-byte VFS calls.
+        dict_buf_t buf;
+        dict_buf_init(&buf, &s_dict_file);
+
+        if (s_dict_idx) {
+            // Indexed path. The keys were built from the ASCII-lowercased
+            // headword truncated to 27 bytes, so truncate the query the same way.
+            char q[DICT_IDX_KEY_LEN];
+            size_t qn = 0;
+            while (word[qn] && qn < sizeof(q) - 1) {
+                q[qn] = (char)tolower((unsigned char)word[qn]);
+                qn++;
+            }
+            q[qn] = '\0';
+
+            // First record whose key is >= q; the LAST record strictly less
+            // than q is the one before it (or the file start if there is none).
+            uint32_t lo_rec = 0, hi_rec = s_dict_idx_count;
+            while (lo_rec < hi_rec) {
+                uint32_t mid = lo_rec + (hi_rec - lo_rec) / 2;
+                if (dict_key_cmp(s_dict_idx + (size_t)mid * DICT_IDX_REC + DICT_IDX_KEY, q) < 0)
+                    lo_rec = mid + 1;
+                else
+                    hi_rec = mid;
+            }
+            long start = 0;
+            if (lo_rec > 0)
+                start = (long)dict_le32(s_dict_idx + (size_t)(lo_rec - 1) * DICT_IDX_REC);
+
+            dict_buf_seek(&buf, start);
+            result = dict_scan(&buf, word, -1);
+        } else {
+            long lo = 0;
+
+            while (hi - lo > 512) {
+                long mid = lo + (hi - lo) / 2;
+                dict_buf_seek(&buf, mid);
+                if (mid != 0) {
+                    // Discard the partial line we landed in the middle of.
+                    dict_buf_skip_line(&buf);
+                }
+                long line_start = dict_buf_tell(&buf);
+                // A long line straddling mid can push line_start to or past hi;
+                // never let hi grow — fall through to the linear scan instead.
+                if (line_start >= hi) break;
+                char line[512];
+                int len = dict_buf_read_line(&buf, line, sizeof(line));
+                if (len < 0) { hi = line_start; continue; }
+                int cmp = dict_strcasecmp_word(line, word);
+                if (cmp < 0) lo = dict_buf_tell(&buf);
+                else         hi = line_start;
+            }
+
+            // Invariant: lo and hi are both line starts, and the first line
+            // whose headword is >= word starts in [lo, hi] — inclusive, since
+            // an exact hit sets hi to the matching line's start. So scan from
+            // lo without skipping and include the line that starts at hi.
+            dict_buf_seek(&buf, lo);
+            result = dict_scan(&buf, word, hi);
+        }
+    }
+
+    if (opened_here) ui_dict_close();
     return result;
 }
 
 bool ui_dict_available(void)
 {
+    if (!sd_fs_ready()) return false;
     SpiGuard spi;
     return SD.exists("/dict/eng-pob.tsv");
 }
@@ -1675,14 +2003,15 @@ bool ui_dict_available(void)
 // which used to dominate cold-load and resume-seek time.
 static File   s_reader_file;
 static bool   s_reader_file_open = false;
-static char   s_reader_file_name[32] = {0};
+static char   s_reader_file_name[UI_READER_NAME_MAX] = {0};
 
 size_t ui_reader_open_view(const char *filename)
 {
     ui_reader_close_view();
+    if (!sd_fs_ready()) return 0;
     if (!filename || !*filename) return 0;
 
-    char path[64];
+    char path[UI_READER_NAME_MAX + 16];
     snprintf(path, sizeof(path), "/books/%s", filename);
 
     size_t size = 0;
@@ -1692,6 +2021,7 @@ size_t ui_reader_open_view(const char *filename)
         if (s_reader_file) {
             size = s_reader_file.size();
             s_reader_file_open = true;
+            s_reader_file.setBufferSize(1024);  // stdio buffer lives in internal DRAM for the whole reader session
             copy_str(s_reader_file_name, sizeof(s_reader_file_name), filename);
         } else {
             log_e("reader_open_view: open failed: %s", path);
@@ -1713,7 +2043,7 @@ void ui_reader_close_view(void)
 
 // List the plain files in `dir` (creating it when missing) into `list` as
 // basenames. The caller owns the SD/SPI bus — wrap this in a SpiGuard.
-static void fs_list_dir(const char *dir, char list[][32], int max, int *count)
+static void fs_list_dir(const char *dir, char list[][UI_READER_NAME_MAX], int max, int *count)
 {
     *count = 0;
 
@@ -1729,7 +2059,7 @@ static void fs_list_dir(const char *dir, char list[][32], int max, int *count)
                 const char* name = file.name();
                 // file.name() might return full path or just name depending on version
                 const char* lastSlash = strrchr(name, '/');
-                copy_str(list[*count], 32, lastSlash ? lastSlash + 1 : name);
+                copy_str(list[*count], UI_READER_NAME_MAX, lastSlash ? lastSlash + 1 : name);
                 (*count)++;
             }
             file = root.openNextFile();
@@ -1737,8 +2067,12 @@ static void fs_list_dir(const char *dir, char list[][32], int max, int *count)
     }
 }
 
-void ui_reader_get_list(char list[UI_READER_MAX_COUNT][32], int *count)
+void ui_reader_get_list(char list[UI_READER_MAX_COUNT][UI_READER_NAME_MAX], int *count)
 {
+    if (!sd_fs_ready()) {
+        if (count) *count = 0;
+        return;
+    }
     SpiGuard spi;
     fs_list_dir("/books", list, UI_READER_MAX_COUNT, count);
 }
@@ -1758,6 +2092,7 @@ size_t ui_reader_read_range(const char *filename, size_t offset,
 {
     if (!buf || buf_size == 0) return 0;
     buf[0] = '\0';
+    if (!sd_fs_ready()) return 0;
 
     // Fast path: reader view is active and has the file already open.
     if (reader_cached_handle_matches(filename)) {
@@ -1768,7 +2103,7 @@ size_t ui_reader_read_range(const char *filename, size_t offset,
         return got;
     }
 
-    char path[64];
+    char path[UI_READER_NAME_MAX + 16];
     snprintf(path, sizeof(path), "/books/%s", filename);
 
     SpiGuard spi;

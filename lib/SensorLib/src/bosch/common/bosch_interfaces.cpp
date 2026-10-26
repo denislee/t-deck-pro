@@ -128,19 +128,29 @@ int8_t SensorInterfaces::bhy2_spi_write(uint8_t reg_addr, const uint8_t *reg_dat
     return DEV_WIRE_NONE;
 }
 
+// Local fork change (t-deck-pro): called after every BHY2 I2C transfer so an
+// application that serialises the bus with its own mutex can let other tasks
+// in between transfers (e.g. during the long firmware upload). Weak no-op by
+// default.
+extern "C" __attribute__((weak)) void sensorlib_i2c_transfer_done(void) {}
+
 int8_t SensorInterfaces::bhy2_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t length, void *intf_ptr)
 {
     SensorLibConfigure *pConfig  =  (SensorLibConfigure *)intf_ptr;
     if (!pConfig) {
         return DEV_WIRE_ERR;
     }
+    int8_t result;
     pConfig->u.i2c_dev.wire->beginTransmission(pConfig->u.i2c_dev.addr);
     pConfig->u.i2c_dev.wire->write(reg_addr);
     if (pConfig->u.i2c_dev.wire->endTransmission() != 0) {
-        return DEV_WIRE_ERR;
+        result = DEV_WIRE_ERR;
+    } else {
+        pConfig->u.i2c_dev.wire->requestFrom(pConfig->u.i2c_dev.addr, length);
+        result = pConfig->u.i2c_dev.wire->readBytes(reg_data, length) == length ? DEV_WIRE_NONE : DEV_WIRE_ERR;
     }
-    pConfig->u.i2c_dev.wire->requestFrom(pConfig->u.i2c_dev.addr, length);
-    return pConfig->u.i2c_dev.wire->readBytes(reg_data, length) == length ? DEV_WIRE_NONE : DEV_WIRE_ERR;
+    sensorlib_i2c_transfer_done();
+    return result;
 }
 
 int8_t SensorInterfaces::bhy2_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t length, void *intf_ptr)
@@ -152,8 +162,9 @@ int8_t SensorInterfaces::bhy2_i2c_write(uint8_t reg_addr, const uint8_t *reg_dat
     pConfig->u.i2c_dev.wire->beginTransmission(pConfig->u.i2c_dev.addr);
     pConfig->u.i2c_dev.wire->write(reg_addr);
     pConfig->u.i2c_dev.wire->write(reg_data, length);
-    return (pConfig->u.i2c_dev.wire->endTransmission() == 0) ? 0 : DEV_WIRE_ERR;
-
+    int8_t result = (pConfig->u.i2c_dev.wire->endTransmission() == 0) ? 0 : DEV_WIRE_ERR;
+    sensorlib_i2c_transfer_done();
+    return result;
 }
 
 

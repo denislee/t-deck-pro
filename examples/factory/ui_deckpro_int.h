@@ -72,7 +72,7 @@ void on_key_esc_pop(void);
  * Owned by ui_deckpro.cpp (placed there so the home-screen 'c' shortcut can
  * stage a resume target before pushing SCREEN13_1).
  * ui_reader.cpp reads and writes these in entry13_1 / exit13_1. */
-extern char   reader_selected_file[32];
+extern char   reader_selected_file[UI_READER_NAME_MAX];
 extern bool   reader_resume_pending;
 extern size_t reader_resume_offset;
 
@@ -94,9 +94,35 @@ void ui_taskbar_leave(void);
 /* Big bordered list row; clicking it pushes screen_id. */
 void ui_menu_item_create(lv_obj_t *list, const char *name, int screen_id);
 
+/* Shared "focused row" look (inverted: black bg, white text) — adds the
+ * ui_deckpro.cpp shared style for LV_PART_MAIN | LV_STATE_FOCUSED instead of
+ * per-object lv_obj_set_style_*() calls.  Used by the reader file list. */
+void ui_style_add_focus_inverted(lv_obj_t *obj);
+
 /* 3-state styling for the edit-mode screens (LoRa params, System Font):
  * editing = inverted + 3 px border, focused = 3 px border, idle = 1 px. */
 void ui_edit_focus_style(lv_obj_t *obj, bool focused, bool editing);
+
+/* j/k + Enter + Esc navigation shared by the LoRa Setting and System Font
+ * screens: j/k move focus, Enter toggles edit mode, j/k in edit mode step
+ * the focused value, Esc leaves edit mode (or the screen). */
+typedef struct { int focus; int count; bool editing; } ui_edit_nav_t;
+enum { UI_EDIT_NONE, UI_EDIT_POP, UI_EDIT_RESTYLE, UI_EDIT_STEP };
+int ui_edit_nav_key(ui_edit_nav_t *nav, char key, int *dir);
+
+/* ── Shortcut menus ──────────────────────────────────────────────────────────
+ * Screens 1 (LoRa) and 6 (Battery) list rows whose first letter is also the
+ * keypad shortcut; this table keeps the label and the handler in sync. */
+typedef struct { char key; const char *label; int screen_id; } ui_shortcut_item_t;
+/* List of 'k  Label' rows; the same table drives the key handler. */
+lv_obj_t *ui_shortcut_menu_create(lv_obj_t *parent, const ui_shortcut_item_t *items, int n);
+void ui_shortcut_menu_on_key(const ui_shortcut_item_t *items, int n);
+
+/* ── Screen transition hooks ─────────────────────────────────────────────────
+ * The screen-transition refresh policy lives in ui_disp_full_refr(); most
+ * screens just need this pair instead of their own entry/exit functions. */
+void ui_entry_taskbar(void);
+void ui_exit_taskbar(void);
 
 /* ── Toast notification ──────────────────────────────────────────────────────
  * Defined in ui_deckpro.cpp. ui_reader.cpp calls this to report errors

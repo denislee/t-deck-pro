@@ -94,8 +94,9 @@ bool lora_init(void)
 
     Serial.println(F("All settings succesfully changed!"));
 
-    Serial.println(F("[SX1262] Sending first packet ... "));
-    transmissionState = radio.startTransmit("Hello World!");
+    // No boot transmission: park the radio in warm sleep (config retained)
+    // until a LoRa screen needs it; any SPI command wakes it.
+    radio.sleep();
 
     s_lora_ready = true;
     return true;
@@ -199,6 +200,14 @@ void lora_sleep(void)
 
     SpiGuard spi;
     radio.sleep();
+}
+
+void lora_power_off(void)
+{
+    // The rail is about to be cut: the radio loses its config, so the next
+    // power-on must run lora_init() again.
+    lora_sleep();
+    s_lora_ready = false;
 }
 
 bool lora_param_set(void)

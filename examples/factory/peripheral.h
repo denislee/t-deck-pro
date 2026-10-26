@@ -14,6 +14,7 @@
 // and corrupt TwoWire's internal txBuffer state.
 void i2c0_lock(void);
 void i2c0_unlock(void);
+bool i2c0_held_by_me(void);
 
 #ifdef __cplusplus
 /* Holds the I2C-0 bus mutex for the enclosing scope. */
@@ -27,7 +28,6 @@ struct I2C0Guard {
 
 enum {
     E_PERI_LORA = 0,
-    E_PERI_TOUCH,
     E_PERI_KYEPAD,
     E_PERI_BQ25896,
     E_PERI_BQ27220,
@@ -53,6 +53,7 @@ void lora_transmit(const char *str);
 bool lora_get_recv(const char **str, int *rssi);
 void lora_set_recv_flag(void);
 void lora_sleep(void);
+void lora_power_off(void);
 bool lora_param_set(void);
 // keypad
 #define KEYPAD_PRESS   1
@@ -67,6 +68,10 @@ bool keypad_init(int address);
 int keypad_get_val(char *c);
 void keypad_set_flag(void);
 void keypad_task_create(void);
+// millis() of the last key pushed into the ring buffer (0 before the first).
+uint32_t keypad_last_activity_ms(void);
+// Re-arm the drain task when INT is already low (after light sleep).
+void keypad_kick(void);
 
 // gyro — compiled only when the BHI260AP hardware is present.
 // Without BOARD_HAS_BHI260AP (the default 4G build) the 103 KB firmware blob
@@ -92,6 +97,9 @@ bool LTR553_init(void);
 bool gps_init(void);
 void gps_task_suspend(void);
 void gps_task_resume(void);
+void gps_set_continuous(bool on);
+// True while the module is powered and its UART is being drained.
+bool gps_module_active(void);
 void gps_get_coord(double *lat, double *lng);
 void gps_get_data(uint16_t *year, uint8_t *month, uint8_t *day);
 void gps_get_time(uint8_t *hour, uint8_t *minute, uint8_t *second);

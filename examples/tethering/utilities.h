@@ -1,9 +1,10 @@
 #pragma once
 
-// A7682E modem pins (mirrors examples/A7682E/test_AT/utilities.h)
-// NOTE: pin 41 is named BOARD_6609_EN in examples/factory/utilities.h (same rail).
-#define BOARD_A7682E_POWER_EN 41 // VBAT -> modem rail enable
-#define BOARD_A7682E_RST      9
-#define BOARD_A7682E_RXD      10 // modem RX -> ESP TX
-#define BOARD_A7682E_TXD      11 // modem TX -> ESP RX
-#define BOARD_A7682E_PWRKEY   40
+#include "../factory/utilities.h"  // single source of truth for the board pins
+
+// Tethering-only aliases for the A7682E pin names the factory sketch spells
+// differently (or documents for reference only).
+#define BOARD_A7682E_POWER_EN BOARD_6609_EN  // same rail (GPIO 41)
+#ifndef BOARD_A7682E_RST
+#define BOARD_A7682E_RST 9
+#endif

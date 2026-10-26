@@ -19,11 +19,9 @@ typedef struct scr_lifecycle {
     void (*entry)(void);
     void (*exit)(void);
     void (*destroy)(void);
-    /* Called by the global 20 ms keypad-dispatch timer (§5.1).
-     * The function drains the keypad ring-buffer itself (same while/
-     * get/set loop as the old per-screen timer callback it replaces).
-     * NULL means this screen has no keyboard handling via the global
-     * timer; SCREEN0 is handled separately by menu_keypay_get_event. */
+    /* Called by ui_deckpro_dispatch_keys() whenever loop() wakes (the
+     * keypad task notifies it after each key burst). The function drains
+     * the keypad ring-buffer itself. NULL means this screen ignores keys. */
     void (*on_key)(void);
 } scr_lifecycle_t;
 
@@ -41,9 +39,9 @@ typedef struct scr_card {
  * *******************************************************************************/
 void scr_mgr_init(void);
 bool scr_mgr_register(int id, scr_lifecycle_t *card_life);
-bool scr_mgr_switch(int id, bool anim);
-bool scr_mgr_push(int id, bool anim);
-bool scr_mgr_pop(bool anim);
+void scr_mgr_switch(int id);
+void scr_mgr_push(int id);
+void scr_mgr_pop(void);
 
 int scr_mgr_get_curr_scr_id(void);
 scr_lifecycle_t *scr_mgr_get_curr_life(void);

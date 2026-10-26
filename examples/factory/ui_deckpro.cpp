@@ -3,6 +3,7 @@
  * macros, and extern declarations for cross-TU state (taskbar objects,
  * reader selection state, ui_get_font / topbar_font_get declarations). */
 #include "ui_deckpro_int.h"
+#include "driver/rtc_io.h"
 
 #define SETTING_PAGE_MAX_ITEM 15
 /* GET_BUFF_LEN comes from ui_deckpro_int.h. */
@@ -10,14 +11,16 @@
 #define KV_LINE_MAX 23
 #define LOW_VOLTAGE_THRESHOLD_MV 3300
 #define LOW_VOLTAGE_SHUTDOWN_DELAY_MS 20000
-#define LOW_VOLTAGE_POLL_MS 2000
+#define LOW_VOLTAGE_POLL_MS 10000
+// Lock the device after this long without a keypress.
+#define AUTO_LOCK_IDLE_MS (10UL * 60UL * 1000UL)
 
 /* Private to this TU: split screens pause / resume it through
  * ui_taskbar_leave() / ui_taskbar_enter(). */
 static lv_timer_t *taskbar_update_timer = NULL;
 static lv_timer_t *low_voltage_timer = NULL;
 static lv_obj_t *label_list[10] = {0};
-static uint16_t taskbar_statue[TASKBAR_ID_MAX] = {0};
+static int taskbar_state[TASKBAR_ID_MAX] = {0};
 static lv_obj_t *low_voltage_popup = NULL;
 static lv_obj_t *low_voltage_countdown_label = NULL;
 static bool low_voltage_latched = false;
@@ -114,9 +117,8 @@ static void low_voltage_reset_state(void)
 
 static void low_voltage_timer_cb(lv_timer_t *t)
 {
-    (void)t;
-
     if (ui_battery_is_external_power_present()) {
+        lv_timer_set_period(t, LOW_VOLTAGE_POLL_MS);
         low_voltage_reset_state();
         return;
     }
@@ -132,6 +134,8 @@ static void low_voltage_timer_cb(lv_timer_t *t)
     if (!low_voltage_latched) {
         return;
     }
+
+    lv_timer_set_period(t, 1000);  // tick the countdown once a second while latched
 
     low_voltage_popup_set_visible(true);
 
@@ -149,21 +153,11 @@ static void low_voltage_timer_cb(lv_timer_t *t)
 }
 
 //************************************[ Other fun ]******************************************
-static lv_obj_t *scr_back_btn_create(lv_obj_t *parent, const char *text, lv_event_cb_t cb)
+/* Screen title with a back arrow; ESC (on_key) is what actually goes back. */
+static lv_obj_t *scr_title_create(lv_obj_t *parent, const char *text)
 {
-    lv_obj_t * btn = lv_btn_create(parent);
-    lv_obj_remove_style_all(btn);
-    lv_obj_set_style_pad_all(btn, 0, 0);
-    lv_obj_set_height(btn, 30);
-    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 3, 3);
-    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_color(btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *label2 = lv_label_create(btn);
-    lv_obj_align(label2, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *label2 = lv_label_create(parent);
+    lv_obj_align(label2, LV_ALIGN_TOP_LEFT, 3, 10);
     lv_obj_set_style_text_color(label2, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_label_set_text(label2, LV_SYMBOL_LEFT);
 
@@ -172,17 +166,8 @@ static lv_obj_t *scr_back_btn_create(lv_obj_t *parent, const char *text, lv_even
     lv_obj_set_style_text_font(label, UI_FONT_MONO(15), LV_PART_MAIN);
     lv_obj_set_style_text_color(label, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_label_set_text(label, text);
-    lv_obj_add_flag(label, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(label, cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_set_ext_click_area(label, 20);
 
     return label;
-}
-
-/* Back-button click handler shared by every scr_back_btn_create() caller. */
-static void scr_pop_event_cb(lv_event_t *e)
-{
-    if (e->code == LV_EVENT_CLICKED) scr_mgr_pop(false);
 }
 
 /* on_key for screens whose only key is ESC = back. */
@@ -192,7 +177,7 @@ void on_key_esc_pop(void)
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
         if (key == KEY_ESC) {
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
     }
@@ -275,15 +260,57 @@ lv_group_t *ui_default_group(void)
     return g;
 }
 
-/* ── Shared list helpers (Settings / Test / A7682 / PCM5102) ──────────────── */
+/* ── Shared styles ─────────────────────────────────────────────────────────
+ * Every lv_obj_set_style_*() allocates a local style entry in the LVGL heap for
+ * that one object, and the list screens build dozens of rows that all repeat
+ * the same handful of properties.  These three lv_style_t live for the whole
+ * run and are added by reference (lv_obj_add_style), so N rows cost one style
+ * each instead of one style entry per property.
+ *
+ * text_font stays out of them: UI_FONT changes at runtime with the System Font
+ * setting, so it must remain a per-object local style.  Same for height/size,
+ * which differ per row. */
+static lv_style_t s_style_row;        /* list row base look */
+static lv_style_t s_style_focus_inv;  /* focused row: inverted */
+static lv_style_t s_style_menu_item;  /* big menu buttons */
 
-/* Inverted row when focused via j/k. */
-static void setting_apply_focus_style(lv_obj_t *btn)
+static void ui_styles_init(void)
 {
-    lv_obj_set_style_bg_color(btn, DECKPRO_COLOR_FG, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(btn, DECKPRO_COLOR_BG, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_FOCUSED);
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+
+    lv_style_init(&s_style_row);
+    lv_style_set_pad_left(&s_style_row, 5);
+    lv_style_set_pad_right(&s_style_row, 5);
+    lv_style_set_bg_color(&s_style_row, DECKPRO_COLOR_BG);
+    lv_style_set_text_color(&s_style_row, DECKPRO_COLOR_FG);
+    lv_style_set_border_width(&s_style_row, 0);   // No border for cleaner look
+    lv_style_set_radius(&s_style_row, 0);         // Square edges for list items
+
+    /* Inverted row when focused via j/k.  The reader list also relies on the
+     * opaque background here; every list button already paints LV_OPA_COVER
+     * from the theme, so carrying it over keeps the reader look explicit. */
+    lv_style_init(&s_style_focus_inv);
+    lv_style_set_bg_color(&s_style_focus_inv, DECKPRO_COLOR_FG);
+    lv_style_set_bg_opa(&s_style_focus_inv, LV_OPA_COVER);
+    lv_style_set_text_color(&s_style_focus_inv, DECKPRO_COLOR_BG);
+    lv_style_set_outline_width(&s_style_focus_inv, 0);
+
+    lv_style_init(&s_style_menu_item);
+    lv_style_set_border_width(&s_style_menu_item, 1);
+    lv_style_set_radius(&s_style_menu_item, 10);
 }
+
+/* Add the shared inverted-focus look (LV_PART_MAIN | LV_STATE_FOCUSED) to obj. */
+void ui_style_add_focus_inverted(lv_obj_t *obj)
+{
+    if (!obj) return;
+    ui_styles_init();
+    lv_obj_add_style(obj, &s_style_focus_inv, LV_PART_MAIN | LV_STATE_FOCUSED);
+}
+
+/* ── Shared list helpers (Settings / Test / A7682 / PCM5102) ──────────────── */
 
 /* Create the group if needed (wrap off). */
 static lv_group_t *ui_list_group_get(lv_group_t **g)
@@ -311,19 +338,15 @@ static lv_obj_t *ui_list_create(lv_obj_t *parent, lv_coord_t y, lv_coord_t h)
     return list;
 }
 
-/* 18 px row: pads 5, font, bg/fg colours, border 0, radius 0, focus style, add to group. */
+/* 18 px row: pads, font, bg/fg colours, border 0, radius 0, focus style, add to group. */
 static void ui_list_style_row(lv_obj_t *btn, lv_group_t *g)
 {
+    ui_styles_init();
     lv_obj_set_height(btn, 18); // Ultra-compact height
-    lv_obj_set_style_pad_left(btn, 5, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(btn, 5, LV_PART_MAIN);
-    lv_obj_set_style_text_font(btn, UI_FONT, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn, DECKPRO_COLOR_BG, LV_PART_MAIN);
-    lv_obj_set_style_text_color(btn, DECKPRO_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT); // No border for cleaner look
-    lv_obj_set_style_radius(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT); // Square edges for list items
+    lv_obj_set_style_text_font(btn, UI_FONT, LV_PART_MAIN); // runtime font setting: stays per-object
+    lv_obj_add_style(btn, &s_style_row, LV_PART_MAIN);
 
-    setting_apply_focus_style(btn);
+    ui_style_add_focus_inverted(btn);
     if (g) lv_group_add_obj(g, btn);
 }
 
@@ -352,7 +375,7 @@ static bool ui_list_nav_key(lv_group_t *g, char key)
 
 static void ui_menu_item_event_cb(lv_event_t *e)
 {
-    scr_mgr_push((int)(intptr_t)lv_event_get_user_data(e), false);
+    scr_mgr_push((int)(intptr_t)lv_event_get_user_data(e));
 }
 
 /* Big bordered list row; clicking it pushes screen_id. */
@@ -368,11 +391,13 @@ void ui_menu_item_create(lv_obj_t *list, const char *name, int screen_id)
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 10, 0);
 
     lv_obj_set_height(obj, LV_VER_RES / 6);
-    lv_obj_set_style_text_font(obj, UI_FONT, LV_PART_MAIN);
-    lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(obj, UI_FONT, LV_PART_MAIN); // runtime font setting: stays per-object
+    ui_styles_init();
+    lv_obj_add_style(obj, &s_style_menu_item, LV_PART_MAIN);
+    // PRESSED never happens without an input device; keep it local so the
+    // pressed look stays exactly as before.
     lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_outline_width(obj, 1, LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_radius(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     lv_obj_add_event_cb(obj, ui_menu_item_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)screen_id);
 }
@@ -395,6 +420,102 @@ void ui_edit_focus_style(lv_obj_t *obj, bool focused, bool editing)
         lv_obj_set_style_text_color(obj, DECKPRO_COLOR_FG, LV_PART_MAIN);
         lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN);
     }
+}
+
+/* j/k + Enter + Esc navigation shared by the LoRa Setting and System Font
+ * screens.  Returns the action the caller must take for `key`; *dir is set
+ * only for UI_EDIT_STEP. */
+int ui_edit_nav_key(ui_edit_nav_t *nav, char key, int *dir)
+{
+    if (!nav) return UI_EDIT_NONE;
+
+    switch (key) {
+    case KEY_ESC:
+        if (nav->editing) {
+            nav->editing = false;
+            return UI_EDIT_RESTYLE;
+        }
+        return UI_EDIT_POP;
+    case KEY_ENTER:
+        nav->editing = !nav->editing;
+        return UI_EDIT_RESTYLE;
+    case 'j':
+        if (nav->editing) {
+            if (dir) *dir = +1;
+            return UI_EDIT_STEP;
+        }
+        if (nav->focus < nav->count - 1) {
+            nav->focus++;
+            return UI_EDIT_RESTYLE;
+        }
+        return UI_EDIT_NONE;
+    case 'k':
+        if (nav->editing) {
+            if (dir) *dir = -1;
+            return UI_EDIT_STEP;
+        }
+        if (nav->focus > 0) {
+            nav->focus--;
+            return UI_EDIT_RESTYLE;
+        }
+        return UI_EDIT_NONE;
+    default:
+        return UI_EDIT_NONE;
+    }
+}
+
+/* List of 'k  Label' rows; the same table drives the key handler. */
+lv_obj_t *ui_shortcut_menu_create(lv_obj_t *parent, const ui_shortcut_item_t *items, int n)
+{
+    lv_obj_t *list = lv_list_create(parent);
+    lv_obj_set_size(list, lv_pct(93), LV_VER_RES - UI_TASKBAR_H - 8);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H + 4);
+    lv_obj_set_style_pad_top(list, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(list, 15, LV_PART_MAIN);
+    lv_obj_set_style_radius(list, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(list, 0, LV_PART_MAIN);
+
+    for (int i = 0; i < n; i++) {
+        // ui_menu_item_create copies the text (lv_label_set_text), so a local
+        // buffer is safe here.
+        char text[64];
+        lv_snprintf(text, sizeof(text), "%c  %s", items[i].key, items[i].label);
+        ui_menu_item_create(list, text, items[i].screen_id);
+    }
+    return list;
+}
+
+void ui_shortcut_menu_on_key(const ui_shortcut_item_t *items, int n)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == KEY_ESC) { // Esc -> back to the parent screen
+            scr_mgr_pop();
+            return;
+        }
+        for (int i = 0; i < n; i++) {
+            if (key == items[i].key) {
+                scr_mgr_push(items[i].screen_id);
+                return;
+            }
+        }
+    }
+}
+
+/* The screen-transition refresh policy lives in ui_disp_full_refr(); most
+ * screens just need this pair. */
+void ui_entry_taskbar(void)
+{
+    ui_taskbar_enter();
+    ui_disp_full_refr();
+}
+
+void ui_exit_taskbar(void)
+{
+    ui_taskbar_leave();
+    ui_disp_full_refr();
 }
 
 //************************************[ screen 0 ]****************************************** menu
@@ -506,18 +627,12 @@ void ui_taskbar_create(lv_obj_t *parent)
     menu_taskbar_wifi = lv_label_create(status_parent);
     lv_label_set_text_fmt(menu_taskbar_wifi, "%s", LV_SYMBOL_WIFI);
     lv_obj_set_style_text_font(menu_taskbar_wifi, tb_font, LV_PART_MAIN);
-    lv_obj_add_flag(menu_taskbar_wifi, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden(menu_taskbar_wifi, !taskbar_state[TASKBAR_ID_WIFI]);
 
     menu_taskbar_charge = lv_label_create(status_parent);
     lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_CHARGE);
     lv_obj_set_style_text_font(menu_taskbar_charge, tb_font, LV_PART_MAIN);
-    lv_obj_add_flag(menu_taskbar_charge, LV_OBJ_FLAG_HIDDEN);
-
-    if(taskbar_statue[TASKBAR_ID_WIFI])
-        lv_obj_clear_flag(menu_taskbar_wifi, LV_OBJ_FLAG_HIDDEN);
-
-    if(taskbar_statue[TASKBAR_ID_CHARGE])
-        lv_obj_clear_flag(menu_taskbar_charge, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden(menu_taskbar_charge, !taskbar_state[TASKBAR_ID_CHARGE]);
 
     menu_taskbar_battery = lv_label_create(status_parent);
     lv_obj_set_style_text_font(menu_taskbar_battery, tb_font, LV_PART_MAIN);
@@ -579,11 +694,11 @@ void ui_taskbar_enter(void)
 
     if (menu_taskbar_charge) {
         lv_label_set_text_fmt(menu_taskbar_charge, "%s",
-                              taskbar_statue[TASKBAR_ID_CHARGE_FINISH] ? LV_SYMBOL_OK : LV_SYMBOL_CHARGE);
-        ui_obj_set_hidden(menu_taskbar_charge, !taskbar_statue[TASKBAR_ID_CHARGE]);
+                              taskbar_state[TASKBAR_ID_CHARGE_FINISH] ? LV_SYMBOL_OK : LV_SYMBOL_CHARGE);
+        ui_obj_set_hidden(menu_taskbar_charge, !taskbar_state[TASKBAR_ID_CHARGE]);
     }
     if (menu_taskbar_wifi) {
-        ui_obj_set_hidden(menu_taskbar_wifi, !taskbar_statue[TASKBAR_ID_WIFI]);
+        ui_obj_set_hidden(menu_taskbar_wifi, !taskbar_state[TASKBAR_ID_WIFI]);
     }
 
     struct tm tm_now;
@@ -649,7 +764,7 @@ static void on_key_usb_msc(void)
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
         if (key == KEY_ESC) {
-            scr_mgr_switch(SCREEN0_ID, false);
+            scr_mgr_switch(SCREEN0_ID);
             return;
         }
     }
@@ -731,10 +846,13 @@ static void exit0(void) {
 }
 
 
+static void on_key_home(void);
+
 static scr_lifecycle_t screen0 = {
     .create = create0,
     .entry = entry0,
     .exit  = exit0,
+    .on_key = on_key_home,
 };
 //************************************[ screen 2 ]****************************************** Setting
 // --------------------- screen 2.1 --------------------- About System
@@ -780,19 +898,10 @@ static void create2_1(lv_obj_t *parent)
     lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 35);
 }
 
-static void entry2_1(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit2_1(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 static scr_lifecycle_t screen2_1 = {
     .create = create2_1,
-    .entry = entry2_1,
-    .exit  = exit2_1,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .on_key    = on_key_esc_pop,
 };
 // --------------------- screen 2 --------------------- Setting
@@ -842,7 +951,7 @@ static void setting_scr_event(lv_event_t *e)
             lv_label_set_text_fmt(h->st, "%s", (h->get_cb() ? "ON" : "OFF"));
             break;
         case UI_SETTING_TYPE_SUB:
-            scr_mgr_push(h->sub_id, false);
+            scr_mgr_push(h->sub_id);
             break;
         default:
             break;
@@ -946,7 +1055,7 @@ static void on_key_settings(void) {
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
         if (key == KEY_ESC) { // Esc -> back to home
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         } else if (key == 'j') {
             if (setting_group) {
@@ -999,14 +1108,6 @@ static void on_key_settings(void) {
         }
     }
 }
-static void entry2(void) {
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit2(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 static void destroy2(void) {
     if (setting_group) {
         lv_group_del(setting_group);
@@ -1016,8 +1117,8 @@ static void destroy2(void) {
 
 static scr_lifecycle_t screen2 = {
     .create = create2,
-    .entry = entry2,
-    .exit  = exit2,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .destroy = destroy2,
     .on_key    = on_key_settings,
 };
@@ -1051,13 +1152,13 @@ static void scr3_GPS_updata(void)
 
     char buf[32];
 
-    lv_snprintf(buf, 16, "%0.1f", lat);
+    ui_fmt_fixed(buf, 16, (float)lat, 1, "");
     kv_set_line(label_list[0], "Latitude:", buf);
 
-    lv_snprintf(buf, 16, "%0.1f", lon);
+    ui_fmt_fixed(buf, 16, (float)lon, 1, "");
     kv_set_line(label_list[1], "Longitude:", buf);
 
-    lv_snprintf(buf, 16, "%0.3fkmph", speed);
+    ui_fmt_fixed(buf, 16, (float)speed, 3, "kmph");
     kv_set_line(label_list[2], "Speed:", buf);
 
     lv_snprintf(buf, 16, "%d", vsat);
@@ -1105,6 +1206,7 @@ static void entry3(void)
     scr3_GPS_updata();
 
     ui_gps_task_resume();
+    ui_gps_set_continuous(true);
 
     ui_taskbar_enter();
 
@@ -1112,9 +1214,9 @@ static void entry3(void)
     ui_disp_full_refr();
 }
 static void exit3(void) {
-    // Keep GPS running in the background so the topbar clock stays sourced
-    // from satellite time after the user leaves this screen — suspending it
-    // here defeats the no-WiFi time fallback.
+    // Back to duty-cycled mode: the GPS task keeps the clock synced with an
+    // hourly fix and powers the module down in between.
+    ui_gps_set_continuous(false);
     if(GPS_loop_timer) {
         lv_timer_del(GPS_loop_timer);
         GPS_loop_timer = NULL;
@@ -1217,9 +1319,9 @@ static void scr4_select_focused(void)
         ui_wifi_set_ssid(scr4_selected_ssid);
         ui_wifi_set_password("");
         ui_wifi_set_enabled(true);
-        scr_mgr_pop(false);
+        scr_mgr_pop();
     } else {
-        scr_mgr_push(SCREEN4_1_ID, false);
+        scr_mgr_push(SCREEN4_1_ID);
     }
 }
 
@@ -1246,7 +1348,7 @@ static void on_key_scr4(void)
             // chewing CPU after we've left the screen.
             if (scr4_scan_timer) { lv_timer_del(scr4_scan_timer); scr4_scan_timer = NULL; }
             ui_wifi_scan_cancel();
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
         if (key == 'r') {
@@ -1424,7 +1526,7 @@ static void scr4_1_status_timer_cb(lv_timer_t *t)
     // Once we land on connected, drop back to settings so the flow ends
     // naturally. Stay put on failure so the user can retry the password.
     if (ui_wifi_get_status() == UI_WIFI_STATUS_CONNECTED) {
-        scr_mgr_pop(false);
+        scr_mgr_pop();
     }
 }
 
@@ -1448,7 +1550,7 @@ static void on_key_scr4_1(void)
         ui_input_set_keypad_flag();
 
         if (key == KEY_ESC) { // Esc -> back to scan list
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
 
@@ -1510,6 +1612,7 @@ static void create4_1(lv_obj_t *parent)
 
     // Password textarea
     scr4_1_pass_ta = lv_textarea_create(cont);
+    lv_obj_set_style_anim_time(scr4_1_pass_ta, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);  // solid cursor: a blinking one keeps the e-paper refreshing nonstop
     lv_textarea_set_one_line(scr4_1_pass_ta, true);
     lv_textarea_set_password_mode(scr4_1_pass_ta, true);
     lv_obj_set_width(scr4_1_pass_ta, lv_pct(100));
@@ -1539,7 +1642,7 @@ static void create4_1(lv_obj_t *parent)
     lv_label_set_long_mode(scr4_1_status_lab, LV_LABEL_LONG_WRAP);
     lv_label_set_text(scr4_1_status_lab, "");
 
-    scr_back_btn_create(parent, "Password", scr_pop_event_cb);
+    scr_title_create(parent, "Password");
 }
 
 static void entry4_1(void)
@@ -1573,24 +1676,22 @@ static lv_obj_t *test_list;
 static int test_num = 0;
 
 static ui_test_handle test_handle_list[] = {
-    { .name="Lora",       .peri_id=E_PERI_LORA       , .cb=ui_test_get, .shortcut='l' },
-    { .name="BQ25896",    .peri_id=E_PERI_BQ25896    , .cb=ui_test_get, .shortcut='5' },
-    { .name="BQ27220",    .peri_id=E_PERI_BQ27220    , .cb=ui_test_get, .shortcut='7' },
-    { .name="SD Card",    .peri_id=E_PERI_SD         , .cb=ui_test_get, .shortcut='d' },
-    { .name="A7682E",     .peri_id=E_PERI_A7682E     , .cb=ui_test_get, .shortcut='a' },
+    { .name="Lora",       .peri_id=E_PERI_LORA       , .shortcut='l' },
+    { .name="BQ25896",    .peri_id=E_PERI_BQ25896    , .shortcut='5' },
+    { .name="BQ27220",    .peri_id=E_PERI_BQ27220    , .shortcut='7' },
+    { .name="SD Card",    .peri_id=E_PERI_SD         , .shortcut='d' },
+    { .name="A7682E",     .peri_id=E_PERI_A7682E     , .shortcut='a' },
 #ifdef BOARD_HAS_PCM5102A
-    { .name="PCM5102A",   .peri_id=E_PERI_PCM5102A   , .cb=ui_test_get, .shortcut='p' },
+    { .name="PCM5102A",   .peri_id=E_PERI_PCM5102A   , .shortcut='p' },
 #endif
-    { .name="Keypad",     .peri_id=E_PERI_KYEPAD     , .cb=ui_test_get, .shortcut='y' },
-    { .name="GPS",        .peri_id=E_PERI_GPS        , .cb=ui_test_get, .shortcut='g' },
+    { .name="Keypad",     .peri_id=E_PERI_KYEPAD     , .shortcut='y' },
+    { .name="GPS",        .peri_id=E_PERI_GPS        , .shortcut='g' },
 #ifdef BOARD_HAS_BHI260AP
-    { .name="BHI260AP",   .peri_id=E_PERI_BHI260AP   , .cb=ui_test_get, .shortcut='b' },
+    { .name="BHI260AP",   .peri_id=E_PERI_BHI260AP   , .shortcut='b' },
 #endif
-    { .name="LTR_553ALS", .peri_id=E_PERI_LTR_553ALS , .cb=ui_test_get, .shortcut='r' },
-    { .name="INK_SCREEN", .peri_id=E_PERI_INK_SCREEN , .cb=ui_test_get, .shortcut='i' },
+    { .name="LTR_553ALS", .peri_id=E_PERI_LTR_553ALS , .shortcut='r' },
+    { .name="INK_SCREEN", .peri_id=E_PERI_INK_SCREEN , .shortcut='i' },
 };
-
-static void test_item_create(void);
 
 static lv_group_t *test_group = NULL;
 
@@ -1602,7 +1703,7 @@ static void test_item_create(void)
         h->st = lv_label_create(obj);
         lv_obj_set_style_text_font(h->st, UI_FONT, LV_PART_MAIN);
         lv_obj_align(h->st, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_label_set_text_fmt(h->st, "%s", (h->cb(h->peri_id) ? "PASS" : "----"));
+        lv_label_set_text_fmt(h->st, "%s", (ui_test_get(h->peri_id) ? "PASS" : "----"));
         // Ensure status label also changes color on focus
         lv_obj_set_style_text_color(h->st, DECKPRO_COLOR_BG, LV_PART_MAIN | LV_STATE_FOCUSED);
 
@@ -1633,7 +1734,7 @@ static void on_key_test(void) {
     while (ui_input_get_keypad_val(&key)) {
         ui_input_set_keypad_flag();
         if (key == KEY_ESC) { // Esc -> back to settings
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
         if (ui_list_nav_key(test_group, key)) continue;
@@ -1650,15 +1751,6 @@ static void on_key_test(void) {
         }
     }
 }
-static void entry5(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit5(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 static void destroy5(void) {
     if (test_group) {
         lv_group_del(test_group);
@@ -1668,69 +1760,39 @@ static void destroy5(void) {
 
 static scr_lifecycle_t screen5 = {
     .create = create5,
-    .entry = entry5,
-    .exit  = exit5,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .destroy = destroy5,
     .on_key    = on_key_test,
 };
 //************************************[ screen 6 ]****************************************** Battery
 // --------------------- screen 6 --------------------- Battery
-static lv_obj_t *scr6_list;
+static const ui_shortcut_item_t scr6_shortcuts[] = {
+    { 'c', "BQ25896", SCREEN6_1_ID },
+    { 'g', "BQ27220", SCREEN6_2_ID },
+};
+#define SCR6_SHORTCUT_N (int)(sizeof(scr6_shortcuts) / sizeof(scr6_shortcuts[0]))
 
 static void create6(lv_obj_t *parent)
 {
     // Use the home-screen taskbar (clock + battery + wifi icon) instead of
     // the per-screen "Battery <" title bar. ESC on the keypad pops back to
     // Settings via its on_key() handler. Letter prefixes on the items double as
-    // keypad shortcuts handled by the same kb timer.
+    // keypad shortcuts handled by the same table.
     ui_taskbar_create(parent);
 
-    scr6_list = lv_list_create(parent);
-    lv_obj_set_size(scr6_list, lv_pct(93), LV_VER_RES - UI_TASKBAR_H - 8);
-    lv_obj_align(scr6_list, LV_ALIGN_TOP_MID, 0, UI_TASKBAR_H + 4);
-    lv_obj_set_style_pad_top(scr6_list, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(scr6_list, 15, LV_PART_MAIN);
-    lv_obj_set_style_radius(scr6_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scr6_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(scr6_list, 0, LV_PART_MAIN);
-
-    ui_menu_item_create(scr6_list, "c  BQ25896", SCREEN6_1_ID);
-    ui_menu_item_create(scr6_list, "g  BQ27220", SCREEN6_2_ID);
+    ui_shortcut_menu_create(parent, scr6_shortcuts, SCR6_SHORTCUT_N);
 }
 
 static void on_key_scr6(void)
 {
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc -> back to Settings
-            scr_mgr_pop(false);
-            return;
-        }
-        if (key == 'c') { // Charger IC
-            scr_mgr_push(SCREEN6_1_ID, false);
-            return;
-        }
-        if (key == 'g') { // Fuel gauge IC
-            scr_mgr_push(SCREEN6_2_ID, false);
-            return;
-        }
-    }
+    ui_shortcut_menu_on_key(scr6_shortcuts, SCR6_SHORTCUT_N);
 }
 
-static void entry6(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit6(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 static scr_lifecycle_t screen6 = {
     .create = create6,
-    .entry = entry6,
-    .exit  = exit6,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .on_key    = on_key_scr6,
 };
 // --------------------- screen 6.1 --------------------- BQ25896
@@ -1743,22 +1805,22 @@ static void scr6_1_battert_updata(void)
 
     kv_set_line(label_list[0], "Charging:", (ui_batt_25896_is_chg() == true ? "Charging" : "Not charged"));
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fV", ui_batt_25896_get_vbus());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_vbus(), 2, "V");
     kv_set_line(label_list[1], "VBUS:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fV", ui_batt_25896_get_vsys());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_vsys(), 2, "V");
     kv_set_line(label_list[2], "VSYS:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fV", ui_batt_25896_get_vbat());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_vbat(), 2, "V");
     kv_set_line(label_list[3], "VBAT:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fv", ui_batt_25896_get_volt_targ());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_volt_targ(), 2, "v");
     kv_set_line(label_list[4], "VOLT Target:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fmA", ui_batt_25896_get_chg_curr());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_chg_curr(), 2, "mA");
     kv_set_line(label_list[5], "Charge Curr:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fmA", ui_batt_25896_get_pre_curr());
+    ui_fmt_fixed(buf, KV_LINE_MAX, ui_batt_25896_get_pre_curr(), 2, "mA");
     kv_set_line(label_list[6], "Prechg Curr:", buf);
 
     lv_snprintf(buf, KV_LINE_MAX, "%s", ui_batt_25896_get_chg_st());
@@ -1788,12 +1850,14 @@ static void create6_1(lv_obj_t *parent)
 
 static void entry6_1(void)
 {
+    ui_batt_25896_set_adc_continuous(true);
     scr6_1_battert_updata();
     ui_taskbar_enter();
     ui_disp_full_refr();
     batt_6_1_timer = lv_timer_create(batt_6_1_updata_timer_event, 5000, NULL);
 }
 static void exit6_1(void) {
+    ui_batt_25896_set_adc_continuous(false);
     if(batt_6_1_timer) {
         lv_timer_del(batt_6_1_timer);
         batt_6_1_timer = NULL;
@@ -1834,7 +1898,7 @@ static void scr6_2_battert_updata(void)
     lv_snprintf(buf, KV_LINE_MAX, "%dmA", ui_battery_27220_get_current());
     kv_set_line(label_list[4], "Current:", buf);
 
-    lv_snprintf(buf, KV_LINE_MAX, "%.2fC", (float)(ui_battery_27220_get_temperature() / 10.0 - 273.0));
+    ui_fmt_fixed(buf, KV_LINE_MAX, (float)(ui_battery_27220_get_temperature() / 10.0f - 273.0f), 2, "C");
     kv_set_line(label_list[5], "Temperature:", buf);
 
     lv_snprintf(buf, KV_LINE_MAX, "%dmAh", ui_battery_27220_get_remain_capacity());
@@ -1917,7 +1981,7 @@ static void input_timer_event(lv_timer_t *t)
         // since this screen owns the keypad queue and a separate kb timer would
         // race us for it.
         if (keypay_v == KEY_ESC) {
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
         if (keypad_str_len + 1 >= KEYPAD_STR_CAP) {
@@ -2024,19 +2088,70 @@ static scr_lifecycle_t screen7 = {
     .exit  = exit7,
 };
 //************************************[ screen 8 ]****************************************** A7682E
+/* Shared A7682 / PCM5102 submenu helpers: a click runs cb(name); ESC pops;
+ * j/k/Enter navigate; a row shortcut focuses, clicks and scrolls to that row. */
+static void action_scr_event(lv_event_t *e)
+{
+    ui_action_handle *h = (ui_action_handle *)e->user_data;
+
+    if(e->code == LV_EVENT_CLICKED) {
+        if(h->cb)
+            h->cb(h->name);
+    }
+}
+
+static void action_items_create(lv_obj_t *list, lv_group_t *group, ui_action_handle *items, int n)
+{
+    for(int i = 0; i < n; i++) {
+        ui_action_handle *h = &items[i];
+        h->obj = lv_list_add_btn(list, NULL, h->name);
+        lv_obj_add_event_cb(h->obj, action_scr_event, LV_EVENT_CLICKED, (void *)h);
+        ui_list_style_row(h->obj, group);
+    }
+    if (group) {
+        lv_obj_t *first = lv_obj_get_child(list, 0);
+        if (first) lv_group_focus_obj(first);
+    }
+}
+
+static void action_on_key(lv_group_t *group, lv_obj_t *list, ui_action_handle *items, int n)
+{
+    char key;
+    while (ui_input_get_keypad_val(&key)) {
+        ui_input_set_keypad_flag();
+        if (key == KEY_ESC) { // Esc -> back to settings
+            scr_mgr_pop();
+            return;
+        }
+        if (ui_list_nav_key(group, key)) continue;
+        // Per-item shortcut: focus + click the matching row.
+        for (int i = 0; i < n; i++) {
+            if (items[i].shortcut == key) {
+                lv_obj_t *obj = lv_obj_get_child(list, i);
+                if (obj) {
+                    lv_group_focus_obj(obj);
+                    lv_event_send(obj, LV_EVENT_CLICKED, NULL);
+                    lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
+                }
+                return;
+            }
+        }
+    }
+}
+
 // --------------------- screen 8 --------------------- A7682E
 static lv_obj_t *a7682_list;
 static int a7682_num = 0;
 
 static bool ui_a7682_call_test(const char *param)
 {
-    scr_mgr_push(SCREEN8_1_ID, false);
+    scr_mgr_push(SCREEN8_1_ID);
     return true;
 }
 
 static bool ui_a7682_at_test(const char *param)
 {
-    scr_mgr_push(SCREEN8_2_ID, false);
+    scr_mgr_push(SCREEN8_2_ID);
     return true;
 }
 
@@ -2047,56 +2162,15 @@ static ui_action_handle a7682_handle_list[] =
     {"AT test",     NULL, ui_a7682_at_test,      't'},
 };
 
-static void a7682_item_create(void);
-
-static void a7682_scr_event(lv_event_t *e)
-{
-    ui_action_handle *h = (ui_action_handle *)e->user_data;
-
-    if(e->code == LV_EVENT_CLICKED) {
-        if(h->cb)
-            h->cb(h->name);
-    }
-}
-
 static lv_group_t *a7682_group = NULL;
 
 static void a7682_item_create(void)
 {
-    for(int i = 0; i < a7682_num; i++) {
-        ui_action_handle *h = &a7682_handle_list[i];
-        h->obj = lv_list_add_btn(a7682_list, NULL, h->name);
-        lv_obj_add_event_cb(h->obj, a7682_scr_event, LV_EVENT_CLICKED, (void *)h);
-        ui_list_style_row(h->obj, a7682_group);
-    }
-    if (a7682_group) {
-        lv_obj_t *first = lv_obj_get_child(a7682_list, 0);
-        if (first) lv_group_focus_obj(first);
-    }
+    action_items_create(a7682_list, a7682_group, a7682_handle_list, a7682_num);
 }
 
 static void on_key_a7682(void) {
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc -> back to settings
-            scr_mgr_pop(false);
-            return;
-        }
-        if (ui_list_nav_key(a7682_group, key)) continue;
-        // Per-item shortcut: focus + click the matching row.
-        for (int i = 0; i < a7682_num; i++) {
-            if (a7682_handle_list[i].shortcut == key) {
-                lv_obj_t *obj = lv_obj_get_child(a7682_list, i);
-                if (obj) {
-                    lv_group_focus_obj(obj);
-                    lv_event_send(obj, LV_EVENT_CLICKED, NULL);
-                    lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
-                }
-                return;
-            }
-        }
-    }
+    action_on_key(a7682_group, a7682_list, a7682_handle_list, a7682_num);
 }
 
 static void create8(lv_obj_t *parent)
@@ -2112,15 +2186,6 @@ static void create8(lv_obj_t *parent)
     a7682_num = sizeof(a7682_handle_list) / sizeof(a7682_handle_list[0]);
     a7682_item_create();
 }
-static void entry8(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-static void exit8(void) {
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
 static void destroy8(void) {
     if (a7682_group) {
         lv_group_del(a7682_group);
@@ -2129,8 +2194,8 @@ static void destroy8(void) {
 }
 static scr_lifecycle_t screen8 = {
     .create = create8,
-    .entry = entry8,
-    .exit  = exit8,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .destroy = destroy8,
     .on_key    = on_key_a7682,
 };
@@ -2175,6 +2240,7 @@ static void create8_1(lv_obj_t *parent)
     lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, lv_pct(20));
     lv_obj_set_style_text_font(ta, &Font_Mono_Bold_20, LV_PART_MAIN);
     lv_obj_clear_flag(ta, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_anim_time(ta, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);  // solid cursor: a blinking one keeps the e-paper refreshing nonstop
     lv_obj_set_style_text_letter_space(ta, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ta, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
@@ -2185,15 +2251,15 @@ static void create8_1(lv_obj_t *parent)
     lv_obj_align(btnm1, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(btnm1, event_handler, LV_EVENT_VALUE_CHANGED, ta);
     
-    scr_back_btn_create(parent, ("Call"), scr_pop_event_cb);
+    scr_title_create(parent, ("Call"));
 }
 static void entry8_1(void) 
 {
-    ui_a7682_loop_resume();
+    // No serial bridge here: the call screen talks to the modem through
+    // TinyGSM and a bridge would steal its responses.
     ui_disp_full_refr();
 }
 static void exit8_1(void) {
-    ui_a7682_loop_suspend();
     ui_disp_full_refr();
 }
 static scr_lifecycle_t screen8_1 = {
@@ -2212,7 +2278,7 @@ static void create8_2(lv_obj_t *parent)
                             "and send the AT command of A7682E to test the function.");
     lv_obj_center(lab);
     
-    scr_back_btn_create(parent, ("AT test"), scr_pop_event_cb);
+    scr_title_create(parent, ("AT test"));
 }
 static void entry8_2(void) 
 {
@@ -2254,7 +2320,7 @@ static void create9(lv_obj_t *parent)
         lv_obj_center(label);
 
         // back 
-        scr_back_btn_create(parent, "Shutdown", scr_pop_event_cb);
+        scr_title_create(parent, "Shutdown");
     } 
     else 
     {
@@ -2297,56 +2363,15 @@ static ui_action_handle pcm5102_handle_list[] =
     {"PCM5102 Audio", NULL, ui_pcm5102_cb, 'u'},
 };
 
-static void pcm5102_item_create(void);
-
-static void pcm5102_scr_event(lv_event_t *e)
-{
-    ui_action_handle *h = (ui_action_handle *)e->user_data;
-
-    if(e->code == LV_EVENT_CLICKED) {
-        if(h->cb)
-            h->cb(h->name);
-    }
-}
-
 static lv_group_t *pcm5102_group = NULL;
 
 static void pcm5102_item_create(void)
 {
-    for(int i = 0; i < pcm5102_num; i++) {
-        ui_action_handle *h = &pcm5102_handle_list[i];
-        h->obj = lv_list_add_btn(pcm5102_list, NULL, h->name);
-        lv_obj_add_event_cb(h->obj, pcm5102_scr_event, LV_EVENT_CLICKED, (void *)h);
-        ui_list_style_row(h->obj, pcm5102_group);
-    }
-    if (pcm5102_group) {
-        lv_obj_t *first = lv_obj_get_child(pcm5102_list, 0);
-        if (first) lv_group_focus_obj(first);
-    }
+    action_items_create(pcm5102_list, pcm5102_group, pcm5102_handle_list, pcm5102_num);
 }
 
 static void on_key_pcm5102(void) {
-    char key;
-    while (ui_input_get_keypad_val(&key)) {
-        ui_input_set_keypad_flag();
-        if (key == KEY_ESC) { // Esc -> back to settings
-            scr_mgr_pop(false);
-            return;
-        }
-        if (ui_list_nav_key(pcm5102_group, key)) continue;
-        // Per-item shortcut: focus + click the matching row.
-        for (int i = 0; i < pcm5102_num; i++) {
-            if (pcm5102_handle_list[i].shortcut == key) {
-                lv_obj_t *obj = lv_obj_get_child(pcm5102_list, i);
-                if (obj) {
-                    lv_group_focus_obj(obj);
-                    lv_event_send(obj, LV_EVENT_CLICKED, NULL);
-                    lv_obj_scroll_to_view(obj, LV_ANIM_OFF);
-                }
-                return;
-            }
-        }
-    }
+    action_on_key(pcm5102_group, pcm5102_list, pcm5102_handle_list, pcm5102_num);
 }
 
 static void create10(lv_obj_t *parent)
@@ -2361,11 +2386,6 @@ static void create10(lv_obj_t *parent)
 
     pcm5102_num = sizeof(pcm5102_handle_list) / sizeof(pcm5102_handle_list[0]);
     pcm5102_item_create();
-}
-static void entry10(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
 }
 static void exit10(void)
 {
@@ -2382,7 +2402,7 @@ static void destroy10(void) {
 
 static scr_lifecycle_t screen10 = {
     .create = create10,
-    .entry = entry10,
+    .entry = ui_entry_taskbar,
     .exit  = exit10,
     .destroy = destroy10,
     .on_key    = on_key_pcm5102,
@@ -2391,9 +2411,10 @@ static scr_lifecycle_t screen10 = {
 //************************************[ screen 11 ]****************************************** Sleep
 static void create11(lv_obj_t *parent)
 {
-    // Deep sleep never returns, so flush any setting still sitting in the
-    // debounced save timer — unlike ui_shutdown_on(), this path does not go
-    // through ui_settings_save() on its way down.
+    // Deep sleep never returns, so stamp the clock and flush any setting
+    // still sitting in the debounced save timer — unlike ui_shutdown_on(),
+    // this path does not go through ui_settings_save() on its way down.
+    ui_time_persist_save();
     ui_settings_save();
 
     lora_sleep();
@@ -2417,20 +2438,21 @@ static void create11(lv_obj_t *parent)
     board_rails_hold(true);
 
     
-    esp_sleep_enable_ext1_wakeup((1UL << BOARD_BOOT_PIN), ESP_EXT1_WAKEUP_ANY_LOW);   // Hibernate using user keys
+    // Wake on BOOT or on any key: the TCA8418 stays powered and holds INT low
+    // while a key event is queued. The INT line needs a pull-up in deep sleep
+    // (the GPIO pull-up set by pinMode does not survive), and it must be idle
+    // high now or the chip would wake immediately.
+    uint64_t wake_mask = (1ULL << BOARD_BOOT_PIN);
+    if (digitalRead(BOARD_KEYBOARD_INT) == HIGH) {
+        rtc_gpio_pullup_en((gpio_num_t)BOARD_KEYBOARD_INT);
+        rtc_gpio_pulldown_dis((gpio_num_t)BOARD_KEYBOARD_INT);
+        wake_mask |= (1ULL << BOARD_KEYBOARD_INT);
+    }
+    esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
-}
-static void entry11(void) 
-{
-    ui_disp_full_refr();
-}
-static void exit11(void) {
-    ui_disp_full_refr();
 }
 static scr_lifecycle_t screen11 = {
     .create = create11,
-    .entry = entry11,
-    .exit  = exit11,
 };
 //************************************[ UI ENTRY ]******************************************
 static void menu_taskbar_update_timer_cb(lv_timer_t *t)
@@ -2454,46 +2476,50 @@ static void menu_taskbar_update_timer_cb(lv_timer_t *t)
     bool finish = 0;
     int percent = 0;
 
-    // Read every tick. The underlying getters are I2C-rate-limited by a 500 ms
-    // cache, and the change-detection below avoids redundant label redraws.
-    // Reading only every 10 s let the label sit at 0 for up to ten seconds
-    // after BQ27220 init completed.
-    finish = ui_battery_27220_get_charge_finish();
-    percent = ui_battery_27220_get_percent();
+    // Until the gauge has produced its first real value, poll every tick; after
+    // that the state of charge moves slowly, so read it every 30 s and the
+    // charger presence every 5 s. Each read is an I2C transaction that keeps the
+    // CPU and bus awake.
+    if (!first_battery_update_done || sec % 30 == 0) {
+        finish = ui_battery_27220_get_charge_finish();
+        percent = ui_battery_27220_get_percent();
 
-    if(taskbar_statue[TASKBAR_ID_CHARGE_FINISH] != finish)
-    {
-        if(finish){
-            lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_OK);
-        } else {
-            lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_CHARGE);
+        if(taskbar_state[TASKBAR_ID_CHARGE_FINISH] != finish)
+        {
+            if(finish){
+                lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_OK);
+            } else {
+                lv_label_set_text_fmt(menu_taskbar_charge, "%s", LV_SYMBOL_CHARGE);
+            }
+            taskbar_state[TASKBAR_ID_CHARGE_FINISH] = finish;
         }
-        taskbar_statue[TASKBAR_ID_CHARGE_FINISH] = finish;
+
+        if(taskbar_state[TASKBAR_ID_BATTERY_PERCENT] != percent)
+        {
+            lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", percent);
+            lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
+            taskbar_state[TASKBAR_ID_BATTERY_PERCENT] = percent;
+            if (!first_battery_update_done) {
+                first_battery_update_done = true;
+                ui_disp_force_full_refr();
+            }
+        }
     }
 
-    if(taskbar_statue[TASKBAR_ID_BATTERY_PERCENT] != percent)
-    {
-        lv_label_set_text_fmt(menu_taskbar_battery_percent, "%d", percent);
-        lv_label_set_text_fmt(menu_taskbar_battery, "%s", ui_battert_27220_get_percent_level());
-        taskbar_statue[TASKBAR_ID_BATTERY_PERCENT] = percent;
-        if (!first_battery_update_done) {
-            first_battery_update_done = true;
-            ui_disp_full_refr();
+    if (!first_battery_update_done || sec % 5 == 0) {
+        charge = ui_battery_is_external_power_present();
+        if(taskbar_state[TASKBAR_ID_CHARGE] != charge)
+        {
+            ui_obj_set_hidden(menu_taskbar_charge, !charge);
+            taskbar_state[TASKBAR_ID_CHARGE] = charge;
         }
-    }
-
-    charge = ui_battery_is_external_power_present();
-    if(taskbar_statue[TASKBAR_ID_CHARGE] != charge)
-    {
-        ui_obj_set_hidden(menu_taskbar_charge, !charge);
-        taskbar_statue[TASKBAR_ID_CHARGE] = charge;
     }
 
     bool wifi_en = ui_wifi_get_enabled();
-    if(taskbar_statue[TASKBAR_ID_WIFI] != (int)wifi_en)
+    if(taskbar_state[TASKBAR_ID_WIFI] != (int)wifi_en)
     {
         ui_obj_set_hidden(menu_taskbar_wifi, !wifi_en);
-        taskbar_statue[TASKBAR_ID_WIFI] = (int)wifi_en;
+        taskbar_state[TASKBAR_ID_WIFI] = (int)wifi_en;
     }
 
     // Clock. Only render once SNTP has produced a plausible year — before that
@@ -2511,12 +2537,14 @@ static void menu_taskbar_update_timer_cb(lv_timer_t *t)
                 last_min = cur;
                 if (!first_time_update_done) {
                     first_time_update_done = true;
-                    ui_disp_full_refr();
+                    ui_disp_force_full_refr();
                 }
-                // Stamp every minute-tick so the next cold boot has something
-                // recent to restore. NVS writes are wear-level safe at this
-                // cadence (~1440/day vs. ~100k cycle endurance).
-                ui_time_persist_save();
+                // Stamp every 15 minutes (each NVS write can stall the flash
+                // cache for tens of ms); lock, deep sleep and shutdown also
+                // stamp.
+                if (tm_now.tm_min % 15 == 0) {
+                    ui_time_persist_save();
+                }
             }
         }
     }
@@ -2747,80 +2775,101 @@ static void ui_do_ntp_sync(void)
 }
 
 // Reader resume state is defined here (rather than alongside the reader code
-// in ui_reader.cpp) because the home-screen 'c' shortcut in
-// menu_keypay_get_event needs to stage a resume target before pushing
-// SCREEN13_1.  All three have external linkage so ui_reader.cpp can access
-// them (declared extern in ui_deckpro_int.h).
-char   reader_selected_file[32] = {0};
+// in ui_reader.cpp) because the home-screen 'c' shortcut in on_key_home()
+// needs to stage a resume target before pushing SCREEN13_1.  All three have
+// external linkage so ui_reader.cpp can access them (declared extern in
+// ui_deckpro_int.h).
+char   reader_selected_file[UI_READER_NAME_MAX] = {0};
 // Set true by 'c' on the home screen; entry13_1 consumes it to seed
 // reader_page_offsets[0] so the first render is the user's last-read page.
 bool   reader_resume_pending = false;
 size_t reader_resume_offset  = 0;
 
 /* ---------------------------------------------------------------
- * Global 20 ms keypad dispatch timer  (§5.1 consolidation)
+ * Keypad dispatch  (§5.1 consolidation)
  *
- * One LVGL timer polls the keypad ring-buffer and dispatches each
- * key event to the current screen's on_key() hook.  The hook
- * contains the original while/get/set drain loop verbatim, so all
- * per-key semantics are preserved.  Screens without an on_key hook
- * (SCREEN0, screens handled by menu_keypay_get_event) receive no
- * delivery here — the home-screen timer below handles SCREEN0.
+ * There is no polling timer any more: the keypad task notifies
+ * the loop task after every key burst, and loop() calls
+ * ui_deckpro_dispatch_keys(), which runs the current screen's
+ * on_key() hook.  The home screen is just another screen with an
+ * on_key hook (on_key_home below), so there is one dispatch path.
+ * Every hook drains the keypad ring-buffer itself with the
+ * original while/get/set loop, so all per-key semantics are
+ * preserved.
  * --------------------------------------------------------------- */
-static lv_timer_t *global_kb_timer = NULL;
-static lv_timer_t *menu_timer       = NULL;
-static void global_kb_timer_cb(lv_timer_t *t)
+
+// Called by loop() each time it wakes: the keypad task notifies the loop
+// task after every burst, so keys are dispatched with no polling timer.
+void ui_deckpro_dispatch_keys(void)
 {
     scr_lifecycle_t *life = scr_mgr_get_curr_life();
     if (life && life->on_key) life->on_key();
 }
 
-// Home-screen keypad handler.  All other screens use the global_kb_timer
-// dispatch below (ui_deckpro_entry()) which calls their on_key() hook.
-static void menu_keypay_get_event(lv_timer_t *timer)
+// Home-screen key handler: drains the ring buffer and runs each
+// single-key shortcut.  Stops draining as soon as a key switched
+// screens, so the new screen does not get the rest of the burst.
+static void on_key_home(void)
 {
-    if (scr_mgr_get_curr_scr_id() != SCREEN0_ID) return;
-
     char key_val;
-    if (!ui_input_get_keypad_val(&key_val)) return;
-    Serial.printf("[home] key=0x%02x ('%c')\n",
-                  (unsigned char)key_val,
-                  (key_val >= 32 && key_val < 127) ? key_val : '?');
-    switch (key_val) {
-        case 's': scr_mgr_push(SCREEN2_ID,        false); break;
-        case 'r': scr_mgr_push(SCREEN13_ID,       false); break;
-        case 'c': {
-            char saved[32] = {0};
-            size_t saved_off = 0;
-            if (ui_reader_resume_get(saved, sizeof(saved), &saved_off) && saved[0]) {
-                strncpy(reader_selected_file, saved, sizeof(reader_selected_file) - 1);
-                reader_selected_file[sizeof(reader_selected_file) - 1] = '\0';
-                reader_resume_offset = saved_off;
-                reader_resume_pending = true;
-                scr_mgr_push(SCREEN13_1_ID, false);
+    while (ui_input_get_keypad_val(&key_val)) {
+        ui_input_set_keypad_flag();
+        Serial.printf("[home] key=0x%02x ('%c')\n",
+                      (unsigned char)key_val,
+                      (key_val >= 32 && key_val < 127) ? key_val : '?');
+        switch (key_val) {
+            case 's': scr_mgr_push(SCREEN2_ID); break;
+            case 'r': scr_mgr_push(SCREEN13_ID); break;
+            case 'c': {
+                char saved[UI_READER_NAME_MAX] = {0};
+                size_t saved_off = 0;
+                if (ui_reader_resume_get(saved, sizeof(saved), &saved_off) && saved[0]) {
+                    strncpy(reader_selected_file, saved, sizeof(reader_selected_file) - 1);
+                    reader_selected_file[sizeof(reader_selected_file) - 1] = '\0';
+                    reader_resume_offset = saved_off;
+                    reader_resume_pending = true;
+                    scr_mgr_push(SCREEN13_1_ID);
+                }
+                break;
             }
-            break;
+            case 'n': scr_mgr_push(SCREEN12_1_ID); break;
+            case 't': scr_mgr_push(SCREEN_DICT_ID); break;
+            case 'q': scr_mgr_push(SCREEN_USB_MSC_ID); break;
+            case 'l': scr_mgr_push(SCREEN_LOCK_ID); break;
+            case 'd': ui_disp_white_clear(); scr_mgr_push(SCREEN11_ID); break;
+            case 'w': ui_wifi_set_enabled(!ui_wifi_get_enabled()); break;
+            case 'p': ui_do_ping_1111(); break;
+            case 'z': ui_do_ntp_sync(); break;
+            case 'b':
+                ui_topbar_show_battery_set(!ui_topbar_show_battery_get());
+                ui_taskbar_apply_battery_visibility();
+                ui_disp_full_refr();
+                break;
+            case KEY_ESC: ui_disp_hard_refr(); break;
         }
-        case 'n': scr_mgr_push(SCREEN12_1_ID, false); break;
-        case 't': scr_mgr_push(SCREEN_DICT_ID,    false); break;
-        case 'q': scr_mgr_push(SCREEN_USB_MSC_ID, false); break;
-        case 'l': scr_mgr_push(SCREEN_LOCK_ID,    false); break;
-        case 'd': ui_disp_white_clear(); scr_mgr_push(SCREEN11_ID, false); break;
-        case 'w': ui_wifi_set_enabled(!ui_wifi_get_enabled()); break;
-        case 'p': ui_do_ping_1111(); break;
-        case 'z': ui_do_ntp_sync(); break;
-        case 'b':
-            ui_topbar_show_battery_set(!ui_topbar_show_battery_get());
-            ui_taskbar_apply_battery_visibility();
-            ui_disp_full_refr();
-            break;
-        case KEY_ESC: ui_disp_hard_refr(); break;
+        if (scr_mgr_get_curr_scr_id() != SCREEN0_ID) break;
     }
-    ui_input_set_keypad_flag();
+}
+
+// Lock after 10 minutes without a key. Skipped on screens that are
+// legitimately idle (USB export, AT/LoRa tests) and in the reader, whose
+// entry() would restart the book from page 1 after the lock pops.
+static void auto_lock_timer_cb(lv_timer_t *)
+{
+    int id = scr_mgr_get_curr_scr_id();
+    if (id == SCREEN_LOCK_ID || id == SCREEN_USB_MSC_ID || id == SCREEN8_2_ID ||
+        id == SCREEN1_1_ID || id == SCREEN13_1_ID || id == SCREEN11_ID) {
+        return;
+    }
+    if (ui_input_idle_ms() >= AUTO_LOCK_IDLE_MS) {
+        scr_mgr_push(SCREEN_LOCK_ID);
+    }
 }
 
 void ui_deckpro_entry(void)
 {
+    ui_styles_init();
+
     lv_disp_t *disp = lv_disp_get_default();
     disp->theme = lv_theme_mono_init(disp, false, LV_FONT_DEFAULT);
 
@@ -2863,8 +2912,9 @@ void ui_deckpro_entry(void)
     scr_mgr_register(SCREEN_DICT_ID, &screen_dict);
 
 
-    scr_mgr_switch(SCREEN0_ID, false); // set root screen
+    scr_mgr_switch(SCREEN0_ID); // set root screen
 
-    global_kb_timer = lv_timer_create(global_kb_timer_cb, 20, NULL);
-    menu_timer = lv_timer_create(menu_keypay_get_event, 40, NULL);
+    // Keys arrive via the keypad task's notification (ui_deckpro_dispatch_keys
+    // from loop()); this timer only implements the idle auto-lock.
+    lv_timer_create(auto_lock_timer_cb, 5000, NULL);
 }

@@ -8,6 +8,9 @@
 #include "peripheral.h"
 #include <ctype.h>
 
+extern TaskHandle_t loopTaskHandle;  // Arduino core (main.cpp): the task running loop() / LVGL
+static volatile uint32_t keypad_last_key_ms = 0;
+
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 10
 #define KEYPAD_PRESS_VAL_MIN   129
@@ -57,6 +60,13 @@ Adafruit_TCA8418 keypad;
 // keypad_task_create(); safe to check for NULL before any xSemaphore call.
 static SemaphoreHandle_t keypad_irq_sem = NULL;
 
+// Re-arm the drain task after light sleep, when INT is already low and the
+// ISR will therefore see no edge.
+void keypad_kick(void)
+{
+    if (keypad_irq_sem) xSemaphoreGive(keypad_irq_sem);
+}
+
 // ISR fired on the falling edge of BOARD_KEYBOARD_INT (GPIO 15). The TCA8418
 // holds the line low until INT_STAT is cleared, so a single falling edge per
 // event burst is all we get. ISR gives the semaphore and yields; I2C access,
@@ -95,6 +105,11 @@ void i2c0_unlock(void)
     }
 }
 
+bool i2c0_held_by_me(void)
+{
+    return i2c0_mutex && xSemaphoreGetMutexHolder(i2c0_mutex) == xTaskGetCurrentTaskHandle();
+}
+
 // Ring buffer of pressed-key characters. The producer (keypad_loop) runs from
 // the IRQ-driven keypad task; consumers (UI polls) often run at 10-50 Hz
 // so without a buffer fast typing drops keys. Keep this a power-of-two for
@@ -130,7 +145,6 @@ bool keypad_init(int address)
     i2c0_lock();
     if (!keypad.begin(address, &Wire)) {
         i2c0_unlock();
-        // Serial.println("keypad not found, check wiring & pullups!");
         log_e("keypad not found, check wiring & pullups!");
         return false;
     }
@@ -176,65 +190,91 @@ void keypad_set_flag(void)
 
 static void keypad_loop(void)
 {
+    bool pushed = false;
+
     // Drain every event the TCA8418 has queued. Held under the I2C bus mutex so
     // a concurrent main-loop Wire user (PMU, gauge, touch) cannot interleave
     // with our reads and corrupt the TwoWire txBuffer state.
     i2c0_lock();
-    while (true) {
-        int k = keypad.getEvent();
-        if (k <= 0) {
+
+    for (int pass = 0; pass < 4; pass++) {
+        // Clear K_INT (and GPI_INT) BEFORE draining: a key that lands mid-drain
+        // re-asserts INT and produces a fresh falling edge instead of being
+        // lost until the safety-net timeout; the re-check of the INT pin below
+        // covers a chip that refuses to release INT while its FIFO is
+        // non-empty. Must be done while i2c0_lock is still held — before
+        // i2c0_unlock() below.
+        keypad.writeRegister(TCA8418_REG_INT_STAT,
+                             TCA8418_REG_STAT_K_INT | TCA8418_REG_STAT_GPI_INT);
+
+        while (true) {
+            int k = keypad.getEvent();
+            if (k <= 0) {
+                break;
+            }
+            int state;
+            if (k >= KEYPAD_RELEASE_VAL_MIN && k <= KEYPAD_RELEASE_VAL_MAX) {
+                k -= KEYPAD_RELEASE_VAL_MIN;
+                state = KEYPAD_RELEASE;
+            } else if (k >= KEYPAD_PRESS_VAL_MIN && k <= KEYPAD_PRESS_VAL_MAX) {
+                k -= KEYPAD_PRESS_VAL_MIN;
+                state = KEYPAD_PRESS;
+            } else {
+                continue;
+            }
+
+            int row = k / KEYPAD_COLS;
+            int col = (KEYPAD_COLS - 1) - k % KEYPAD_COLS;
+
+            // Sym/shift are held modifiers — track their state on both press and
+            // release, and never push the sentinel to the buffer.
+            if (keymap[row][col] == KEY_SYM_SENTINEL) {
+                sym_held = (state == KEYPAD_PRESS);
+                continue;
+            }
+            if (keymap[row][col] == KEY_SHIFT_SENTINEL) {
+                shift_held = (state == KEYPAD_PRESS);
+                continue;
+            }
+
+            if (state != KEYPAD_PRESS) {
+                continue;
+            }
+
+            char c;
+            if (shift_held)    c = toupper((unsigned char)keymap[row][col]);
+            else if (sym_held) c = sym_keymap[row][col];
+            else               c = keymap[row][col];
+            keypad_buf_push(c);
+            pushed = true;
+        }
+
+        // INT released after this pass → nothing left queued, stop here.
+        if (digitalRead(BOARD_KEYBOARD_INT) == HIGH) {
             break;
         }
-        int state;
-        if (k >= KEYPAD_RELEASE_VAL_MIN && k <= KEYPAD_RELEASE_VAL_MAX) {
-            k -= KEYPAD_RELEASE_VAL_MIN;
-            state = KEYPAD_RELEASE;
-        } else if (k >= KEYPAD_PRESS_VAL_MIN && k <= KEYPAD_PRESS_VAL_MAX) {
-            k -= KEYPAD_PRESS_VAL_MIN;
-            state = KEYPAD_PRESS;
-        } else {
-            continue;
-        }
-
-        int row = k / KEYPAD_COLS;
-        int col = (KEYPAD_COLS - 1) - k % KEYPAD_COLS;
-
-        // Sym/shift are held modifiers — track their state on both press and
-        // release, and never push the sentinel to the buffer.
-        if (keymap[row][col] == KEY_SYM_SENTINEL) {
-            sym_held = (state == KEYPAD_PRESS);
-            continue;
-        }
-        if (keymap[row][col] == KEY_SHIFT_SENTINEL) {
-            shift_held = (state == KEYPAD_PRESS);
-            continue;
-        }
-
-        if (state != KEYPAD_PRESS) {
-            continue;
-        }
-
-        char c;
-        if (shift_held)    c = toupper((unsigned char)keymap[row][col]);
-        else if (sym_held) c = sym_keymap[row][col];
-        else               c = keymap[row][col];
-        keypad_buf_push(c);
     }
 
-    // Clear K_INT (and GPI_INT) in INT_STAT so the open-drain INT line
-    // de-asserts. The TCA8418 holds INT low until this register is written
-    // with 1-to-clear bits, regardless of FIFO state. Must be done while
-    // i2c0_lock is still held — before i2c0_unlock() below.
-    keypad.writeRegister(TCA8418_REG_INT_STAT,
-                         TCA8418_REG_STAT_K_INT | TCA8418_REG_STAT_GPI_INT);
-
     i2c0_unlock();
+
+    // Wake the LVGL loop straight away instead of letting it poll the ring
+    // buffer.
+    if (pushed) {
+        keypad_last_key_ms = millis();
+        if (loopTaskHandle) xTaskNotifyGive(loopTaskHandle);
+    }
+}
+
+// millis() of the last key that reached the ring buffer; 0 if none yet.
+uint32_t keypad_last_activity_ms(void)
+{
+    return keypad_last_key_ms;
 }
 
 // Dedicated drain task. Blocks on keypad_irq_sem, which is given by the
 // falling-edge ISR on BOARD_KEYBOARD_INT. When the TCA8418 asserts INT the
 // task wakes, drains the full FIFO in one pass (keypad_loop), and clears
-// INT_STAT so the line de-asserts. The 500 ms timeout is a safety net: if the
+// INT_STAT so the line de-asserts. The 5 s timeout is a safety net: if the
 // ISR was missed (e.g. INT was already low at attachInterrupt time, or a
 // glitch prevented the edge) the task re-syncs by draining and clearing.
 // Because keypad_loop() clears INT_STAT unconditionally, the timeout path is
@@ -244,7 +284,7 @@ static TaskHandle_t keypad_task_handle = NULL;
 static void keypad_task(void *param)
 {
     (void)param;
-    const TickType_t timeout = pdMS_TO_TICKS(500);
+    const TickType_t timeout = pdMS_TO_TICKS(5000);
     for (;;) {
         // Block until INT fires or the safety-net timeout expires.
         xSemaphoreTake(keypad_irq_sem, timeout);
@@ -271,10 +311,10 @@ void keypad_task_create(void)
     attachInterrupt(digitalPinToInterrupt(BOARD_KEYBOARD_INT),
                     keypad_irq_handler, FALLING);
 
-    // Priority above loopTask (1) so we preempt the e-paper SPI refresh, but
-    // below the time-critical GPS/LoRa tasks. 4 KB stack: nominally a TCA8418
-    // drain is tiny, but when the I2C bus is unhealthy (Error 263 timeouts on
-    // shared peripherals) the Wire error-handling path eats hundreds of
-    // additional bytes — 2 KB tripped the stack canary in practice.
+    // Priority above loopTask (1) so we preempt the e-paper SPI refresh, and
+    // above the GPS task (KEYPAD_PRIORITY 19 vs GPS 17). 4 KB stack: nominally
+    // a TCA8418 drain is tiny, but when the I2C bus is unhealthy (Error 263
+    // timeouts on shared peripherals) the Wire error-handling path eats
+    // hundreds of additional bytes — 2 KB tripped the stack canary in practice.
     xTaskCreate(keypad_task, "keypad", 4096, NULL, KEYPAD_PRIORITY, &keypad_task_handle);
 }

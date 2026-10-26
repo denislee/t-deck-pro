@@ -11,3 +11,6 @@ build
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# PlatformIO .ino preprocessing leftovers (the generated .ino.cpp copies).
+*.ino.cpp

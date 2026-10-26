@@ -11,9 +11,9 @@
 #include "utilities.h"
 #include "peripheral.h"
 
-SensorBHI260AP bhy;
-struct bhy2_data_xyz accel_data;
-struct bhy2_data_xyz gyro_data;
+static SensorBHI260AP bhy;
+static struct bhy2_data_xyz accel_data;
+static struct bhy2_data_xyz gyro_data;
 
 float accel_factor;
 float gyro_factor;
@@ -22,26 +22,12 @@ void accel_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, 
 {
     accel_factor = get_sensor_default_scaling(sensor_id);
     bhy2_parse_xyz(data_ptr, &accel_data);
-    // Serial.print(bhy.getSensorName(sensor_id));
-    // Serial.print(":");
-    // Serial.printf("x: %f, y: %f, z: %f;\r\n",
-    //               accel_data.x * accel_factor,
-    //               accel_data.y * accel_factor,
-    //               accel_data.z * accel_factor
-    //              );
 }
 
 void gyro_process_callback(uint8_t sensor_id, uint8_t *data_ptr, uint32_t len, uint64_t *timestamp)
 {
     gyro_factor = get_sensor_default_scaling(sensor_id);
     bhy2_parse_xyz(data_ptr, &gyro_data);
-    // Serial.print(bhy.getSensorName(sensor_id));
-    // Serial.print(":");
-    // Serial.printf("x: %f, y: %f, z: %f;\r\n",
-    //               gyro_data.x * gyro_factor,
-    //               gyro_data.y * gyro_factor,
-    //               gyro_data.z * gyro_factor
-    //              );
 }
 
 /**
@@ -72,6 +58,17 @@ void BHI260AP_get_val(int val_type, float *x, float *y, float *z)
             *y = 0;
             *z = 0;
             break;
+    }
+}
+
+// Each BHY2 transfer is a complete I2C transaction, so while this task holds
+// i2c0 (BHI260AP_init's I2C0Guard) it can hand the bus to the higher-priority
+// keypad task between transfers instead of stalling it for the whole upload.
+extern "C" void sensorlib_i2c_transfer_done(void)
+{
+    if (i2c0_held_by_me()) {
+        i2c0_unlock();
+        i2c0_lock();
     }
 }
 

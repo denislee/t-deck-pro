@@ -1,7 +1,5 @@
 /*
  * ui_lockscreen.cpp — lock screen (SCREEN_LOCK_ID).
- *
- * Pure move from ui_deckpro.cpp.  No behaviour change.
  */
 #include "ui_deckpro_int.h"
 
@@ -169,8 +167,8 @@ static void lock_update_clock(bool force_full)
         if (lock_date_label) lv_label_set_text(lock_date_label, "no time sync");
         if (lock_month_label) lv_label_set_text(lock_month_label, "");
         if (lock_cal_label)  lv_label_set_text(lock_cal_label, "");
-        if (lock_today_box)  lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
-        if (lock_today_label) lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
+        if (lock_today_box)  ui_obj_set_hidden(lock_today_box, true);
+        if (lock_today_label) ui_obj_set_hidden(lock_today_label, true);
         return;
     }
 
@@ -249,7 +247,7 @@ static void create_lock(lv_obj_t *parent)
     lv_obj_set_size(lock_today_box, lock_cal_cell_w() - 4, lock_cal_cell_h());
     lv_obj_set_style_bg_color(lock_today_box, DECKPRO_COLOR_FG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(lock_today_box, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(lock_today_box, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden(lock_today_box, true);
 
     // ── Calendar: date grid ──
     lock_cal_label = lv_label_create(parent);
@@ -260,7 +258,7 @@ static void create_lock(lv_obj_t *parent)
     lock_today_label = lv_label_create(parent);
     lv_obj_set_style_text_color(lock_today_label, DECKPRO_COLOR_BG, LV_PART_MAIN);
     lv_label_set_text(lock_today_label, "");
-    lv_obj_add_flag(lock_today_label, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden(lock_today_label, true);
 
     // ── Progress dots (intentionally tiny — just a subtle hint) ──
     lock_dots_label = lv_label_create(parent);
@@ -293,15 +291,15 @@ static void lock_apply_orientation(bool landscape)
             lv_obj_set_style_text_font(lock_time_label, &lv_font_spleen_12x24, LV_PART_MAIN);
             lv_obj_align(lock_time_label, LV_ALIGN_TOP_LEFT, 12, 8);
         }
-        if (lock_date_label) lv_obj_add_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
-        if (lock_rule) lv_obj_add_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
+        if (lock_date_label) ui_obj_set_hidden(lock_date_label, true);
+        if (lock_rule) ui_obj_set_hidden(lock_rule, true);
 
         if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_TOP_RIGHT, -12, 12);
 
         int x = lock_cal_x();
         int grid_w = 7 * lock_cal_cell_w();
         if (lock_month_label) {
-            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_month_label, false);
             lv_obj_set_style_text_font(lock_month_label, &lv_font_spleen_12x24, LV_PART_MAIN);
             // Center the month name over the (nudged) calendar grid, not the
             // panel, so the whole block shifts as one. Fixed-width label +
@@ -311,12 +309,12 @@ static void lock_apply_orientation(bool landscape)
             lv_obj_align(lock_month_label, LV_ALIGN_TOP_LEFT, x, 36);
         }
         if (lock_wk_label) {
-            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_wk_label, false);
             lv_obj_set_style_text_font(lock_wk_label, &lv_font_terminus_12x24_bold, LV_PART_MAIN);
             lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 24);
         }
         if (lock_cal_label) {
-            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_cal_label, false);
             lv_obj_set_style_text_font(lock_cal_label, &lv_font_spleen_12x24, LV_PART_MAIN);
             lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
         }
@@ -332,18 +330,18 @@ static void lock_apply_orientation(bool landscape)
             lv_obj_align(lock_time_label, LV_ALIGN_TOP_MID, 0, 16);
         }
         if (lock_date_label) {
-            lv_obj_clear_flag(lock_date_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_date_label, false);
             lv_obj_align(lock_date_label, LV_ALIGN_TOP_MID, 0, 86);
         }
         if (lock_rule) {
-            lv_obj_clear_flag(lock_rule, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_rule, false);
             lv_obj_align(lock_rule, LV_ALIGN_TOP_MID, 0, 118);
         }
         if (lock_dots_label) lv_obj_align(lock_dots_label, LV_ALIGN_BOTTOM_MID, 0, -4);
 
         int x = lock_cal_x();
         if (lock_month_label) {
-            lv_obj_clear_flag(lock_month_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_month_label, false);
             lv_obj_set_style_text_font(lock_month_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
             // Undo the fixed-width / centered-text styling landscape applies.
             lv_obj_set_width(lock_month_label, LV_SIZE_CONTENT);
@@ -351,12 +349,12 @@ static void lock_apply_orientation(bool landscape)
             lv_obj_align(lock_month_label, LV_ALIGN_TOP_MID, 0, 126);
         }
         if (lock_wk_label) {
-            lv_obj_clear_flag(lock_wk_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_wk_label, false);
             lv_obj_set_style_text_font(lock_wk_label, &lv_font_tamzen_10x20_bold, LV_PART_MAIN);
             lv_obj_set_pos(lock_wk_label, x, lock_cal_y() - 22);
         }
         if (lock_cal_label) {
-            lv_obj_clear_flag(lock_cal_label, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden(lock_cal_label, false);
             lv_obj_set_style_text_font(lock_cal_label, &lv_font_tamzen_10x20, LV_PART_MAIN);
             lv_obj_set_pos(lock_cal_label, x, lock_cal_y());
         }
@@ -368,9 +366,8 @@ static void lock_apply_orientation(bool landscape)
 
 static void entry_lock(void)
 {
+    ui_time_persist_save();
     lock_unlock_progress = 0;
-    lock_last_minute = -1;
-    lock_last_yday = -1;
     lock_month_offset = 0;
     // Restore the last orientation the user toggled to with 'r'. Persisted
     // via Preferences (lk_rot) so a reboot doesn't drop the user back to
@@ -458,7 +455,7 @@ static void lock_handle_key(char key)
         // Persist so the choice survives reboot.
         ui_lock_landscape_set(lock_landscape ? 1 : 0);
         lock_update_clock(true);
-        ui_disp_full_refr();
+        ui_disp_force_full_refr();
         return;
     }
     if (key == 'j' || key == 'J' || key == 'k' || key == 'K') {
@@ -483,7 +480,7 @@ static void lock_handle_key(char key)
         lock_unlock_progress++;
         if (lock_unlock_progress >= LOCK_UNLOCK_REQUIRED) {
             lock_unlock_progress = 0;
-            scr_mgr_pop(false);
+            scr_mgr_pop();
             return;
         }
         lock_render_dots();
@@ -494,7 +491,7 @@ static void lock_handle_key(char key)
 }
 
 /* Lock screen on_key hook — delegates to lock_handle_key() which was
- * previously called directly from menu_keypay_get_event(). */
+ * previously called directly from the global keypad dispatch. */
 static void on_key_lock(void)
 {
     char key;
@@ -505,4 +502,11 @@ static void on_key_lock(void)
          * so we don't deliver keys to the newly active screen here. */
         if (scr_mgr_get_curr_scr_id() != SCREEN_LOCK_ID) break;
     }
+}
+
+// Called after a timed light-sleep wake, which may land before the 15 s
+// clock timer is due.
+void ui_lock_clock_refresh(void)
+{
+    lock_update_clock(false);
 }

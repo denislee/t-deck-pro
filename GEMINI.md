@@ -60,7 +60,8 @@ The e-paper refresh is handled through a custom LVGL flush callback.
 - `examples/factory/`: The most comprehensive example, including UI and peripheral drivers.
 - `examples/touch_hyn_core/`: Standalone Hynitron CST3xx/CST66xx touch driver (the factory firmware does not include the `hyn_*` stack).
 - `examples/factory/utilities.h`: Centralized pin definitions and I2C addresses.
-- `lib/`: Local copies of required libraries.
+- `lib/`: Local copies of required libraries. Local fork changes are marked "Local fork change" (GxEPD2 GDEQ031T10 partial-update re-init and bulk SPI; SensorLib BHY2 transfer hook).
+- `tools/kaikki_to_tsv.py`, `tools/build_dict_index.py`, `tools/test_dict_lookup.py`: build the SD-card dictionary (`/dict/eng-pob.tsv` + optional sparse index `/dict/eng-pob.idx`) and check the lookup host-side.
 - `hardware/`: Schematics and datasheets (PDF).
 - `firmware/`: Pre-compiled binaries, including Meshtastic support.
 

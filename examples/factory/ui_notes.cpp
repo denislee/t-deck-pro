@@ -87,7 +87,7 @@ static void on_key_notes_editor(void)
                 // Stay in the editor so the user doesn't lose the buffer.
                 return;
             }
-            scr_mgr_switch(SCREEN0_ID, false);
+            scr_mgr_switch(SCREEN0_ID);
             return;
         } else if (key >= 32 && key <= 126) {
             lv_textarea_add_char(notes_editor_ta, key);
@@ -100,6 +100,12 @@ static void create12_1(lv_obj_t *parent)
     ui_taskbar_create(parent);
 
     notes_editor_ta = lv_textarea_create(parent);
+    // Cap the note: every keystroke reallocates and re-wraps the whole text
+    // in the 48 KB LVGL heap, and a failed realloc would halt the UI.
+    lv_textarea_set_max_length(notes_editor_ta, 4096);
+    // Solid cursor: the theme's 500 ms blink would force a ~700 ms e-paper
+    // partial refresh back to back for as long as the editor is open.
+    lv_obj_set_style_anim_time(notes_editor_ta, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_size(notes_editor_ta, lv_pct(100), LV_VER_RES - UI_TASKBAR_H);
     lv_obj_align(notes_editor_ta, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_text_font(notes_editor_ta, UI_FONT, LV_PART_MAIN);
@@ -110,21 +116,9 @@ static void create12_1(lv_obj_t *parent)
     lv_group_focus_obj(notes_editor_ta);
 }
 
-static void entry12_1(void)
-{
-    ui_taskbar_enter();
-    ui_disp_full_refr();
-}
-
-static void exit12_1(void)
-{
-    ui_taskbar_leave();
-    ui_disp_full_refr();
-}
-
 scr_lifecycle_t screen12_1 = {
     .create = create12_1,
-    .entry = entry12_1,
-    .exit  = exit12_1,
+    .entry = ui_entry_taskbar,
+    .exit  = ui_exit_taskbar,
     .on_key    = on_key_notes_editor,
 };

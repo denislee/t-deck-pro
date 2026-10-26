@@ -8,7 +8,7 @@
 
 /* clang-format off */
 
-TinyGPSPlus gps;
+static TinyGPSPlus gps;
 static bool GPS_Recovery();
 static bool gps_try_baud(uint32_t baud);
 static void gps_power_cycle();
@@ -24,6 +24,24 @@ static uint8_t gps_month=0, gps_day=0;
 static uint8_t gps_hour=0, gps_minute=0, gps_second=0;
 static uint32_t gps_vsat=0;
 static uint32_t gps_active_baud = 0;
+
+static volatile bool gps_continuous = false;  // GPS screen open: track nonstop
+static bool gps_module_on = true;
+
+// GPS gives us UTC date+time once it has a fix. We push it into the system
+// clock via settimeofday() so the existing ui_time_get_local() path picks it
+// up automatically — no UI changes needed. This is the offline fallback for
+// NTP: without WiFi the clock would otherwise be stuck at "--:--".
+//
+// We re-apply every hour to absorb any ESP32 internal RTC drift, and we
+// rate-limit attempts so we're not toggling TZ on every NMEA sentence.
+#define GPS_TIME_RESYNC_INTERVAL_MS (60UL * 60UL * 1000UL)
+#define GPS_TIME_ATTEMPT_INTERVAL_MS 1000UL
+#define GPS_RESYNC_WINDOW_MS (5UL * 60UL * 1000UL)  // give a hot/cold start this long to produce a fix
+
+static uint32_t gps_time_last_set_ms = 0;
+static uint32_t gps_time_last_attempt_ms = 0;
+static bool gps_time_ever_set = false;
 
 static constexpr uint32_t GPS_BAUD_CANDIDATES[] = {
     9600,
@@ -61,6 +79,38 @@ static bool gps_try_baud(uint32_t baud)
     return true;
 }
 
+// Send UBX-CFG-VALSET (RAM layer) setting one U1/L config key.
+static void gps_valset_u1(uint32_t key, uint8_t value)
+{
+    uint8_t frame[17] = {
+        0xB5, 0x62,                              // sync
+        0x06, 0x8A,                              // class = CFG, id = VALSET
+        0x09, 0x00,                              // length = 9
+        0x00,                                    // version
+        0x01,                                    // layers = RAM
+        0x00, 0x00,                              // reserved
+        static_cast<uint8_t>(key & 0xFF),        // key, little-endian
+        static_cast<uint8_t>((key >> 8) & 0xFF),
+        static_cast<uint8_t>((key >> 16) & 0xFF),
+        static_cast<uint8_t>((key >> 24) & 0xFF),
+        value,                                   // value
+        0x00, 0x00                               // CK_A, CK_B (filled below)
+    };
+
+    // Checksum covers class, id, length and payload (the sync chars are not
+    // included).
+    uint8_t ck_a = 0, ck_b = 0;
+    for (size_t i = 2; i < sizeof(frame) - 2; ++i) {
+        ck_a = static_cast<uint8_t>(ck_a + frame[i]);
+        ck_b = static_cast<uint8_t>(ck_b + ck_a);
+    }
+    frame[sizeof(frame) - 2] = ck_a;
+    frame[sizeof(frame) - 1] = ck_b;
+
+    SerialGPS.write(frame, sizeof(frame));
+    SerialGPS.flush();
+}
+
 // The MIA-M10Q's PPS (TIMEPULSE) output and the back-of-device red LED share
 // the same net (utilities.h defines both BOARD_GPS_PPS and BOARD_RED_LED as
 // GPIO 1). With the GPS powered, the module drives ~1 Hz pulses onto that
@@ -85,6 +135,33 @@ static void gps_disable_time_pulse(void)
     SerialGPS.flush();
 }
 
+// TinyGPS++ only parses RMC and GGA; the module's other default sentences
+// just keep the UART (and this task) busy.
+static void gps_disable_unused_nmea(void)
+{
+    gps_valset_u1(0x209100ca, 0); /*GLL*/
+    gps_valset_u1(0x209100c0, 0); /*GSA*/
+    gps_valset_u1(0x209100c5, 0); /*GSV*/
+    gps_valset_u1(0x209100b1, 0); /*VTG*/
+}
+
+// The module's RAM config is lost with the rail, so it is re-sent on every
+// power-up.
+static void gps_module_power(bool on)
+{
+    if (on) {
+        digitalWrite(BOARD_GPS_EN, HIGH);
+        delay(200);
+        SerialGPS.begin(gps_active_baud, SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
+        gps_disable_time_pulse();
+        gps_disable_unused_nmea();
+    } else {
+        SerialGPS.end();
+        digitalWrite(BOARD_GPS_EN, LOW);
+    }
+    gps_module_on = on;
+}
+
 bool gps_init(void)
 {
     bool result = false;
@@ -104,6 +181,7 @@ bool gps_init(void)
     }
     if(result) {
         gps_disable_time_pulse();
+        gps_disable_unused_nmea();
         Serial.println("GPS Task Create...!");
         gps_task_create();
     }
@@ -121,8 +199,29 @@ static void gps_task(void *param)
     // wake us via the now-valid gps_handle once init is complete.
     vTaskSuspend(NULL);
 
+    static uint32_t s_resync_started_ms = 0;
+
     while(1)
     {
+        if (gps_continuous && !gps_module_on) gps_module_power(true);
+
+        if (!gps_continuous && gps_time_ever_set) {
+            uint32_t since = millis() - gps_time_last_set_ms;
+            if (since < GPS_TIME_RESYNC_INTERVAL_MS) {
+                // Clock is fresh: power the module down and sleep until the
+                // next resync is due (or until gps_set_continuous() wakes us).
+                if (gps_module_on) gps_module_power(false);
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(GPS_TIME_RESYNC_INTERVAL_MS - since));
+                continue;
+            }
+            if (!gps_module_on) { gps_module_power(true); s_resync_started_ms = millis(); }
+            else if (millis() - s_resync_started_ms > GPS_RESYNC_WINDOW_MS) {
+                // No fix within the window: give up until the next interval.
+                gps_time_last_set_ms = millis();
+                continue;
+            }
+        }
+
         // NOTE: the former 'while (Serial.available()) SerialGPS.write(Serial.read())'
         // USB-console passthrough was removed. It races with a7682_task which
         // drains the same SerialMon UART, splitting console input
@@ -138,8 +237,11 @@ static void gps_task(void *param)
         }
 
         if (millis() > 30000 && gps.charsProcessed() < 10) {
-            Serial.println(F("No GPS detected: check wiring."));
-            delay(1000);
+            static bool warned = false;
+            if (!warned) {
+                Serial.println(F("No GPS detected: check wiring."));
+                warned = true;
+            }
         }
 
         // The u-blox MIA-M10Q runs at 1 Hz; waking 1000×/s to drain a UART
@@ -165,8 +267,26 @@ void gps_task_suspend(void)
 void gps_task_resume(void)
 {
     if (gps_handle != nullptr) {
+        gps_module_on = true;  // callers raise BOARD_GPS_EN before resuming
         vTaskResume(gps_handle);
+        xTaskNotifyGive(gps_handle);
     }
+}
+
+// The GPS screen needs live data; elsewhere the module is only powered for the
+// hourly clock resync. Inside gps_task the duty-cycle block is skipped while
+// gps_continuous is set, and the top of each iteration powers the module back
+// up if it had been switched off.
+void gps_set_continuous(bool on)
+{
+    gps_continuous = on;
+    if (on && gps_handle != nullptr) xTaskNotifyGive(gps_handle);
+}
+
+// True while the module is powered and its UART is being drained.
+bool gps_module_active(void)
+{
+    return gps_handle != nullptr && gps_module_on && eTaskGetState(gps_handle) != eSuspended;
 }
 
 void gps_get_coord(double *lat, double *lng)
@@ -198,20 +318,6 @@ void gps_get_speed(double *speed)
 {
     *speed = gps_speed;
 }
-
-// GPS gives us UTC date+time once it has a fix. We push it into the system
-// clock via settimeofday() so the existing ui_time_get_local() path picks it
-// up automatically — no UI changes needed. This is the offline fallback for
-// NTP: without WiFi the clock would otherwise be stuck at "--:--".
-//
-// We re-apply every hour to absorb any ESP32 internal RTC drift, and we
-// rate-limit attempts so we're not toggling TZ on every NMEA sentence.
-#define GPS_TIME_RESYNC_INTERVAL_MS (60UL * 60UL * 1000UL)
-#define GPS_TIME_ATTEMPT_INTERVAL_MS 1000UL
-
-static uint32_t gps_time_last_set_ms = 0;
-static uint32_t gps_time_last_attempt_ms = 0;
-static bool gps_time_ever_set = false;
 
 static void gps_try_apply_time_sync(void)
 {
