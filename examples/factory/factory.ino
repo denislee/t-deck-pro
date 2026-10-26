@@ -526,18 +526,16 @@ static bool bq27220_init(void)
     return ret;
 }
 
+// Runs from an LVGL timer with period FACTORY_BQ25896_RUNTIME_CHECK_MS, which
+// already rate-limits it (a second millis() gate here could skip every other
+// tick on timer jitter).
 static void bq25896_runtime_maintain(void)
 {
-    static uint32_t last_check_ms = 0;
     static uint32_t last_recovery_ms = 0;
 
     if (!peri_init_st[E_PERI_BQ25896]) {
         return;
     }
-    if (millis() - last_check_ms < FACTORY_BQ25896_RUNTIME_CHECK_MS) {
-        return;
-    }
-    last_check_ms = millis();
 
     {
         I2C0Guard g;
@@ -901,6 +899,7 @@ static bool lock_screen_light_sleep(void)
     if (keypad_get_val(NULL)) return false;              // key waiting for dispatch
     if (digitalRead(BOARD_KEYBOARD_INT) == LOW) return false;
     if (ui_battery_is_external_power_present()) return false; // on USB: keep USB-CDC up
+    if (ui_low_voltage_latched()) return false;          // shutdown countdown must tick
 
     time_t now = time(NULL);
     uint32_t to_minute_s = 60 - (uint32_t)(now % 60);

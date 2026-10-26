@@ -14,3 +14,6 @@ build
 
 # PlatformIO .ino preprocessing leftovers (the generated .ino.cpp copies).
 *.ino.cpp
+
+# Python bytecode from tools/.
+__pycache__/

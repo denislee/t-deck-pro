@@ -27,6 +27,10 @@ static uint32_t gps_active_baud = 0;
 
 static volatile bool gps_continuous = false;  // GPS screen open: track nonstop
 static bool gps_module_on = true;
+// Set by gps_task_resume(): the rail may have been cut (settings toggle) or the
+// UART ended (duty cycle) while the task was suspended, so the task re-runs a
+// clean power-up instead of trusting gps_module_on.
+static volatile bool gps_repower = false;
 
 // GPS gives us UTC date+time once it has a fix. We push it into the system
 // clock via settimeofday() so the existing ui_time_get_local() path picks it
@@ -200,9 +204,14 @@ static void gps_task(void *param)
     vTaskSuspend(NULL);
 
     static uint32_t s_resync_started_ms = 0;
+    static bool s_resync_active = false;
 
     while(1)
     {
+        if (gps_repower) {
+            gps_repower = false;
+            gps_module_power(true);
+        }
         if (gps_continuous && !gps_module_on) gps_module_power(true);
 
         if (!gps_continuous && gps_time_ever_set) {
@@ -210,12 +219,18 @@ static void gps_task(void *param)
             if (since < GPS_TIME_RESYNC_INTERVAL_MS) {
                 // Clock is fresh: power the module down and sleep until the
                 // next resync is due (or until gps_set_continuous() wakes us).
+                s_resync_active = false;
                 if (gps_module_on) gps_module_power(false);
                 ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(GPS_TIME_RESYNC_INTERVAL_MS - since));
                 continue;
             }
-            if (!gps_module_on) { gps_module_power(true); s_resync_started_ms = millis(); }
-            else if (millis() - s_resync_started_ms > GPS_RESYNC_WINDOW_MS) {
+            // Start the window when the resync begins, even if the module is
+            // already on (e.g. the GPS screen just closed).
+            if (!s_resync_active) {
+                s_resync_active = true;
+                s_resync_started_ms = millis();
+                if (!gps_module_on) gps_module_power(true);
+            } else if (millis() - s_resync_started_ms > GPS_RESYNC_WINDOW_MS) {
                 // No fix within the window: give up until the next interval.
                 gps_time_last_set_ms = millis();
                 continue;
@@ -267,7 +282,7 @@ void gps_task_suspend(void)
 void gps_task_resume(void)
 {
     if (gps_handle != nullptr) {
-        gps_module_on = true;  // callers raise BOARD_GPS_EN before resuming
+        gps_repower = true;  // rail/UART state is unknown after a suspend
         vTaskResume(gps_handle);
         xTaskNotifyGive(gps_handle);
     }

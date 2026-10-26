@@ -2193,6 +2193,14 @@ Flash each tier and watch serial before trusting it on battery.
 - `tools/test_dict_lookup.py eng-pob.tsv --expect-old-failures`: 302 words; fixed 0 misses, indexed 0, old 108 (negative control).
 - The six hardware checks above are still open: they need the board on USB and, for item 6, a power meter.
 
+**Review fixes after `0af64f3` (build-verified, default + variant, 0 warnings, `firmware.bin` 1,175,696 B):**
+- GPS: `gps_task_resume()` re-powers the module instead of assuming the rail is up, so the GPS screen works after a duty-cycle power-down. Resume respects the GPS setting. The resync window starts when the resync begins.
+- Keypad: re-drain after 20 ms while INT stays low, capped at 10 tries, so a stuck line falls back to the 5 s safety net.
+- Keys left in a burst after a screen switch go to the new screen straight away (`ui_deckpro_dispatch_keys`), not at the next timer wake.
+- The lock screen does not light-sleep once the low-voltage countdown latches (`ui_low_voltage_latched`).
+- The modem probe result is dropped if the modem was turned off during the probe. Deep sleep keeps RTC_PERIPH on so the keypad INT pull-up holds. `ui_dict_close()` takes `SpiGuard`. `bq25896_runtime_maintain` lost its redundant `millis()` gate.
+- Still open: a failed modem probe cuts the rail, but the setting still shows ON. Auto-lock still skips the reader, because re-entering it restarts the book.
+
 ---
 
 ## Appendix — measurement commands

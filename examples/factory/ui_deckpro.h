@@ -116,6 +116,9 @@ void ui_deckpro_dispatch_keys(void);
 // Refresh the lock-screen clock after a timed light-sleep wake, which may land
 // before the 15 s clock timer is due.
 void ui_lock_clock_refresh(void);
+// True while the low-voltage shutdown countdown runs; the lock screen must not
+// light-sleep through it.
+bool ui_low_voltage_latched(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

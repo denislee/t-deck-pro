@@ -670,7 +670,10 @@ static volatile bool s_a7682_probe_running = false;
 
 static void a7682_lazy_probe_task(void *)
 {
-    peri_init_st[E_PERI_A7682E] = a7682_probe();
+    bool ok = a7682_probe();
+    // The user may have cut the rail while the probe was running; a stale
+    // "ok" would mark an unpowered modem as present.
+    peri_init_st[E_PERI_A7682E] = ok && default_a7682_status;
     s_a7682_probe_running = false;
     vTaskDelete(NULL);
 }
@@ -769,7 +772,8 @@ void ui_setting_get_sd_capacity(uint64_t *total, uint64_t *used)
 //************************************[ screen 3 ]****************************************** GPS
 void ui_gps_task_resume(void)
 {
-    gps_task_resume();
+    // Resuming re-powers the module; respect the GPS on/off setting.
+    if (default_gps_status) gps_task_resume();
 }
 void ui_gps_get_coord(double *lat, double *lng)
 {
@@ -1872,7 +1876,10 @@ void ui_dict_open(void)
 
 void ui_dict_close(void)
 {
-    if (s_dict_file) s_dict_file.close();
+    if (s_dict_file) {
+        SpiGuard spi;  // SD shares the bus with LoRa and the e-paper
+        s_dict_file.close();
+    }
     if (s_dict_idx) {
         free(s_dict_idx);
         s_dict_idx = NULL;

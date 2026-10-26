@@ -115,6 +115,11 @@ static void low_voltage_reset_state(void)
     low_voltage_popup_set_visible(false);
 }
 
+bool ui_low_voltage_latched(void)
+{
+    return low_voltage_latched;
+}
+
 static void low_voltage_timer_cb(lv_timer_t *t)
 {
     if (ui_battery_is_external_power_present()) {
@@ -2446,6 +2451,9 @@ static void create11(lv_obj_t *parent)
     if (digitalRead(BOARD_KEYBOARD_INT) == HIGH) {
         rtc_gpio_pullup_en((gpio_num_t)BOARD_KEYBOARD_INT);
         rtc_gpio_pulldown_dis((gpio_num_t)BOARD_KEYBOARD_INT);
+        // ext1 alone lets the RTC_PERIPH domain power down, which disables
+        // the RTC pull-up just enabled; keep the domain on.
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
         wake_mask |= (1ULL << BOARD_KEYBOARD_INT);
     }
     esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
@@ -2800,15 +2808,23 @@ size_t reader_resume_offset  = 0;
 
 // Called by loop() each time it wakes: the keypad task notifies the loop
 // task after every burst, so keys are dispatched with no polling timer.
+// A hook that switches screens returns with the rest of the burst still
+// buffered and no new notification coming, so hand it to the new screen now
+// instead of at the next timer wake (bounded against screen ping-pong).
 void ui_deckpro_dispatch_keys(void)
 {
-    scr_lifecycle_t *life = scr_mgr_get_curr_life();
-    if (life && life->on_key) life->on_key();
+    for (int i = 0; i < 4; i++) {
+        scr_lifecycle_t *life = scr_mgr_get_curr_life();
+        if (!life || !life->on_key) return;
+        life->on_key();
+        if (scr_mgr_get_curr_life() == life || !ui_input_get_keypad_val(NULL)) return;
+    }
 }
 
 // Home-screen key handler: drains the ring buffer and runs each
 // single-key shortcut.  Stops draining as soon as a key switched
-// screens, so the new screen does not get the rest of the burst.
+// screens; ui_deckpro_dispatch_keys() then hands the rest of the burst
+// to the new screen's own hook.
 static void on_key_home(void)
 {
     char key_val;

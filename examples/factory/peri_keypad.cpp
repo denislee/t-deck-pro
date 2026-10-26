@@ -284,9 +284,18 @@ static TaskHandle_t keypad_task_handle = NULL;
 static void keypad_task(void *param)
 {
     (void)param;
-    const TickType_t timeout = pdMS_TO_TICKS(5000);
+    uint8_t fast_retries = 0;
     for (;;) {
-        // Block until INT fires or the safety-net timeout expires.
+        // Block until INT fires or the safety-net timeout expires. If the last
+        // drain gave up with INT still low (keys kept arriving through every
+        // pass), no new falling edge will come, so re-drain soon rather than
+        // after the 5 s safety net. Capped so a line stuck low (faulty or
+        // absent TCA8418) does not poll I2C at 50 Hz forever.
+        bool int_low = (digitalRead(BOARD_KEYBOARD_INT) == LOW);
+        if (!int_low) fast_retries = 0;
+        else if (fast_retries <= 10) fast_retries++;
+        const TickType_t timeout = (int_low && fast_retries <= 10)
+                                       ? pdMS_TO_TICKS(20) : pdMS_TO_TICKS(5000);
         xSemaphoreTake(keypad_irq_sem, timeout);
         // Drain the full TCA8418 FIFO and clear INT_STAT in one locked burst.
         keypad_loop();
